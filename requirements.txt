@@ -1,0 +1,19 @@
+# Driver Fatigue Detection System — Python dependencies
+# Target: Raspberry Pi OS Bookworm, Python 3.9+
+#
+# NOTE: dlib compiles from source on the Pi and takes ~30-60 min. Install the
+# build prerequisites first:
+#   sudo apt install build-essential cmake libopenblas-dev liblapack-dev
+#
+# NOTE: picamera2 is normally installed system-wide via apt on Raspberry Pi OS
+# (sudo apt install python3-picamera2). If using a venv, create it with
+# --system-site-packages so the apt-installed libcamera bindings are visible.
+
+opencv-python-headless
+dlib
+face-recognition
+imutils
+numpy
+scipy
+requests
+picamera2
