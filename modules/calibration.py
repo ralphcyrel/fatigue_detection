@@ -10,7 +10,8 @@ deriving personal baselines:
 
 * ``ear_baseline``             mean open-eye EAR
 * ``ear_threshold``            75 % of ``ear_baseline`` → "eye closed" cut-off
-* ``perclos_baseline``         mean PERCLOS (floored at 0.5 %)
+* ``perclos_baseline``         closed frames / all frames over the whole
+                               run, in percent (floored at 0.5 %)
 * ``blink_duration_baseline``  mean blink duration (floored at 50 ms)
 * ``blink_frequency_baseline`` blinks completed / duration, as blinks per
                                minute (floored at 1 blink/min)
@@ -41,16 +42,32 @@ baseline and hence their yawn threshold. The median is the resting
 closed-mouth value regardless. The MAR keys are only present in
 ``compute_baselines()`` when MAR samples were supplied to ``update()``.
 
+The PERCLOS baseline is counted directly from the per-frame ``eye_closed``
+flag rather than averaged from ``PERCLOSCalculator``'s rolling value. That
+value is cumulative until its window fills, so averaging it weights a closed
+frame by roughly ``ln(N / k)`` for frame index ``k`` - a blink in the first
+second counted ~6x one mid-run. The rolling samples are still kept in
+``perclos_values`` for diagnostics; they are only used as a last-resort
+fallback when the caller never supplied ``eye_closed``.
+
 Progress is measured in wall-clock time rather than frame count so a slow
 frame rate merely reduces the number of samples instead of stretching the
 calibration period. Every time-dependent method accepts an optional
 ``timestamp`` so the module can be driven deterministically in tests or
 video replays.
+
+Every frame fed to ``update()`` is also retained as a row in ``samples`` and
+can be written out with :meth:`CalibrationManager.write_files` (CSV of the
+raw series plus a JSON summary), mirroring ``PredriveAssessment``, so a
+stored baseline can always be traced back to the frames that produced it.
 """
 
+import csv
+import json
 import logging
 import time
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -59,6 +76,12 @@ from modules.blink import MIN_BLINK_DURATION_MS
 from modules.mar import YAWN_MAR_RATIO
 
 logger = logging.getLogger(__name__)
+
+# Column order of the per-frame CSV written by ``write_files()``.
+SAMPLE_FIELDS = (
+    "t_rel", "t_abs", "ear", "threshold", "eye_closed", "mar",
+    "blink_duration_ms", "blink_freq", "perclos",
+)
 
 # Fraction of the baseline EAR below which the eye is considered closed.
 # 0.75 sits comfortably between typical open (≈0.30) and closed (≈0.10) EARs.
@@ -100,8 +123,11 @@ class CalibrationManager:
             Its length is the blink count behind ``blink_frequency_baseline``.
         blink_frequencies: Rolling blink-frequency sample per frame
             (diagnostics only; not used for any baseline).
-        perclos_values: PERCLOS sample per frame.
+        perclos_values: Rolling PERCLOS sample per frame (diagnostics only).
         mar_values: MAR sample per frame (only if the caller supplies it).
+        closed_frames: Frames with ``eye_closed=True`` (drives ``perclos_baseline``).
+        flagged_frames: Frames for which ``eye_closed`` was supplied at all.
+        samples: One dict per frame (keys as in ``SAMPLE_FIELDS``).
     """
 
     def __init__(
@@ -130,6 +156,9 @@ class CalibrationManager:
         self.blink_frequencies: List[float] = []
         self.perclos_values: List[float] = []
         self.mar_values: List[float] = []
+        self.closed_frames: int = 0
+        self.flagged_frames: int = 0
+        self.samples: List[Dict[str, Any]] = []
 
     def start(self, timestamp: Optional[float] = None) -> None:
         """
@@ -138,6 +167,9 @@ class CalibrationManager:
         Args:
             timestamp: Start time in seconds. Defaults to ``time.time()``.
         """
+        self.closed_frames = 0
+        self.flagged_frames = 0
+        self.samples.clear()
         self.ear_values.clear()
         self.blink_durations.clear()
         self.blink_frequencies.clear()
@@ -156,6 +188,8 @@ class CalibrationManager:
         perclos: float,
         timestamp: Optional[float] = None,
         mar: Optional[float] = None,
+        eye_closed: Optional[bool] = None,
+        threshold: Optional[float] = None,
     ) -> Dict[str, object]:
         """
         Record one frame's metrics and report calibration progress.
@@ -166,10 +200,18 @@ class CalibrationManager:
                 frame, or ``None`` if no blink completed (the usual case).
             blink_frequency: Current rolling blink frequency (kept for
                 diagnostics; the baseline is derived from the blink count).
-            perclos: Current PERCLOS percentage.
+            perclos: Current rolling PERCLOS percentage (kept for
+                diagnostics; the baseline is counted from ``eye_closed``).
             timestamp: Frame time in seconds. Defaults to ``time.time()``.
             mar: Raw MAR for this frame, or ``None`` if the caller does not
                 track the mouth (then no MAR baseline is produced).
+            eye_closed: Whether this frame counted as closed (``ear <
+                threshold``) - the same test ``PERCLOSCalculator`` applies.
+                Supply it on every frame; ``perclos_baseline`` is the share
+                of flagged frames that were closed.
+            threshold: Closure threshold in force on this frame, recorded in
+                ``samples`` so the CSV shows what ``eye_closed`` was judged
+                against.
 
         Returns:
             ``{"progress": float, "seconds_remaining": int, "is_complete": bool}``
@@ -195,6 +237,20 @@ class CalibrationManager:
                 self.blink_durations.append(float(blink_duration_ms))
             if mar is not None:
                 self.mar_values.append(float(mar))
+            if eye_closed is not None:
+                self.flagged_frames += 1
+                self.closed_frames += int(bool(eye_closed))
+            self.samples.append({
+                "t_rel": now - self.start_time,
+                "t_abs": now,
+                "ear": float(ear),
+                "threshold": None if threshold is None else float(threshold),
+                "eye_closed": eye_closed,
+                "mar": None if mar is None else float(mar),
+                "blink_duration_ms": blink_duration_ms,
+                "blink_freq": float(blink_frequency),
+                "perclos": float(perclos),
+            })
 
         progress = self.get_progress(now)
         elapsed = now - self.start_time
@@ -253,12 +309,19 @@ class CalibrationManager:
             n_blinks / self.duration * BLINK_FREQUENCY_WINDOW_S if self.duration > 0 else 0.0
         )
 
+        # PERCLOS over the whole run, every frame weighted equally. Only if
+        # the caller never flagged frames do we fall back to the rolling
+        # value's final sample (correct while the PERCLOS window covers the
+        # run; see module docstring for why its mean is not used).
+        if self.flagged_frames > 0:
+            raw_perclos = self.closed_frames / self.flagged_frames * 100.0
+        else:
+            logger.warning("Calibration received no eye_closed flags - PERCLOS baseline "
+                           "taken from the rolling value's final sample")
+            raw_perclos = self.perclos_values[-1] if self.perclos_values else 0.0
+
         # Floors only guard against a zero divisor from a degenerate run.
-        perclos_baseline = self._floored(
-            "perclos_baseline",
-            float(np.mean(self.perclos_values)) if self.perclos_values else 0.0,
-            MIN_PERCLOS_BASELINE,
-        )
+        perclos_baseline = self._floored("perclos_baseline", raw_perclos, MIN_PERCLOS_BASELINE)
         blink_duration_baseline = self._floored(
             "blink_duration_baseline",
             float(np.mean(self.blink_durations)) if self.blink_durations else 0.0,
@@ -302,6 +365,75 @@ class CalibrationManager:
             name, measured, floor,
         )
         return floor
+
+    # ------------------------------------------------------------------
+
+    def raw_summary(self) -> Dict[str, Any]:
+        """
+        Sample counts and pre-floor statistics behind the baselines.
+
+        Everything here is a plain measurement; nothing is floored, so a
+        baseline that landed on a floor can be traced to its cause.
+        """
+        def mean(values: List[float]) -> Optional[float]:
+            return round(float(np.mean(values)), 4) if values else None
+
+        return {
+            "frames": len(self.ear_values),
+            "duration_s": self.duration,
+            "fps_measured": (round(len(self.ear_values) / self.duration, 2)
+                             if self.duration > 0 else None),
+            "ear_mean": mean(self.ear_values),
+            "blinks": len(self.blink_durations),
+            "blink_duration_mean_ms": mean(self.blink_durations),
+            "blink_frequency_per_min": (round(len(self.blink_durations) / self.duration
+                                              * BLINK_FREQUENCY_WINDOW_S, 3)
+                                        if self.duration > 0 else None),
+            "closed_frames": self.closed_frames,
+            "flagged_frames": self.flagged_frames,
+            "perclos_counted": (round(self.closed_frames / self.flagged_frames * 100.0, 4)
+                                if self.flagged_frames else None),
+            "perclos_rolling_mean": mean(self.perclos_values),
+            "perclos_rolling_final": self.perclos_values[-1] if self.perclos_values else None,
+            "mar_median": (round(float(np.median(self.mar_values)), 4)
+                           if self.mar_values else None),
+        }
+
+    def write_files(
+        self,
+        device_id: str,
+        driver_id: Optional[int],
+        baselines: Optional[Dict[str, float]] = None,
+        directory: Path = config.CALIBRATIONS_DIR,
+    ) -> Path:
+        """
+        Write ``<device>_<driver>_<UTC stamp>.csv`` (one row per frame, columns
+        as in ``SAMPLE_FIELDS``) and a ``.json`` summary next to it holding
+        :meth:`raw_summary` plus the ``baselines`` that were persisted.
+
+        Returns:
+            Path of the CSV file.
+        """
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.start_time))
+        stem = f"{device_id}_{driver_id if driver_id is not None else 'unknown'}_{stamp}"
+        csv_path = directory / f"{stem}.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=SAMPLE_FIELDS)
+            writer.writeheader()
+            for s in self.samples:
+                writer.writerow({k: s.get(k) for k in SAMPLE_FIELDS})
+        summary: Dict[str, Any] = {
+            "device_id": device_id,
+            "driver_id": driver_id,
+            "started_at": self.start_time,
+            "csv": csv_path.name,
+            "raw": self.raw_summary(),
+            "baselines": baselines,
+        }
+        (directory / f"{stem}.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        logger.info("Calibration data written: %s (%d frames)", csv_path, len(self.samples))
+        return csv_path
 
     def get_progress(self, timestamp: Optional[float] = None) -> float:
         """

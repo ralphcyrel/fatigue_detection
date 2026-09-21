@@ -50,17 +50,19 @@ _CREATED_OK = (200, 201)
 # Statuses the operator portal may return for an override request.
 OVERRIDE_STATUSES = ("pending", "approved", "denied")
 
-# Numeric calibration fields, as stored by the backend and consumed by
-# ``modules.pipeline``. Anything else on a calibration record (ids,
-# timestamps, the device string) is metadata, not a threshold.
-THRESHOLD_FIELDS = (
-    "ear_baseline",
-    "ear_threshold",
-    "perclos_baseline",
-    "blink_duration_baseline",
-    "blink_frequency_baseline",
-    "mar_baseline",
-    "yawn_threshold",
+# How GET /devices/{id}/calibration lays out the numbers -> the flat names the
+# rest of the Pi uses (``modules.pipeline``, ``main.DEFAULT_THRESHOLDS``).
+# The backend groups them and drops the suffix from the baselines but keeps
+# it on the thresholds, so the mapping is spelled out rather than derived.
+CALIBRATION_FIELD_MAP = (
+    # (group, backend key,      pipeline key)
+    ("baselines",  "ear",             "ear_baseline"),
+    ("baselines",  "perclos",         "perclos_baseline"),
+    ("baselines",  "blink_duration",  "blink_duration_baseline"),
+    ("baselines",  "blink_frequency", "blink_frequency_baseline"),
+    ("baselines",  "mar",             "mar_baseline"),
+    ("thresholds", "ear_threshold",   "ear_threshold"),
+    ("thresholds", "yawn_threshold",  "yawn_threshold"),
 )
 
 
@@ -252,29 +254,36 @@ class APIClient:
             logger.error("GET %s returned HTTP %s: %s", path, resp.status_code, resp.text[:200])
             return None
 
-        payload = self._unwrap(self._safe_json(resp))
-        if not isinstance(payload, dict):
-            logger.error("GET %s: expected an object, got %s", path, type(payload).__name__)
+        # Success body is {"status": "ok", "data": {...}} - two keys, so the
+        # generic single-key ``_unwrap`` does not apply.
+        payload = self._safe_json(resp)
+        record = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(record, dict):
+            logger.error("GET %s: expected {\"data\": {...}}, got %s", path, resp.text[:200])
             return None
 
-        record_driver = payload.get("driver_id")
+        record_driver = record.get("driver_id")
         if (expected_driver_id is not None and record_driver is not None
                 and int(record_driver) != int(expected_driver_id)):
             logger.warning(
-                "Device %s is assigned to driver %s but the camera recognised driver %s - "
+                "Device %s is assigned to driver %s (%s) but the camera recognised driver %s - "
                 "using the assigned driver's calibration",
-                device_id, record_driver, expected_driver_id,
+                device_id, record_driver, record.get("driver_name", "?"), expected_driver_id,
             )
 
-        # Coerce to float - Laravel may serialise decimals as strings.
+        # Flatten the grouped record into pipeline names, coercing to float -
+        # Laravel may serialise decimals as strings. A missing or null field
+        # is simply absent (main.py fills MAR keys from DEFAULT_THRESHOLDS).
         thresholds: Dict[str, float] = {}
-        for key in THRESHOLD_FIELDS:
-            if payload.get(key) is None:
+        for group, key, name in CALIBRATION_FIELD_MAP:
+            section = record.get(group)
+            value = section.get(key) if isinstance(section, dict) else None
+            if value is None:
                 continue
             try:
-                thresholds[key] = float(payload[key])
+                thresholds[name] = float(value)
             except (TypeError, ValueError):
-                logger.debug("Ignoring non-numeric threshold field %r=%r", key, payload[key])
+                logger.debug("Ignoring non-numeric calibration field %s.%s=%r", group, key, value)
         logger.info("Loaded calibration for device %s (driver %s): %s",
                     device_id, record_driver, thresholds)
         return thresholds

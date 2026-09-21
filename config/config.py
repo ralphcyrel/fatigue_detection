@@ -32,6 +32,10 @@ LOGS_DIR: Final[Path] = BASE_DIR / "logs"
 # Per-frame CSV + JSON summary of every pre-drive assessment (results data).
 ASSESSMENTS_DIR: Final[Path] = LOGS_DIR / "assessments"
 
+# Per-frame CSV + JSON summary of every enrollment calibration, so a stored
+# baseline can be traced back to the raw EAR/MAR series that produced it.
+CALIBRATIONS_DIR: Final[Path] = LOGS_DIR / "calibrations"
+
 # Any additional trained models (e.g. custom face encoders) go here.
 MODELS_DIR: Final[Path] = BASE_DIR / "models"
 

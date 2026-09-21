@@ -31,7 +31,7 @@ import logging
 import sys
 import time
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
@@ -41,7 +41,7 @@ from modules.alert import AlertManager
 from modules.api import APIClient
 from modules.assessment import PredriveAssessment
 from modules.blink import BlinkDetector
-from modules.calibration import CalibrationManager
+from modules.calibration import EAR_THRESHOLD_RATIO, CalibrationManager
 from modules.ear import EARCalculator
 from modules.face_recognition_module import DriverRecognizer
 from modules.head_pose import HeadPoseEstimator
@@ -69,6 +69,13 @@ DANGER_EVENT_INTERVAL: float = 5.0
 
 # Frames of face captured for the enrollment encoding.
 ENROLL_FRAMES: int = 30
+
+# Enrollment: wall-clock seconds of the driver's own EAR observed before
+# calibration starts, to derive a personal closure threshold (see
+# run_enrollment). Time-scoped so a slow loop settles for the same period
+# as a fast one; SEED_MIN_SAMPLES guards a face that appears late.
+SEED_WINDOW_S: float = 1.0
+SEED_MIN_SAMPLES: int = 5
 
 # Log the measured loop rate every N frames.
 FPS_LOG_INTERVAL: int = 30
@@ -505,11 +512,6 @@ def cleanup() -> None:
 # Enrollment mode
 # ---------------------------------------------------------------------------
 
-def _mean_or_none(values: List[float]) -> Optional[float]:
-    """Mean rounded to 4 dp, or ``None`` for an empty buffer (never a floor)."""
-    return round(float(np.mean(values)), 4) if values else None
-
-
 def run_enrollment(api_client: APIClient, extractor: LandmarkExtractor) -> int:
     """
     Enrol a new driver: face encoding + 60 s alert-state calibration.
@@ -518,9 +520,12 @@ def run_enrollment(api_client: APIClient, extractor: LandmarkExtractor) -> int:
     1. Ask for the driver's DB id on the terminal.
     2. Capture ``ENROLL_FRAMES`` frames containing a face and average their
        128-d encodings (averaging is more robust than a single frame).
-    3. Run ``CalibrationManager`` for ``config.CALIBRATION_DURATION`` s,
-       feeding it EAR / blink / PERCLOS / MAR from the live pipeline.
-    4. POST encoding + baselines to the backend.
+    3. Settle for ``SEED_WINDOW_S`` to derive a personal closure threshold
+       from the driver's own median EAR, then run ``CalibrationManager``
+       for ``config.CALIBRATION_DURATION`` s, feeding it EAR / blink /
+       PERCLOS / MAR from the live pipeline.
+    4. Write the per-frame series to ``config.CALIBRATIONS_DIR`` and POST
+       encoding + baselines to the backend.
 
     Args:
         api_client: Connected API client.
@@ -574,11 +579,31 @@ def run_enrollment(api_client: APIClient, extractor: LandmarkExtractor) -> int:
     perclos_calc = PERCLOSCalculator()
     calib = CalibrationManager()
 
-    # No personal threshold exists yet, so start with the generic default
-    # and tighten it to 75 % of the driver's running median EAR once we have
-    # a second of data.
-    threshold = DEFAULT_THRESHOLDS["ear_threshold"]
-    ear_history = []
+    # No personal threshold exists yet. Rather than seeding one from
+    # DEFAULT_THRESHOLDS (0.225 is 75 % of a 0.30 EAR but 88 % of a 0.255 one -
+    # inside landmark noise, so it manufactures false closures), observe the
+    # driver for SEED_WINDOW_S of wall-clock time *before* calibration starts
+    # and derive the threshold from their own median EAR. Nothing is fed to
+    # the blink detector, PERCLOS or the calibration until then, so the
+    # calibration window is pure detection time under a personal threshold.
+    ear_history: list = []
+    seed_start = time.time()
+    logger.info("Settling for %.0f s to derive a personal closure threshold...", SEED_WINDOW_S)
+    while time.time() - seed_start < SEED_WINDOW_S or len(ear_history) < SEED_MIN_SAMPLES:
+        frame = capture_frame()
+        if frame is None:
+            continue
+        landmarks, _ = extractor.extract(frame)
+        if landmarks is None:
+            display_text(frame, "FACE LOST - please look at the camera")
+            present(frame)
+            continue
+        ear_history.append(ear_calc.compute_average_ear(landmarks))
+        display_text(frame, "SETTLING - look at the road")
+        present(frame)
+    threshold = float(np.median(ear_history)) * EAR_THRESHOLD_RATIO
+    logger.info("Seed threshold %.4f from %d frames (median EAR %.4f)",
+                threshold, len(ear_history), float(np.median(ear_history)))
 
     logger.info("Starting %d s calibration - stay alert, look at the road and keep "
                 "your mouth relaxed (talking inflates the MAR baseline).",
@@ -596,11 +621,12 @@ def run_enrollment(api_client: APIClient, extractor: LandmarkExtractor) -> int:
 
         ear = ear_calc.compute_average_ear(landmarks)
         mar = mar_calc.compute_mar(landmarks)
+        # Keep tightening to the running median as more of the driver is seen.
         ear_history.append(ear)
-        if len(ear_history) >= config.CAMERA_FPS:
-            threshold = float(np.median(ear_history)) * 0.75
+        threshold = float(np.median(ear_history)) * EAR_THRESHOLD_RATIO
 
         now = time.time()
+        eye_closed = ear < threshold  # the test both detectors below apply
         event = blink_detector.update(ear, threshold, now)
         perclos = perclos_calc.update(ear, threshold)
         status = calib.update(
@@ -610,6 +636,8 @@ def run_enrollment(api_client: APIClient, extractor: LandmarkExtractor) -> int:
             perclos,
             timestamp=now,
             mar=mar,
+            eye_closed=eye_closed,
+            threshold=threshold,
         )
 
         display_text(frame, f"CALIBRATING {status['progress'] * 100:.0f}%  "
@@ -618,21 +646,15 @@ def run_enrollment(api_client: APIClient, extractor: LandmarkExtractor) -> int:
 
     baselines = calib.compute_baselines()
     logger.info("Calibration baselines: %s", baselines)
-    # Raw buffers behind those baselines. compute_baselines() floors PERCLOS,
-    # blink duration and blink frequency at MIN_* (modules/calibration.py),
-    # so a baseline that equals its floor cannot be told apart from a metric
-    # that was never observed (e.g. zero blinks) without the pre-floor values.
-    logger.info(
-        "Calibration raw samples: ear n=%d mean=%s | blinks n=%d mean_ms=%s | "
-        "blink_freq n=%d mean=%s final=%s | perclos n=%d mean=%s | mar n=%d median=%s",
-        len(calib.ear_values), _mean_or_none(calib.ear_values),
-        len(calib.blink_durations), _mean_or_none(calib.blink_durations),
-        len(calib.blink_frequencies), _mean_or_none(calib.blink_frequencies),
-        calib.blink_frequencies[-1] if calib.blink_frequencies else None,
-        len(calib.perclos_values), _mean_or_none(calib.perclos_values),
-        len(calib.mar_values),
-        round(float(np.median(calib.mar_values)), 4) if calib.mar_values else None,
-    )
+    # Pre-floor measurements and counts, so a baseline that landed on a
+    # MIN_* floor (modules/calibration.py) can be traced to its cause.
+    logger.info("Calibration raw: %s", calib.raw_summary())
+    # Per-frame series + summary on disk, written before the backend call so
+    # a rejected enrollment still leaves the evidence behind.
+    try:
+        calib.write_files(config.DEVICE_ID, driver_id, baselines)
+    except OSError as exc:
+        logger.error("Could not write calibration data: %s", exc)
 
     # ---- 3. Persist ---------------------------------------------------------
     ok = api_client.save_driver_enrollment(driver_id, face_encoding.tolist(), baselines)
