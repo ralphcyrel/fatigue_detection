@@ -31,7 +31,7 @@ import logging
 import sys
 import time
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -505,6 +505,11 @@ def cleanup() -> None:
 # Enrollment mode
 # ---------------------------------------------------------------------------
 
+def _mean_or_none(values: List[float]) -> Optional[float]:
+    """Mean rounded to 4 dp, or ``None`` for an empty buffer (never a floor)."""
+    return round(float(np.mean(values)), 4) if values else None
+
+
 def run_enrollment(api_client: APIClient, extractor: LandmarkExtractor) -> int:
     """
     Enrol a new driver: face encoding + 60 s alert-state calibration.
@@ -613,6 +618,21 @@ def run_enrollment(api_client: APIClient, extractor: LandmarkExtractor) -> int:
 
     baselines = calib.compute_baselines()
     logger.info("Calibration baselines: %s", baselines)
+    # Raw buffers behind those baselines. compute_baselines() floors PERCLOS,
+    # blink duration and blink frequency at MIN_* (modules/calibration.py),
+    # so a baseline that equals its floor cannot be told apart from a metric
+    # that was never observed (e.g. zero blinks) without the pre-floor values.
+    logger.info(
+        "Calibration raw samples: ear n=%d mean=%s | blinks n=%d mean_ms=%s | "
+        "blink_freq n=%d mean=%s final=%s | perclos n=%d mean=%s | mar n=%d median=%s",
+        len(calib.ear_values), _mean_or_none(calib.ear_values),
+        len(calib.blink_durations), _mean_or_none(calib.blink_durations),
+        len(calib.blink_frequencies), _mean_or_none(calib.blink_frequencies),
+        calib.blink_frequencies[-1] if calib.blink_frequencies else None,
+        len(calib.perclos_values), _mean_or_none(calib.perclos_values),
+        len(calib.mar_values),
+        round(float(np.median(calib.mar_values)), 4) if calib.mar_values else None,
+    )
 
     # ---- 3. Persist ---------------------------------------------------------
     ok = api_client.save_driver_enrollment(driver_id, face_encoding.tolist(), baselines)
@@ -640,7 +660,11 @@ def load_thresholds(
     api_client: APIClient, driver_id: int, allow_defaults: bool
 ) -> Optional[Dict[str, float]]:
     """
-    Fetch a driver's calibrated baselines and fill any omitted field.
+    Fetch the calibrated baselines for this device and fill any omitted field.
+
+    The backend keys calibration by device (``config.DEVICE_ID``) and
+    resolves the assigned driver itself; ``driver_id`` is the driver the
+    camera recognised and is only used for logging / a mismatch warning.
 
     Args:
         api_client: Backend client.
@@ -653,7 +677,9 @@ def load_thresholds(
     Returns:
         A complete thresholds dict, or ``None`` (pre-drive only).
     """
-    thresholds = api_client.get_driver_thresholds(driver_id)
+    thresholds = api_client.get_device_calibration(
+        config.DEVICE_ID, expected_driver_id=driver_id
+    )
     if not thresholds or "ear_threshold" not in thresholds:
         if not allow_defaults:
             logger.warning("No baseline on file for driver %s (backend returned %r)",

@@ -6,7 +6,8 @@ API. It owns a ``requests.Session`` (so the TCP connection and auth headers
 are reused across calls) and wraps every endpoint the other modules need:
 
     GET  /drivers/encodings                 -> DriverRecognizer.load_encodings()
-    GET  /drivers/{id}/thresholds           -> per-driver calibration profile
+    GET  /devices/{device_id}/calibration   -> active calibration of the driver
+                                               assigned to this device
     POST /drivers/{id}/enroll               -> save encoding + baselines
     POST /fatigue-events                    -> log a DANGER event (monitoring)
     POST /assessments                       -> pre-drive verdict + per-frame series
@@ -48,6 +49,19 @@ _CREATED_OK = (200, 201)
 
 # Statuses the operator portal may return for an override request.
 OVERRIDE_STATUSES = ("pending", "approved", "denied")
+
+# Numeric calibration fields, as stored by the backend and consumed by
+# ``modules.pipeline``. Anything else on a calibration record (ids,
+# timestamps, the device string) is metadata, not a threshold.
+THRESHOLD_FIELDS = (
+    "ear_baseline",
+    "ear_threshold",
+    "perclos_baseline",
+    "blink_duration_baseline",
+    "blink_frequency_baseline",
+    "mar_baseline",
+    "yawn_threshold",
+)
 
 
 class APIClient:
@@ -166,8 +180,9 @@ class APIClient:
         ``GET /drivers/encodings``
 
         Returns:
-            List of ``{"driver_id": int, "name": str, "encoding": str|list}``
-            records, or ``None`` on failure.
+            List of ``{"driver_id": int, "name": str, "face_encoding": str|list}``
+            records, or ``None`` on failure. Older backends used the key
+            ``encoding``; ``DriverRecognizer`` accepts either.
         """
         payload = self._unwrap(self._get_json("/drivers/encodings"))
         if payload is None:
@@ -178,64 +193,142 @@ class APIClient:
         logger.info("Fetched %d face encoding records", len(payload))
         return payload
 
-    def get_driver_thresholds(self, driver_id: int) -> Optional[Dict[str, float]]:
+    def get_device_calibration(
+        self,
+        device_id: Optional[str] = None,
+        expected_driver_id: Optional[int] = None,
+    ) -> Optional[Dict[str, float]]:
         """
-        Fetch a driver's calibrated baselines and thresholds.
+        Fetch the active calibration profile for the driver assigned to
+        this device.
 
-        ``GET /drivers/{driver_id}/thresholds``
+        ``GET /devices/{device_id}/calibration``
+
+        The backend resolves device -> assigned driver -> active calibration
+        itself, so the Pi never handles calibration or driver database ids
+        here. It answers 404 in three operationally distinct situations,
+        each with ``lock_reason: "no_baseline"`` and its own ``status``
+        (device not registered, no driver assigned, no active calibration).
+        All three are the same lock condition for the Pi, so this method
+        returns ``None`` for each, but logs the ``status`` so an operator
+        can tell which one it was.
 
         Args:
-            driver_id: Primary key of the driver in the Laravel DB.
+            device_id: Device string (``pi-01``). Defaults to
+                ``config.DEVICE_ID``.
+            expected_driver_id: The driver the Pi recognised on camera. If
+                the record names a different ``driver_id`` a warning is
+                logged - the calibration belongs to whoever is *assigned* to
+                the device, not necessarily whoever is in the seat.
 
         Returns:
             ``{"ear_baseline", "ear_threshold", "perclos_baseline",
-            "perclos_threshold", "blink_duration_baseline",
-            "blink_frequency_baseline", "mar_baseline", "yawn_threshold"}``
-            as floats, or ``None`` on failure. The two MAR keys are absent
-            for drivers enrolled before yawn detection existed; ``main.py``
-            fills them from ``DEFAULT_THRESHOLDS``.
+            "blink_duration_baseline", "blink_frequency_baseline",
+            "mar_baseline", "yawn_threshold"}`` as floats, or ``None`` on
+            404 / failure. The two MAR keys are absent for drivers enrolled
+            before yawn detection existed; ``main.py`` fills them from
+            ``DEFAULT_THRESHOLDS``.
         """
-        payload = self._unwrap(self._get_json(f"/drivers/{driver_id}/thresholds"))
-        if payload is None:
+        device_id = device_id or config.DEVICE_ID
+        path = f"/devices/{device_id}/calibration"
+        resp = self._request("GET", path)
+        if resp is None:
             return None
+
+        if resp.status_code == 404:
+            payload = self._unwrap(self._safe_json(resp))
+            info = payload if isinstance(payload, dict) else {}
+            if info.get("lock_reason") == LockReason.NO_BASELINE.value:
+                logger.warning(
+                    "No baseline for device %s: status=%r (%s)",
+                    device_id, info.get("status"), info.get("message", "no message"),
+                )
+            else:
+                logger.error("GET %s returned HTTP 404 without a no_baseline lock reason: %s",
+                             path, resp.text[:200])
+            return None
+
+        if not resp.ok:
+            logger.error("GET %s returned HTTP %s: %s", path, resp.status_code, resp.text[:200])
+            return None
+
+        payload = self._unwrap(self._safe_json(resp))
         if not isinstance(payload, dict):
-            logger.error("GET thresholds for driver %s: expected an object", driver_id)
+            logger.error("GET %s: expected an object, got %s", path, type(payload).__name__)
             return None
+
+        record_driver = payload.get("driver_id")
+        if (expected_driver_id is not None and record_driver is not None
+                and int(record_driver) != int(expected_driver_id)):
+            logger.warning(
+                "Device %s is assigned to driver %s but the camera recognised driver %s - "
+                "using the assigned driver's calibration",
+                device_id, record_driver, expected_driver_id,
+            )
 
         # Coerce to float - Laravel may serialise decimals as strings.
         thresholds: Dict[str, float] = {}
-        for key, value in payload.items():
+        for key in THRESHOLD_FIELDS:
+            if payload.get(key) is None:
+                continue
             try:
-                thresholds[key] = float(value)
+                thresholds[key] = float(payload[key])
             except (TypeError, ValueError):
-                logger.debug("Ignoring non-numeric threshold field %r=%r", key, value)
-        logger.info("Loaded thresholds for driver %s: %s", driver_id, thresholds)
+                logger.debug("Ignoring non-numeric threshold field %r=%r", key, payload[key])
+        logger.info("Loaded calibration for device %s (driver %s): %s",
+                    device_id, record_driver, thresholds)
         return thresholds
 
+    def get_driver_thresholds(self, driver_id: int) -> Optional[Dict[str, float]]:
+        """
+        Backward-compatible alias for :meth:`get_device_calibration`.
+
+        ``GET /drivers/{id}/thresholds`` no longer exists; the calibration
+        is keyed by this device (``config.DEVICE_ID``). ``driver_id`` is
+        only used to warn if the assigned driver differs.
+        """
+        return self.get_device_calibration(expected_driver_id=driver_id)
+
     def save_driver_enrollment(
-        self, driver_id: int, face_encoding: List[float], thresholds: Dict[str, float]
+        self,
+        driver_id: int,
+        face_encoding: List[float],
+        thresholds: Dict[str, float],
+        sample_duration_s: Optional[int] = None,
+        device_id: Optional[str] = None,
     ) -> bool:
         """
         Persist a newly enrolled driver's encoding and calibration profile.
 
         ``POST /drivers/{driver_id}/enroll``
 
+        The endpoint takes every baseline as a top-level field (not nested
+        under ``thresholds``) plus three provenance fields: how long the
+        calibration ran, which device captured it and when.
+
         Args:
             driver_id: Driver to attach the data to (must already exist).
             face_encoding: 128-d list of floats.
             thresholds: Baselines dict from ``CalibrationManager``. Every
-                key is forwarded verbatim, so this now includes
-                ``mar_baseline`` and ``yawn_threshold``; the Laravel side
-                must accept (and store) those two extra fields.
+                key is forwarded, so this includes ``mar_baseline`` and
+                ``yawn_threshold`` when MAR was sampled.
+            sample_duration_s: Seconds the calibration observed the driver.
+                Defaults to ``config.CALIBRATION_DURATION``.
+            device_id: Device string that captured the calibration. Must be
+                registered in the backend. Defaults to ``config.DEVICE_ID``.
 
         Returns:
             ``True`` on HTTP 200/201, ``False`` otherwise.
         """
-        body = {
+        body: Dict[str, Any] = {
             # Ensure plain Python floats - numpy scalars are not JSON-serialisable.
             "face_encoding": [float(x) for x in face_encoding],
-            "thresholds": {k: float(v) for k, v in thresholds.items()},
+            "sample_duration_s": int(sample_duration_s if sample_duration_s is not None
+                                     else config.CALIBRATION_DURATION),
+            "captured_on_device_id": device_id or config.DEVICE_ID,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
         }
+        body.update({k: float(v) for k, v in thresholds.items()})
         resp = self._request("POST", f"/drivers/{driver_id}/enroll", json=body)
         if resp is None:
             return False

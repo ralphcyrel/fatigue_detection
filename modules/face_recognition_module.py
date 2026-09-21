@@ -15,10 +15,12 @@ The heavy lifting is done by the `face_recognition` library (a dlib wrapper):
 Encodings are fetched through the API client (Module 9). The expected payload
 shape from ``api_client.get_face_encodings()`` is a list of records::
 
-    [{"driver_id": 1, "name": "Jane Doe", "encoding": [0.12, -0.05, ...]}, ...]
+    [{"driver_id": 1, "name": "Jane Doe", "face_encoding": [0.12, -0.05, ...]}, ...]
 
-``encoding`` may be a list of 128 floats or a JSON-encoded string of one
-(Laravel often stores it as a JSON column); both are handled.
+The vector may be a list of 128 floats or a JSON-encoded string of one
+(Laravel often stores it as a JSON column); both are handled. The key is
+``face_encoding`` on the current backend and ``encoding`` on older ones;
+either is accepted (see ``ENCODING_KEYS``).
 """
 
 import json
@@ -32,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 # Length of the embedding vector produced by face_recognition / dlib's ResNet.
 ENCODING_LENGTH: int = 128
+
+# Record keys that may carry the vector, in order of preference. The Laravel
+# backend serialises it as ``face_encoding``; ``encoding`` is the older name.
+ENCODING_KEYS = ("face_encoding", "encoding")
 
 
 class DriverRecognizer:
@@ -99,7 +105,7 @@ class DriverRecognizer:
         for record in records:
             try:
                 driver_id = int(record["driver_id"])
-                encoding = self._parse_encoding(record["encoding"])
+                encoding = self._parse_encoding(self._encoding_field(record))
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed face encoding record %r: %s", record, exc)
                 continue
@@ -207,6 +213,19 @@ class DriverRecognizer:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _encoding_field(record: Dict[str, Any]) -> Union[str, List[float], np.ndarray]:
+        """
+        Return the raw vector from an API record under whichever key it uses.
+
+        Raises:
+            KeyError: If none of ``ENCODING_KEYS`` is present.
+        """
+        for key in ENCODING_KEYS:
+            if key in record:
+                return record[key]
+        raise KeyError(f"none of {ENCODING_KEYS} present")
 
     @staticmethod
     def _parse_encoding(raw: Union[str, List[float], np.ndarray]) -> np.ndarray:
