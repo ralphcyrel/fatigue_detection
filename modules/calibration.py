@@ -10,15 +10,29 @@ deriving personal baselines:
 
 * ``ear_baseline``             mean open-eye EAR
 * ``ear_threshold``            75 % of ``ear_baseline`` → "eye closed" cut-off
-* ``perclos_baseline``         mean PERCLOS (floored at 5.0 %)
-* ``blink_duration_baseline``  mean blink duration (floored at 150 ms)
-* ``blink_frequency_baseline`` mean blink frequency (floored at 5 blinks/min)
+* ``perclos_baseline``         mean PERCLOS (floored at 0.5 %)
+* ``blink_duration_baseline``  mean blink duration (floored at 50 ms)
+* ``blink_frequency_baseline`` blinks completed / duration, as blinks per
+                               minute (floored at 1 blink/min)
 * ``mar_baseline``             **median** closed-mouth MAR (floored at 0.2)
 * ``yawn_threshold``           ``mar_baseline * 2.0`` → "candidate yawn" cut-off
 
-The floors stop a very still, low-blink calibration from producing tiny
-baselines that would inflate every normalised metric (and hence the FRS)
-during normal driving.
+The floors exist only to keep a degenerate calibration (no blinks detected
+at all) from producing a zero baseline that the normalised metrics would
+divide by. They sit at the smallest value the pipeline can physically
+measure, so a genuine alert driver is never floored: a recorded blink is
+at least ``MIN_BLINK_DURATION_MS`` long, one blink in the window is 1 per
+minute, and 0.5 % PERCLOS is fewer closed frames than three short blinks.
+Whenever a floor does engage, ``compute_baselines()`` logs a warning naming
+the metric - blink detection evidently did not work during calibration,
+and the resulting profile should be treated as suspect.
+
+The blink-frequency baseline is derived from the number of blinks that
+completed during calibration rather than from ``BlinkDetector``'s rolling
+count. That counter starts empty at the same instant as calibration, so
+sampling it every frame yields a ramp whose mean is only a fraction of the
+true rate. The per-frame samples are still kept in ``blink_frequencies``
+for diagnostics.
 
 The MAR baseline uses the median rather than the mean on purpose: a driver
 who talks during the 60 s calibration produces a right-skewed MAR sample
@@ -34,23 +48,32 @@ calibration period. Every time-dependent method accepts an optional
 video replays.
 """
 
+import logging
 import time
 from typing import Dict, List, Optional
 
 import numpy as np
 
 from config import config
+from modules.blink import MIN_BLINK_DURATION_MS
 from modules.mar import YAWN_MAR_RATIO
+
+logger = logging.getLogger(__name__)
 
 # Fraction of the baseline EAR below which the eye is considered closed.
 # 0.75 sits comfortably between typical open (≈0.30) and closed (≈0.10) EARs.
 EAR_THRESHOLD_RATIO: float = 0.75
 
 # Lower bounds applied to the computed baselines (see module docstring).
-MIN_PERCLOS_BASELINE: float = 5.0          # percent
-MIN_BLINK_DURATION_BASELINE: float = 150.0  # milliseconds
-MIN_BLINK_FREQUENCY_BASELINE: float = 5.0   # blinks per window (minute)
+# Each is the smallest value the pipeline can measure, so it engages only on
+# a degenerate run, never on a quiet-but-genuine one.
+MIN_PERCLOS_BASELINE: float = 0.5                          # percent
+MIN_BLINK_DURATION_BASELINE: float = MIN_BLINK_DURATION_MS  # ms; shortest accepted blink
+MIN_BLINK_FREQUENCY_BASELINE: float = 1.0                  # blinks per minute
 MIN_MAR_BASELINE: float = 0.2               # outer-lip MAR; ~0.4-0.6 is typical
+
+# Blink frequency is expressed per this many seconds regardless of duration.
+BLINK_FREQUENCY_WINDOW_S: float = 60.0
 
 
 class CalibrationManager:
@@ -74,7 +97,9 @@ class CalibrationManager:
         start_time: ``time.time()`` at which ``start()`` was called.
         ear_values: EAR sample per frame.
         blink_durations: Duration (ms) of each blink completed during calibration.
-        blink_frequencies: Rolling blink-frequency sample per frame.
+            Its length is the blink count behind ``blink_frequency_baseline``.
+        blink_frequencies: Rolling blink-frequency sample per frame
+            (diagnostics only; not used for any baseline).
         perclos_values: PERCLOS sample per frame.
         mar_values: MAR sample per frame (only if the caller supplies it).
     """
@@ -139,7 +164,8 @@ class CalibrationManager:
             ear: Raw EAR for this frame.
             blink_duration_ms: Duration of a blink that completed on this
                 frame, or ``None`` if no blink completed (the usual case).
-            blink_frequency: Current rolling blink frequency.
+            blink_frequency: Current rolling blink frequency (kept for
+                diagnostics; the baseline is derived from the blink count).
             perclos: Current PERCLOS percentage.
             timestamp: Frame time in seconds. Defaults to ``time.time()``.
             mar: Raw MAR for this frame, or ``None`` if the caller does not
@@ -192,7 +218,9 @@ class CalibrationManager:
             ``{"ear_baseline", "ear_threshold", "perclos_baseline",
             "blink_duration_baseline", "blink_frequency_baseline"}`` plus
             ``"mar_baseline"`` and ``"yawn_threshold"`` when MAR samples
-            were collected.
+            were collected. ``blink_frequency_baseline`` is in blinks per
+            minute. Zero blinks is not an error, but it is logged as a
+            warning and the affected baselines come out at their floors.
 
         Raises:
             RuntimeError: if calibration has not completed, or if no EAR
@@ -210,19 +238,34 @@ class CalibrationManager:
         ear_baseline = float(np.mean(self.ear_values))
         ear_threshold = ear_baseline * EAR_THRESHOLD_RATIO
 
-        # Each remaining baseline is floored so that an unusually quiet
-        # calibration cannot make the normalised metrics explode later.
-        perclos_baseline = max(
+        n_blinks = len(self.blink_durations)
+        if n_blinks == 0:
+            logger.warning(
+                "Calibration saw no blinks in %d s over %d frames - blink detection "
+                "did not work (threshold / frame rate?); blink and PERCLOS baselines "
+                "will be floored and this profile should not be trusted",
+                self.duration, len(self.ear_values),
+            )
+
+        # Blinks per minute from the count, not from the detector's rolling
+        # counter (see module docstring for why the latter is biased).
+        raw_blink_frequency = (
+            n_blinks / self.duration * BLINK_FREQUENCY_WINDOW_S if self.duration > 0 else 0.0
+        )
+
+        # Floors only guard against a zero divisor from a degenerate run.
+        perclos_baseline = self._floored(
+            "perclos_baseline",
             float(np.mean(self.perclos_values)) if self.perclos_values else 0.0,
             MIN_PERCLOS_BASELINE,
         )
-        blink_duration_baseline = max(
+        blink_duration_baseline = self._floored(
+            "blink_duration_baseline",
             float(np.mean(self.blink_durations)) if self.blink_durations else 0.0,
             MIN_BLINK_DURATION_BASELINE,
         )
-        blink_frequency_baseline = max(
-            float(np.mean(self.blink_frequencies)) if self.blink_frequencies else 0.0,
-            MIN_BLINK_FREQUENCY_BASELINE,
+        blink_frequency_baseline = self._floored(
+            "blink_frequency_baseline", raw_blink_frequency, MIN_BLINK_FREQUENCY_BASELINE
         )
 
         baselines = {
@@ -235,11 +278,30 @@ class CalibrationManager:
 
         if self.mar_values:
             # Median, not mean - see the module docstring.
-            mar_baseline = max(float(np.median(self.mar_values)), MIN_MAR_BASELINE)
+            mar_baseline = self._floored(
+                "mar_baseline", float(np.median(self.mar_values)), MIN_MAR_BASELINE
+            )
             baselines["mar_baseline"] = mar_baseline
             baselines["yawn_threshold"] = mar_baseline * YAWN_MAR_RATIO
 
         return baselines
+
+    @staticmethod
+    def _floored(name: str, measured: float, floor: float) -> float:
+        """
+        Apply a lower bound to a baseline, warning when it engages.
+
+        A floor engaging means the measurement was degenerate (see module
+        docstring), so it must never be silent: the persisted profile would
+        otherwise look like a real calibration.
+        """
+        if measured >= floor:
+            return measured
+        logger.warning(
+            "Calibration %s floored: measured %.4g < %.4g - using the floor",
+            name, measured, floor,
+        )
+        return floor
 
     def get_progress(self, timestamp: Optional[float] = None) -> float:
         """
