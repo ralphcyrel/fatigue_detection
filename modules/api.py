@@ -15,6 +15,7 @@ are reused across calls) and wraps every endpoint the other modules need:
     GET  /override-requests/{id}            -> operator decision (pending/approved/denied)
     GET  /drivers/{id}/relay-override       -> (deprecated) per-driver unlock flag
     GET  /ping                              -> backend reachability
+    POST /devices/{device_id}/heartbeat     -> "still online" + actual relay state
 
 ``config.API_BASE_URL`` already ends in ``/api`` (e.g.
 ``http://localhost:8000/api``), so paths here are written relative to it.
@@ -26,8 +27,9 @@ Design rules, because this runs inside a real-time detection loop:
 * every method catches ``requests.exceptions.RequestException`` (and bad
   JSON), logs it, and returns ``None`` / ``False`` - the loop must keep
   running with the last known state if the backend is unreachable;
-* :meth:`push_fatigue_event` is fire-and-forget on a daemon thread so a
-  DANGER frame is never delayed by network latency.
+* :meth:`push_fatigue_event` and :meth:`post_heartbeat` are fire-and-forget
+  on a daemon thread so a DANGER frame (or the 30 s heartbeat) is never
+  delayed by network latency.
 """
 
 import logging
@@ -46,6 +48,16 @@ logger = logging.getLogger(__name__)
 _ENROLL_OK = (200, 201)
 _EVENT_OK = (201,)
 _CREATED_OK = (200, 201)
+_HEARTBEAT_OK = (200, 201, 204)
+
+# AlertManager.get_relay_state() -> the heartbeat's ``confirmed_state``
+# vocabulary. "interrupted" = starter circuit inhibited. Anything else
+# (``None`` before the relay has been driven) is reported as "unknown".
+RELAY_CONFIRMED_STATE = {
+    "UNLOCKED": "normal",
+    "LOCKED": "interrupted",
+}
+CONFIRMED_STATE_UNKNOWN = "unknown"
 
 # Statuses the operator portal may return for an override request.
 OVERRIDE_STATUSES = ("pending", "approved", "denied")
@@ -98,6 +110,11 @@ class APIClient:
         self.token: str = token if token is not None else config.API_TOKEN
         self.timeout: int = config.API_TIMEOUT
 
+        # Outcome of the last heartbeat (``None`` until one has been sent).
+        # Only used to log the offline -> online transition once rather
+        # than every 30 s; races between heartbeat threads are harmless.
+        self._heartbeat_ok: Optional[bool] = None
+
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -119,7 +136,12 @@ class APIClient:
         return f"{self.base_url}/{path.lstrip('/')}"
 
     def _request(
-        self, method: str, path: str, **kwargs: Any
+        self,
+        method: str,
+        path: str,
+        *,
+        error_level: int = logging.ERROR,
+        **kwargs: Any,
     ) -> Optional[requests.Response]:
         """
         Perform one HTTP request, swallowing transport errors.
@@ -127,6 +149,9 @@ class APIClient:
         Args:
             method: ``"GET"`` or ``"POST"``.
             path: Endpoint path relative to ``base_url``.
+            error_level: Log level for a transport failure. ERROR by
+                default; the periodic heartbeat passes DEBUG so an offline
+                backend does not write an error line every 30 s.
             **kwargs: Passed through to ``Session.request`` (e.g. ``json=``).
 
         Returns:
@@ -137,7 +162,7 @@ class APIClient:
         try:
             return self.session.request(method, url, timeout=self.timeout, **kwargs)
         except requests.exceptions.RequestException as exc:
-            logger.error("%s %s failed: %s", method, url, exc)
+            logger.log(error_level, "%s %s failed: %s", method, url, exc)
             return None
 
     def _get_json(self, path: str) -> Optional[Any]:
@@ -615,3 +640,94 @@ class APIClient:
         else:
             logger.warning("Backend NOT reachable at %s", self.base_url)
         return reachable
+
+    # ------------------------------------------------------------------
+    # Device heartbeat
+    # ------------------------------------------------------------------
+
+    def post_heartbeat(
+        self,
+        relay_state: Optional[str],
+        device_id: Optional[str] = None,
+        firmware_version: Optional[str] = None,
+        blocking: bool = False,
+    ) -> bool:
+        """
+        Tell the portal this unit is online and what the relay actually is.
+
+        ``POST /devices/{device_id}/heartbeat``
+
+        ``confirmed_state`` must be the relay state *as driven* by
+        ``AlertManager`` (``get_relay_state()``), not what was commanded:
+        the portal compares it with its own ``commanded_state`` to spot a
+        unit that has not applied a command. The mapping is
+        :data:`RELAY_CONFIRMED_STATE` (``UNLOCKED`` -> ``normal``,
+        ``LOCKED`` -> ``interrupted``); ``None`` -> ``unknown``.
+
+        The response carries the portal's ``commanded_state``. It is only
+        logged at DEBUG for now - nothing acts on it yet.
+
+        Sent from the main loop every ``config.HEARTBEAT_INTERVAL_SECONDS``
+        in both phases. By default the request runs on a daemon thread and
+        this returns immediately. An unreachable backend is logged at DEBUG
+        only (it recurs every 30 s and ``ping()`` already warned at
+        start-up); recovery is logged once at INFO, and a rejected body
+        (HTTP 4xx/5xx - a contract problem, not an outage) once at WARNING.
+
+        Args:
+            relay_state: ``"LOCKED"`` / ``"UNLOCKED"`` from
+                ``AlertManager.get_relay_state()``, or ``None`` if the
+                relay has not been driven yet (reported as ``unknown``).
+            device_id: Defaults to ``config.DEVICE_ID``.
+            firmware_version: Defaults to ``config.FIRMWARE_VERSION``.
+            blocking: If ``True``, send synchronously and return the real
+                outcome (tests).
+
+        Returns:
+            Non-blocking: ``True`` if the request was queued.
+            Blocking: ``True`` on HTTP 2xx, ``False`` otherwise.
+        """
+        path = f"/devices/{device_id or config.DEVICE_ID}/heartbeat"
+        body = {
+            "confirmed_state": RELAY_CONFIRMED_STATE.get(
+                str(relay_state).upper() if relay_state is not None else "",
+                CONFIRMED_STATE_UNKNOWN,
+            ),
+            "firmware_version": firmware_version or config.FIRMWARE_VERSION,
+        }
+        if blocking:
+            return self._send_heartbeat(path, body)
+
+        threading.Thread(
+            target=self._send_heartbeat, args=(path, body),
+            name="heartbeat", daemon=True,
+        ).start()
+        return True
+
+    def _send_heartbeat(self, path: str, body: Dict[str, Any]) -> bool:
+        """POST one heartbeat; log only transitions (see :meth:`post_heartbeat`)."""
+        was_ok = self._heartbeat_ok
+        resp = self._request("POST", path, json=body, error_level=logging.DEBUG)
+        ok = resp is not None and resp.status_code in _HEARTBEAT_OK
+        self._heartbeat_ok = ok
+
+        if ok:
+            # Not acted on yet - surfaced at DEBUG so it can be seen arriving.
+            payload = self._unwrap(self._safe_json(resp))
+            commanded = payload.get("commanded_state") if isinstance(payload, dict) else None
+            if was_ok is False:
+                logger.info("Heartbeat restored: backend reachable again "
+                            "(confirmed=%s, commanded=%r)", body["confirmed_state"], commanded)
+            else:
+                logger.debug("Heartbeat sent (confirmed=%s, commanded=%r)",
+                             body["confirmed_state"], commanded)
+        elif resp is None:
+            # Transport failure - _request already logged the cause at DEBUG.
+            logger.debug("Heartbeat not delivered: backend unreachable")
+        else:
+            # Reachable but refused: one WARNING, then DEBUG until it clears.
+            logger.log(
+                logging.DEBUG if was_ok is False else logging.WARNING,
+                "Heartbeat rejected: HTTP %s %s", resp.status_code, resp.text[:200],
+            )
+        return ok

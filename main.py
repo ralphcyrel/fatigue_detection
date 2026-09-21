@@ -22,6 +22,12 @@ phases::
     camera -> LandmarkExtractor -> MetricsPipeline (EAR / MAR / blink / PERCLOS
               / yawn / head pose / FRS) -> phase-specific decision -> AlertManager
 
+In both phases the loop also posts a heartbeat every
+``config.HEARTBEAT_INTERVAL_SECONDS`` (``POST /devices/{id}/heartbeat``) carrying
+the relay state as actually driven (``normal`` / ``interrupted``), so the
+operator portal can show the unit as online and spot one that has not applied
+a command.
+
 Runs on the Raspberry Pi (Picamera2 + GPIO) and, with automatic fallbacks,
 on a development machine (cv2.VideoCapture + mocked GPIO / ignition).
 """
@@ -130,6 +136,7 @@ _camera: Optional["Camera"] = None
 _alert_manager: Optional[AlertManager] = None
 _head_pose: Optional[HeadPoseEstimator] = None
 _ignition: Any = None
+_heartbeat: Optional["Heartbeat"] = None
 _display_available: bool = True
 
 
@@ -275,6 +282,56 @@ class LoopRate:
         return self.fps
 
 
+class Heartbeat:
+    """
+    Periodic "still online" post to the portal, ticked from the frame loop.
+
+    Fires every ``config.HEARTBEAT_INTERVAL_SECONDS`` of wall-clock time,
+    the first one on the first tick so the portal sees the unit as soon as
+    the supervisor starts. It is driven from the loop rather than a
+    background timer on purpose: a stalled detection loop then stops
+    heartbeating and the portal shows the unit offline. The POST itself
+    runs on a daemon thread (``APIClient.post_heartbeat``), so a slow or
+    dead backend never delays a frame.
+
+    ``confirmed_state`` is read from ``AlertManager`` at send time - the
+    relay as actually driven, not as commanded (``UNLOCKED`` -> ``normal``,
+    ``LOCKED`` -> ``interrupted``). Without an ``AlertManager`` the state is
+    reported as ``unknown``; in practice ``main()`` creates the manager
+    (which drives the relay to its fail-secure state) before this ticker,
+    so a real run never sends ``unknown``.
+    """
+
+    def __init__(
+        self,
+        api_client: APIClient,
+        alert_manager: Optional[AlertManager],
+        interval: float = config.HEARTBEAT_INTERVAL_SECONDS,
+    ) -> None:
+        self.api_client = api_client
+        self.alert_manager = alert_manager
+        self.interval = interval
+        self._last_sent: Optional[float] = None
+
+    def tick(self, now: Optional[float] = None) -> bool:
+        """
+        Queue a heartbeat if the interval has elapsed.
+
+        Args:
+            now: ``time.monotonic()`` for this frame (taken here if omitted).
+
+        Returns:
+            ``True`` if a heartbeat was queued on this tick.
+        """
+        now = time.monotonic() if now is None else now
+        if self._last_sent is not None and now - self._last_sent < self.interval:
+            return False
+        self._last_sent = now
+        relay = self.alert_manager.get_relay_state() if self.alert_manager else None
+        self.api_client.post_heartbeat(relay)
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Display helpers (all tolerate a headless Pi with no monitor)
 # ---------------------------------------------------------------------------
@@ -328,7 +385,13 @@ def present(frame: np.ndarray) -> int:
 
     ``q`` raises :class:`QuitRequested`; ``i`` toggles the mock ignition.
     Other keys are returned to the caller (e.g. ``r`` to retry).
+
+    Every loop in both phases passes through here once per frame, so this
+    is also where the :class:`Heartbeat` is ticked (a no-op until
+    ``config.HEARTBEAT_INTERVAL_SECONDS`` have elapsed; never blocks).
     """
+    if _heartbeat is not None:
+        _heartbeat.tick()
     key = show_frame(frame)
     if key == KEY_QUIT:
         raise QuitRequested()
@@ -1149,7 +1212,7 @@ def main(argv: Optional[list] = None) -> int:
     Returns:
         Process exit code.
     """
-    global _camera, _alert_manager, _head_pose, _ignition
+    global _camera, _alert_manager, _head_pose, _ignition, _heartbeat
 
     args = parse_args(argv)
     setup_logging()
@@ -1205,8 +1268,13 @@ def main(argv: Optional[list] = None) -> int:
             exit_code = run_enrollment(api_client, extractor)
         else:
             rate = LoopRate()
-            logger.info("Supervisor started in %s - press 'q' in the window or Ctrl-C to stop",
-                        initial_phase.value)
+            # Heartbeat to the portal, ticked from present() in every phase
+            # loop. Reads the relay state from _alert_manager at send time.
+            _heartbeat = Heartbeat(api_client, _alert_manager)
+            logger.info("Supervisor started in %s - press 'q' in the window or Ctrl-C to stop "
+                        "(heartbeat every %.0fs, firmware %s)",
+                        initial_phase.value, config.HEARTBEAT_INTERVAL_SECONDS,
+                        config.FIRMWARE_VERSION)
             # 8. Phase supervisor: each phase function returns when the
             #    ignition state changes (or, in pre-drive, on 'r' to re-run).
             while True:

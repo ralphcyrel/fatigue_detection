@@ -123,7 +123,8 @@ fatigue-detection/
 - **Ignition sense (GPIO 25)** — fuse tap on an ignition-switched circuit through an
   optocoupler (or a divider clamped to 3.3 V — never 12 V straight to the pin). Pulled
   down, so a disconnected tap reads OFF (pre-drive). Debounced 0.3 s in software.
-- Set `FATIGUE_DEVICE_ID` per vehicle; it keys assessments and override requests.
+- Set `FATIGUE_DEVICE_ID` per vehicle; it keys assessments, override requests and the
+  heartbeat. Bump `FIRMWARE_VERSION` in `config/config.py` on release; the portal shows it.
 
 ## How to run
 
@@ -151,3 +152,4 @@ assessment (after a pass or a denied override).
 | POST | `/override-requests` | starter stays inhibited; `reason`, `driver_id` (nullable), `assessment_id` |
 | GET | `/override-requests/{id}` | `status`: `pending` / `approved` / `denied` |
 | GET | `/ping` | reachability |
+| POST | `/devices/{id}/heartbeat` | every 30 s in both phases: `confirmed_state` (relay as actually driven: `normal` / `interrupted` / `unknown`), `firmware_version`; response `commanded_state` is logged at debug only |

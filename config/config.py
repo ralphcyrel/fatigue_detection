@@ -90,6 +90,16 @@ API_TIMEOUT: Final[int] = 5
 # driver to key them by. Set per vehicle in the environment.
 DEVICE_ID: Final[str] = os.environ.get("FATIGUE_DEVICE_ID", "pi-01")
 
+# Version of this Pi software, reported in every heartbeat so the operator
+# portal can see which build each unit is running. Bump on release.
+FIRMWARE_VERSION: Final[str] = "1.0.0"
+
+# How often (seconds, wall clock) the main loop posts a heartbeat
+# (POST /devices/{id}/heartbeat) so the portal can show the unit as online.
+# Ticked from the detection loop itself - not a background timer - so a
+# stalled loop stops heartbeating and the portal sees the unit go offline.
+HEARTBEAT_INTERVAL_SECONDS: Final[float] = 30.0
+
 # ---------------------------------------------------------------------------
 # GPIO pins (BCM numbering)
 # ---------------------------------------------------------------------------
