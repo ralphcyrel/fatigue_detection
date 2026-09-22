@@ -72,7 +72,9 @@ fatigue-detection/
 ├── data/             # landmark model + calibration data (git-ignored contents)
 ├── logs/             # runtime logs
 ├── models/           # additional trained models
-├── main.py           # entry point
+├── deploy/           # systemd unit + install notes for the touchscreen launcher
+├── main.py           # entry point (CLI)
+├── launcher.py       # touchscreen menu that shells out to main.py
 ├── requirements.txt
 └── README.md
 ```
@@ -134,16 +136,44 @@ python main.py --mock-gpio                       # no hardware: 'i' toggles mock
 python main.py --mock-gpio --force-phase predrive     # stay in pre-drive ('r' re-runs)
 python main.py --mock-gpio --force-phase monitoring   # stay in monitoring
 python main.py --debug-pose                      # overlay head-pose debounce timers
-python main.py --enroll                          # enrol a driver
+python main.py --enroll                          # enrol a driver (prompts for the id)
+python main.py --enroll --driver-id 7            # enrol driver 7, no prompt
 ```
 
 Preview-window keys: `q` quit · `i` toggle mock ignition · `r` re-run the pre-drive
 assessment (after a pass or a denied override).
 
+### Touchscreen launcher (no keyboard)
+
+`launcher.py` is a Tkinter menu for demoing the unit with only the touchscreen
+attached. It shells out to `main.py` with the flags above, so the CLI stays the
+single source of truth:
+
+| Button | Runs |
+|---|---|
+| Enroll driver | picks a driver from `GET /drivers` (the one assigned to this `FATIGUE_DEVICE_ID` is listed first), then `main.py --enroll --driver-id N` |
+| Pre-drive assessment | `main.py --force-phase predrive` |
+| Continuous monitoring | `main.py --force-phase monitoring` |
+| Follow ignition | `main.py` (real ignition input selects the phase) |
+
+The header shows the device id and whether the backend answers `/ping`. While a
+session runs the launcher shrinks to a bottom strip with a **STOP** button
+(sends SIGINT = Ctrl-C); when `main.py` exits the menu returns with the result.
+Layout scales with the screen, from the 480×320 panel up to an HDMI monitor.
+
+```bash
+python launcher.py               # fullscreen
+python launcher.py --windowed    # development: 480x320 window
+```
+
+To start it on boot see [`deploy/README.md`](deploy/README.md) (systemd unit,
+plus how to disable it again for CLI development).
+
 ## Backend endpoints used
 
 | Method | Path | Purpose |
 |---|---|---|
+| GET | `/drivers` | driver roster for the launcher's picker (`id`, `full_name`, `device_id`, `is_enrolled`) |
 | GET | `/drivers/encodings` | face encodings for recognition |
 | GET | `/drivers/{id}/thresholds` | per-driver baselines (incl. `mar_baseline`, `yawn_threshold`) |
 | POST | `/drivers/{id}/enroll` | encoding + baselines |

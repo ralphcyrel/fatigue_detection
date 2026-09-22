@@ -5,6 +5,8 @@ Three phases, selected by the vehicle's ignition state (Module 11)::
 
     --enroll        Enrollment (operator-supervised, at hiring): face encoding +
                     60 s alert-state calibration -> Laravel backend.
+                    ``--driver-id N`` skips the terminal prompt (used by
+                    ``launcher.py``, which has no keyboard).
 
     ignition OFF    Pre-drive assessment: recognise the driver, fetch their
                     thresholds, run a 30 s assessment. PASS -> starter relay
@@ -575,12 +577,15 @@ def cleanup() -> None:
 # Enrollment mode
 # ---------------------------------------------------------------------------
 
-def run_enrollment(api_client: APIClient, extractor: LandmarkExtractor) -> int:
+def run_enrollment(
+    api_client: APIClient, extractor: LandmarkExtractor, driver_id: Optional[int] = None
+) -> int:
     """
     Enrol a new driver: face encoding + 60 s alert-state calibration.
 
     Steps:
-    1. Ask for the driver's DB id on the terminal.
+    1. Ask for the driver's DB id on the terminal (skipped when ``driver_id``
+       is supplied, e.g. via ``--driver-id`` from the touchscreen launcher).
     2. Capture ``ENROLL_FRAMES`` frames containing a face and average their
        128-d encodings (averaging is more robust than a single frame).
     3. Settle for ``SEED_WINDOW_S`` to derive a personal closure threshold
@@ -593,18 +598,21 @@ def run_enrollment(api_client: APIClient, extractor: LandmarkExtractor) -> int:
     Args:
         api_client: Connected API client.
         extractor: Landmark extractor for the calibration phase.
+        driver_id: Driver's DB id. ``None`` prompts on the terminal.
 
     Returns:
         Process exit code (0 = success).
     """
     import face_recognition  # heavy import; only needed here
 
-    raw = input("Enter driver_id to enrol: ").strip()
-    try:
-        driver_id = int(raw)
-    except ValueError:
-        logger.error("Invalid driver_id %r - must be an integer", raw)
-        return 2
+    if driver_id is None:
+        raw = input("Enter driver_id to enrol: ").strip()
+        try:
+            driver_id = int(raw)
+        except ValueError:
+            logger.error("Invalid driver_id %r - must be an integer", raw)
+            return 2
+    logger.info("Enrolling driver %s", driver_id)
 
     # ---- 1. Face encoding ------------------------------------------------
     logger.info("Look at the camera. Capturing %d frames for the face encoding...", ENROLL_FRAMES)
@@ -1180,6 +1188,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         help="enrol a new driver (face encoding + 60 s calibration) and exit",
     )
     parser.add_argument(
+        "--driver-id", type=int, default=None, metavar="N",
+        help="with --enroll: the driver's DB id (skips the terminal prompt)",
+    )
+    parser.add_argument(
         "--mock-gpio", action="store_true",
         help="force AlertManager and IgnitionSensor into mock mode even on a Pi "
              "(press 'i' in the preview window to toggle the mock ignition)",
@@ -1198,7 +1210,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         help="seconds the head pose must be normal before a head-pose DANGER "
              f"is released (default {HEAD_POSE_RELEASE_HOLD_S})",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.driver_id is not None and not args.enroll:
+        parser.error("--driver-id only makes sense with --enroll")
+    return args
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -1265,7 +1280,7 @@ def main(argv: Optional[list] = None) -> int:
         _camera = Camera()
 
         if args.enroll:
-            exit_code = run_enrollment(api_client, extractor)
+            exit_code = run_enrollment(api_client, extractor, driver_id=args.driver_id)
         else:
             rate = LoopRate()
             # Heartbeat to the portal, ticked from present() in every phase

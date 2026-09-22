@@ -1,0 +1,57 @@
+# Touchscreen launcher on boot - makes the unit plug-and-go for demos.
+#
+# Not installed automatically. See deploy/README.md for the full steps; the
+# short version:
+#
+#   sudo cp deploy/fatigue-launcher.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fatigue-launcher
+#
+# Back to the plain CLI while developing:
+#
+#   sudo systemctl disable --now fatigue-launcher     # off, and stays off after reboot
+#   sudo systemctl stop fatigue-launcher              # off until next boot only
+#
+# Adjust User=, WorkingDirectory= and ExecStart= if the project or venv live
+# somewhere other than /home/pi/fatigue-detection.
+
+[Unit]
+Description=Driver Fatigue Detection touchscreen launcher
+# The launcher (Tk) and main.py's preview (cv2) both need the desktop, so
+# wait for the graphical target and for the desktop session to have opened
+# the X display (Desktop autologin must be enabled in raspi-config).
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/fatigue-detection
+
+# Display for Tk and cv2. Works for X11 and for Wayland via Xwayland on
+# Raspberry Pi OS Bookworm.
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PYTHONUNBUFFERED=1
+
+# FATIGUE_API_BASE_URL / FATIGUE_API_TOKEN / FATIGUE_DEVICE_ID live here so
+# the token is not in the unit file. The leading "-" makes it optional.
+EnvironmentFile=-/etc/fatigue-detection.env
+
+# Wait (up to ~30 s) for the desktop to be up before starting.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -S /tmp/.X11-unix/X0 ] && exit 0; sleep 1; done; echo "no X display" >&2; exit 1'
+ExecStart=/home/pi/fatigue-detection/venv/bin/python launcher.py
+
+# Ask nicely first so a running main.py child gets SIGINT and releases the
+# camera / GPIO, then escalate after 20 s.
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

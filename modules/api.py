@@ -203,6 +203,28 @@ class APIClient:
     # Endpoints
     # ------------------------------------------------------------------
 
+    def get_drivers(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        Fetch the driver roster (used by the touchscreen launcher's picker).
+
+        ``GET /drivers``
+
+        Returns:
+            List of ``{"id": int, "full_name": str, "device_id": str|None,
+            "is_enrolled": bool}`` records, or ``None`` on failure.
+            ``device_id`` is the unit's string identifier (e.g. ``pi-01``),
+            comparable to ``config.DEVICE_ID``; ``is_enrolled`` reflects an
+            active calibration on the backend.
+        """
+        payload = self._unwrap(self._get_json("/drivers"))
+        if payload is None:
+            return None
+        if not isinstance(payload, list):
+            logger.error("GET /drivers: expected a list, got %s", type(payload).__name__)
+            return None
+        logger.info("Fetched %d driver records", len(payload))
+        return payload
+
     def get_face_encodings(self) -> Optional[List[Dict[str, Any]]]:
         """
         Fetch every enrolled driver's face encoding.
