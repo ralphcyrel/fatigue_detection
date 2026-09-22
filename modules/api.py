@@ -46,7 +46,10 @@ logger = logging.getLogger(__name__)
 
 # HTTP status codes accepted as "created / ok" for the POST endpoints.
 _ENROLL_OK = (200, 201)
-_EVENT_OK = (201,)
+# /fatigue-events: 201 = created, 200 = duplicate deduped server-side,
+# 202 = accepted and queued for retry. All three mean the data was taken.
+_EVENT_OK = (200, 201, 202)
+_EVENT_OUTCOME = {200: "deduplicated", 201: "created", 202: "queued for retry"}
 _CREATED_OK = (200, 201)
 _HEARTBEAT_OK = (200, 201, 204)
 
@@ -447,6 +450,10 @@ class APIClient:
             logger.info(
                 "Fatigue event logged for driver %s (FRS %.3f)",
                 body["driver_id"], body["frs_score"],
+            )
+            logger.debug(
+                "Fatigue event outcome: HTTP %s (%s)",
+                resp.status_code, _EVENT_OUTCOME[resp.status_code],
             )
             return True
         logger.error(
