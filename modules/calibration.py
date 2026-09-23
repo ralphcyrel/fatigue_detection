@@ -120,6 +120,10 @@ class CalibrationManager:
         start_time: ``time.time()`` at which ``start()`` was called.
         ear_values: EAR sample per frame.
         blink_durations: Duration (ms) of each blink completed during calibration.
+        microsleep_durations: Closure duration (ms) at the moment each
+            microsleep was confirmed during calibration - a lower bound on the
+            real closure, not its total. Any entry here means the baselines
+            are suspect; the count matters more than the durations.
             Its length is the blink count behind ``blink_frequency_baseline``.
         blink_frequencies: Rolling blink-frequency sample per frame
             (diagnostics only; not used for any baseline).
@@ -153,6 +157,9 @@ class CalibrationManager:
 
         self.ear_values: List[float] = []
         self.blink_durations: List[float] = []
+        # Microsleeps confirmed during the window. Non-empty means the
+        # calibration was not taken on an alert driver.
+        self.microsleep_durations: List[float] = []
         self.blink_frequencies: List[float] = []
         self.perclos_values: List[float] = []
         self.mar_values: List[float] = []
@@ -172,6 +179,7 @@ class CalibrationManager:
         self.samples.clear()
         self.ear_values.clear()
         self.blink_durations.clear()
+        self.microsleep_durations.clear()
         self.blink_frequencies.clear()
         self.perclos_values.clear()
         self.mar_values.clear()
@@ -190,6 +198,7 @@ class CalibrationManager:
         mar: Optional[float] = None,
         eye_closed: Optional[bool] = None,
         threshold: Optional[float] = None,
+        microsleep_ms: Optional[float] = None,
     ) -> Dict[str, object]:
         """
         Record one frame's metrics and report calibration progress.
@@ -212,6 +221,14 @@ class CalibrationManager:
             threshold: Closure threshold in force on this frame, recorded in
                 ``samples`` so the CSV shows what ``eye_closed`` was judged
                 against.
+            microsleep_ms: Closure duration (ms) *so far* of a microsleep
+                confirmed on this frame, from ``MicrosleepDetector.update()``,
+                or ``None`` (the usual case). This is the duration at the
+                moment of confirmation (≈ 1.0 s), i.e. a lower bound on the
+                full closure - the total is not known until the eyes reopen,
+                which may be after the calibration window has closed.
+                Recorded and warned about but never added to
+                ``blink_durations`` - see :attr:`microsleep_durations`.
 
         Returns:
             ``{"progress": float, "seconds_remaining": int, "is_complete": bool}``
@@ -235,6 +252,22 @@ class CalibrationManager:
             # completed this frame.
             if blink_duration_ms is not None:
                 self.blink_durations.append(float(blink_duration_ms))
+            # A microsleep during calibration is a contradiction in terms:
+            # this window is supposed to be the driver's *alert* state. Record
+            # it and shout, so the operator can see why the baselines should
+            # not be trusted. It never joins blink_durations - a single one
+            # would inflate blink_duration_baseline permanently for this
+            # driver, and every later ratio divides by that baseline, quietly
+            # suppressing the blink-duration term for good.
+            if microsleep_ms is not None:
+                self.microsleep_durations.append(float(microsleep_ms))
+                logger.warning(
+                    "MICROSLEEP during calibration at %.1fs of %.0fs (eyes closed %.2fs) "
+                    "- the driver is not in an alert state and these baselines will be "
+                    "unreliable; %d so far this run",
+                    now - self.start_time, self.duration, float(microsleep_ms) / 1000.0,
+                    len(self.microsleep_durations),
+                )
             if mar is not None:
                 self.mar_values.append(float(mar))
             if eye_closed is not None:
@@ -293,6 +326,16 @@ class CalibrationManager:
 
         ear_baseline = float(np.mean(self.ear_values))
         ear_threshold = ear_baseline * EAR_THRESHOLD_RATIO
+
+        if self.microsleep_durations:
+            logger.warning(
+                "Calibration recorded %d microsleep(s), at least %.1fs of eye closure - "
+                "the driver was NOT in an alert state for this window. The baselines below "
+                "describe a drowsy driver and every later metric is normalised against "
+                "them; re-run enrollment when the driver is rested.",
+                len(self.microsleep_durations),
+                sum(self.microsleep_durations) / 1000.0,
+            )
 
         n_blinks = len(self.blink_durations)
         if n_blinks == 0:
@@ -386,6 +429,8 @@ class CalibrationManager:
             "ear_mean": mean(self.ear_values),
             "blinks": len(self.blink_durations),
             "blink_duration_mean_ms": mean(self.blink_durations),
+            "microsleeps": len(self.microsleep_durations),
+            "microsleep_confirm_ms_mean": mean(self.microsleep_durations),
             "blink_frequency_per_min": (round(len(self.blink_durations) / self.duration
                                               * BLINK_FREQUENCY_WINDOW_S, 3)
                                         if self.duration > 0 else None),

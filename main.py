@@ -48,7 +48,7 @@ from config import config
 from modules.alert import AlertManager
 from modules.api import APIClient
 from modules.assessment import PredriveAssessment
-from modules.blink import BlinkDetector
+from modules.blink import BlinkDetector, MicrosleepDetector
 from modules.calibration import EAR_THRESHOLD_RATIO, CalibrationManager
 from modules.ear import EARCalculator
 from modules.face_recognition_module import DriverRecognizer
@@ -127,6 +127,7 @@ KEY_RETRY = ord("r")      # pre-drive: re-run the assessment
 # Human-readable lock reasons for the overlay.
 LOCK_REASON_TEXT: Dict[LockReason, str] = {
     LockReason.FATIGUE_DETECTED: "FATIGUE DETECTED",
+    LockReason.MICROSLEEP_DETECTED: "MICROSLEEP DETECTED",
     LockReason.DRIVER_NOT_RECOGNIZED: "DRIVER NOT RECOGNIZED",
     LockReason.NO_BASELINE: "NO BASELINE ON FILE",
 }
@@ -422,7 +423,8 @@ def draw_overlay(
 ) -> None:
     """
     Annotate ``frame`` in place with driver name, FRS, level, EAR, PERCLOS,
-    MAR / yawn state, relay state, measured loop rate and head pose.
+    MAR / yawn state, relay state, measured loop rate and head pose, plus a
+    MICROSLEEP banner while that override is active.
 
     Args:
         frame: BGR frame to draw on.
@@ -480,6 +482,17 @@ def draw_overlay(
     cv2.putText(frame, angles, (10, 125), font, 0.5, WHITE, 1, cv2.LINE_AA)
     cv2.putText(frame, f"Head: {status}", (w - 200, 125), font, 0.55,
                 status_color, 2, cv2.LINE_AA)
+
+    # Microsleep banner across the middle of the frame while the override is
+    # up. Deliberately loud and deliberately not in the metrics strip: this is
+    # the one event the whole system exists to catch.
+    if m.microsleep_override:
+        closed_s = float(m.microsleep_status.get("closed_s", 0.0))
+        held = f" {closed_s:.1f}s" if closed_s > 0 else " (recovering)"
+        banner_y = frame.shape[0] // 2
+        cv2.rectangle(frame, (0, banner_y - 34), (w, banner_y + 12), (0, 0, 0), -1)
+        cv2.putText(frame, f"MICROSLEEP{held}  (n={m.microsleep_count})",
+                    (12, banner_y), font, 0.95, (0, 0, 255), 2, cv2.LINE_AA)
 
 
 def draw_pose_debug(
@@ -648,6 +661,7 @@ def run_enrollment(
     mar_calc = MARCalculator()
     blink_detector = BlinkDetector(frequency_window=60)
     perclos_calc = PERCLOSCalculator()
+    microsleep_detector = MicrosleepDetector()
     calib = CalibrationManager()
 
     # No personal threshold exists yet. Rather than seeding one from
@@ -699,6 +713,10 @@ def run_enrollment(
         now = time.time()
         eye_closed = ear < threshold  # the test both detectors below apply
         event = blink_detector.update(ear, threshold, now)
+        # Same EAR and threshold: closures >= 1 s are microsleeps and are
+        # rejected by the blink detector, so they must be collected here or
+        # they would vanish from the calibration record entirely.
+        ms_event = microsleep_detector.update(ear, threshold, now)
         perclos = perclos_calc.update(ear, threshold)
         status = calib.update(
             ear,
@@ -709,6 +727,7 @@ def run_enrollment(
             mar=mar,
             eye_closed=eye_closed,
             threshold=threshold,
+            microsleep_ms=ms_event["duration_ms"] if ms_event else None,
         )
 
         display_text(frame, f"CALIBRATING {status['progress'] * 100:.0f}%  "
@@ -1002,7 +1021,7 @@ def run_predrive_assessment(
 
                 landmarks, _rect = extractor.extract(frame)
                 if landmarks is None:
-                    pipeline.note_no_face()
+                    pipeline.note_no_face(now)
                     assessment.add_no_face(now)
                     alert_manager.set_alert_level("ALERT")
                     display_text(frame, "NO FACE")
@@ -1026,11 +1045,13 @@ def run_predrive_assessment(
             # 5. Persist
             result = assessment.result()
             logger.info("Pre-drive result: passed=%s void=%s worst_%.0fs_mean=%.3f mean=%.3f "
-                        "median=%.3f max=%.3f n=%d no_face=%d pose_override_frames=%d yawns=%d",
+                        "median=%.3f max=%.3f n=%d no_face=%d pose_override_frames=%d "
+                        "yawns=%d microsleeps=%d",
                         result["passed"], result["void"], result["worst_window_s"],
                         result["worst_window_mean"], result["mean_frs"], result["median_frs"],
                         result["max_frs"], result["n_samples"], result["n_no_face"],
-                        result["pose_override_frames"], result["yawns"])
+                        result["pose_override_frames"], result["yawns"],
+                        result["microsleeps"])
             try:
                 assessment.write_files(config.DEVICE_ID, driver_id)
             except OSError as exc:
@@ -1041,7 +1062,27 @@ def run_predrive_assessment(
                 logger.warning("Pre-drive: assessment VOID (face missing %.0f%% of frames)",
                                result["no_face_fraction"] * 100)
                 lock_reason = LockReason.DRIVER_NOT_RECOGNIZED
+            elif result["failed_on_microsleep"]:
+                # Checked before the aggregate so the lock reason names the
+                # real finding: a microsleep fails outright, and the worst
+                # window can easily still be under the threshold when it does.
+                logger.warning(
+                    "Pre-drive: FAILED ON MICROSLEEP - %d confirmed during the %.0fs "
+                    "assessment (worst %.0fs mean %.3f vs threshold %.2f; the aggregate "
+                    "alone would have %s). Sleep intrusion in a stationary vehicle is "
+                    "disqualifying on its own.",
+                    result["microsleeps"], result["duration_s"], result["worst_window_s"],
+                    result["worst_window_mean"], result["pass_threshold"],
+                    "FAILED" if result["worst_window_mean"] >= result["pass_threshold"]
+                    else "PASSED",
+                )
+                lock_reason = LockReason.MICROSLEEP_DETECTED
             elif not result["passed"]:
+                logger.warning(
+                    "Pre-drive: FAILED on aggregate - worst %.0fs mean %.3f >= %.2f",
+                    result["worst_window_s"], result["worst_window_mean"],
+                    result["pass_threshold"],
+                )
                 lock_reason = LockReason.FATIGUE_DETECTED
 
             assessment_id = api_client.post_assessment(
@@ -1057,7 +1098,7 @@ def run_predrive_assessment(
                 wait_for_ignition(ignition, rate, "ASSESSMENT PASSED - start vehicle", (0, 200, 0))
                 return
 
-        # 7. Lock path (all three reasons)
+        # 7. Lock path (every lock reason)
         alert_manager.set_alert_level("ALERT")
         await_override(api_client, alert_manager, ignition, rate, driver_id,
                        lock_reason, assessment_id)
@@ -1097,12 +1138,19 @@ def run_monitoring(
                 alert_manager.get_relay_state())
 
     pipeline = MetricsPipeline(head_pose, pose_release_hold=pose_release_hold)
+    logger.info("Monitoring: FRS weights %s, theoretical max %s",
+                pipeline.frs_calc.weights, pipeline.frs_calc.theoretical_max())
+
     driver: Optional[Dict[str, Any]] = None
     current_driver_id: Optional[int] = None
     thresholds: Dict[str, float] = dict(DEFAULT_THRESHOLDS)
     defaults_logged = False
     last_danger_push = 0.0
     frame_count = 0
+    # Effective level (FRS band, or DANGER under the head-pose override) as
+    # of the previous scored frame, so transitions can be logged once rather
+    # than every frame. ``None`` until the first face is processed.
+    last_level: Optional[str] = None
 
     while ignition.phase() is Phase.MONITORING:
         frame_count += 1
@@ -1120,7 +1168,12 @@ def run_monitoring(
         # Landmarks - no face is treated as the safe state
         landmarks, _rect = extractor.extract(frame)
         if landmarks is None:
-            pipeline.note_no_face()
+            pipeline.note_no_face(now)
+            # No face is the safe state; record it as an ALERT transition so
+            # a brief dropout and re-acquire at the same level stays quiet.
+            if last_level not in (None, "ALERT"):
+                logger.info("Level %s -> ALERT (no face - metrics unavailable)", last_level)
+            last_level = "ALERT"
             alert_manager.set_alert_level("ALERT")
             display_text(frame, "NO FACE")
             draw_banner(frame, banner, banner_color)
@@ -1154,6 +1207,26 @@ def run_monitoring(
                 driver = match
 
         m = pipeline.process(landmarks, thresholds, now, now_mono)
+
+        # Log the full FRS breakdown whenever the effective level changes, so
+        # the session log shows which term carried the score into the new
+        # band rather than just the total.
+        if m.level != last_level:
+            logger.info(
+                "Level %s -> %s: %s%s",
+                last_level or "(none)", m.level,
+                pipeline.frs_calc.format_breakdown(m.frs_result),
+                f"  [{m.override_reason} override forcing DANGER]" if m.overridden else "",
+            )
+            logger.debug(
+                "Level %s inputs: ear=%.3f (norm %.3f) perclos=%.1f%% (norm %.3f) "
+                "blink_dur=%.0fms (norm %.3f) blink_freq=%.1f (norm %.3f) "
+                "mar=%.3f (norm %.3f) yawn_norm=%.3f",
+                m.level, m.ear, m.ear_norm, m.perclos, m.perclos_norm,
+                m.blink_duration_ms, m.bd_norm, m.blink_freq, m.bf_norm,
+                m.mar, m.mar_norm, m.yawn_norm,
+            )
+            last_level = m.level
 
         # Physical alerts - LEDs and buzzer only. m.level is DANGER while the
         # head-pose override is active regardless of the (lower) FRS level.

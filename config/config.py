@@ -153,15 +153,22 @@ FRS_WEIGHTS: Final[Dict[str, float]] = {
     "blink_frequency": 0.15,
     "perclos": 0.30,
     "yawn": 0.15,
+    "microsleep": 0.25,
 }
 
+# Weights that sit *on top of* the eye-metric partition rather than inside it
+# (see modules.frs). Both were added after the eye weights and bands were
+# tuned; carving them out would have rescaled every existing eye-only score.
+_ADDITIVE_WEIGHTS: Final[tuple] = ("yawn", "microsleep")
+
 # Guard against accidental edits: the eye-metric weights must still form a
-# proper partition of 1.0 (the yawn weight is additive and excluded).
+# proper partition of 1.0 (the additive weights are excluded).
 _EYE_WEIGHT_SUM: Final[float] = sum(
-    w for k, w in FRS_WEIGHTS.items() if k != "yawn"
+    w for k, w in FRS_WEIGHTS.items() if k not in _ADDITIVE_WEIGHTS
 )
 assert abs(_EYE_WEIGHT_SUM - 1.0) < 1e-9, (
-    f"FRS_WEIGHTS eye metrics (all but 'yawn') must sum to 1.0, got {_EYE_WEIGHT_SUM}"
+    f"FRS_WEIGHTS eye metrics (all but {_ADDITIVE_WEIGHTS}) must sum to 1.0, "
+    f"got {_EYE_WEIGHT_SUM}"
 )
 
 # ---------------------------------------------------------------------------

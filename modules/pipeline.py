@@ -5,8 +5,9 @@ Both operating phases (pre-drive assessment and continuous monitoring) turn
 one frame's landmarks into one :class:`FrameMetrics` through exactly the same
 code path::
 
-    landmarks -> EAR / MAR -> blink / PERCLOS / yawn -> normalise -> FRS
-              -> head pose -> debounce -> effective level
+    landmarks -> EAR / MAR -> blink / microsleep / PERCLOS / yawn
+              -> normalise -> FRS -> head pose -> debounce
+              -> effective level
 
 Keeping this in one place is what guarantees the two phases can never
 compute the metrics differently: ``main.py`` only decides what to *do* with
@@ -23,9 +24,9 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from modules.blink import BlinkDetector
+from modules.blink import BlinkDetector, MicrosleepDetector
 from modules.ear import EARCalculator
-from modules.frs import FRSCalculator
+from modules.frs import MICROSLEEP_COUNT_WINDOW_S, FRSCalculator
 from modules.mar import MARCalculator, YawnDetector
 from modules.perclos import PERCLOSCalculator
 
@@ -49,16 +50,29 @@ CALIBRATION_BLINK_WINDOW_S: float = 60.0
 # Log the head pose every N processed frames to avoid log spam.
 POSE_LOG_INTERVAL: int = 30
 
+# Hysteresis on the microsleep DANGER override. There is no engage hold: the
+# 1.0 s closure ``MicrosleepDetector`` already required *is* the hold, so the
+# override engages on the frame the microsleep is confirmed. The release hold
+# keeps the level at DANGER for this long after the eyes reopen, so a 1.2 s
+# microsleep does not drop straight back to ALERT the instant the driver
+# blinks awake.
+MICROSLEEP_DANGER_HOLD_S: float = 0.0
+MICROSLEEP_RELEASE_HOLD_S: float = 3.0
+
 
 class HeadPoseDebounce:
     """
-    Wall-clock debounce for the head-pose DANGER override.
+    Wall-clock hold/release debounce for a DANGER override.
 
-    The override engages once the pose has been *continuously* alerting for
+    The override engages once the input has been *continuously* alerting for
     ``danger_hold`` seconds and releases once it has been *continuously*
     normal for ``release_hold`` seconds. Any frame of the opposite state
     restarts the respective timer. Both use ``time.monotonic()`` so the
     behaviour does not depend on the (variable) loop rate.
+
+    Named for its first user, the head-pose override, but the logic is
+    generic and :class:`MetricsPipeline` also drives the microsleep override
+    with it (``danger_hold=0``, so that one engages immediately).
     """
 
     def __init__(self, danger_hold: float, release_hold: float) -> None:
@@ -136,6 +150,10 @@ class FrameMetrics:
     pose_event: Optional[str]      # "engaged" | "released" | None
     yawn_event: Optional[Dict[str, float]]
     yawn_status: Dict[str, Any] = field(default_factory=dict)
+    microsleep_override: bool = False           # microsleep DANGER override active
+    microsleep_event: Optional[Dict[str, float]] = None   # set on confirmation
+    microsleep_count: int = 0                   # confirmed in the trailing window
+    microsleep_status: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def frs(self) -> float:
@@ -143,13 +161,28 @@ class FrameMetrics:
         return float(self.frs_result["frs"])
 
     @property
+    def overridden(self) -> bool:
+        """Whether either DANGER override (head pose or microsleep) is active."""
+        return self.pose_override or self.microsleep_override
+
+    @property
+    def override_reason(self) -> str:
+        """Human-readable cause of the override, or ``""`` when there is none."""
+        reasons = []
+        if self.microsleep_override:
+            reasons.append("microsleep")
+        if self.pose_override:
+            reasons.append("head pose")
+        return " + ".join(reasons)
+
+    @property
     def level(self) -> str:
-        """Effective alert level: ``DANGER`` while the head-pose override is active."""
-        return "DANGER" if self.pose_override else str(self.frs_result["level"])
+        """Effective alert level: ``DANGER`` while either override is active."""
+        return "DANGER" if self.overridden else str(self.frs_result["level"])
 
     def effective_result(self) -> Dict[str, Any]:
-        """``frs_result`` with ``level``/``color`` forced to DANGER under the override."""
-        if self.pose_override:
+        """``frs_result`` with ``level``/``color`` forced to DANGER under an override."""
+        if self.overridden:
             return dict(self.frs_result, level="DANGER", color="red")
         return self.frs_result
 
@@ -172,6 +205,8 @@ class MetricsPipeline:
             scaled by ``blink_window_s / 60`` automatically.
         pose_release_hold: Seconds of normal pose before a head-pose DANGER
             override is released.
+        microsleep_release_hold: Seconds after the eyes reopen before a
+            microsleep DANGER override is released.
     """
 
     def __init__(
@@ -180,6 +215,7 @@ class MetricsPipeline:
         blink_window_s: float = CALIBRATION_BLINK_WINDOW_S,
         pose_release_hold: float = HEAD_POSE_RELEASE_HOLD_S,
         pose_danger_hold: float = HEAD_POSE_DANGER_HOLD_S,
+        microsleep_release_hold: float = MICROSLEEP_RELEASE_HOLD_S,
     ) -> None:
         self.head_pose = head_pose
         self.blink_window_s = float(blink_window_s)
@@ -188,8 +224,14 @@ class MetricsPipeline:
         self.blink_detector = BlinkDetector(frequency_window=int(blink_window_s))
         self.perclos_calc = PERCLOSCalculator()
         self.yawn_detector = YawnDetector()
+        self.microsleep_detector = MicrosleepDetector()
         self.frs_calc = FRSCalculator()
         self.pose_debounce = HeadPoseDebounce(pose_danger_hold, pose_release_hold)
+        # Engages on the frame the microsleep is confirmed (no engage hold -
+        # the 1.0 s closure was the hold) and lingers for the release hold.
+        self.microsleep_debounce = HeadPoseDebounce(
+            MICROSLEEP_DANGER_HOLD_S, microsleep_release_hold
+        )
         self._frames = 0
 
     # ------------------------------------------------------------------
@@ -241,6 +283,33 @@ class MetricsPipeline:
         # Raw metrics
         ear = self.ear_calc.compute_average_ear(landmarks)
         self.blink_detector.update(ear, thresholds["ear_threshold"], now)
+        # Same EAR and same threshold as the blink detector, so the two can
+        # never disagree about whether the eyes are shut. Closures of
+        # MICROSLEEP_MIN_DURATION_S or more are reported here and rejected
+        # there, which is the whole split.
+        microsleep_event = self.microsleep_detector.update(
+            ear, thresholds["ear_threshold"], now
+        )
+        if microsleep_event:
+            logger.warning(
+                "MICROSLEEP confirmed: eyes closed %.2fs (EAR %.3f < threshold %.3f) - "
+                "%d in the last %.0fs -> DANGER override",
+                microsleep_event["duration_ms"] / 1000.0, ear,
+                thresholds["ear_threshold"],
+                self.microsleep_detector.get_microsleep_count(
+                    MICROSLEEP_COUNT_WINDOW_S, now),
+                MICROSLEEP_COUNT_WINDOW_S,
+            )
+        ms_event = self.microsleep_debounce.update(
+            self.microsleep_detector.is_microsleeping, now_mono
+        )
+        if ms_event == "released":
+            logger.info(
+                "Microsleep over for %.2fs - releasing DANGER override (total closure %.2fs)",
+                self.microsleep_debounce.release_hold,
+                (self.microsleep_detector.microsleep_durations[-1] / 1000.0
+                 if self.microsleep_detector.microsleep_durations else 0.0),
+            )
         perclos = self.perclos_calc.update(ear, thresholds["ear_threshold"])
         mar = self.mar_calc.compute_mar(landmarks)
         yawn_event = self.yawn_detector.update(mar, thresholds["yawn_threshold"], now)
@@ -251,7 +320,7 @@ class MetricsPipeline:
                         thresholds["yawn_threshold"], self.yawn_detector.get_yawn_count())
 
         # Normalise against this driver's calibration
-        blink_duration_ms = self.blink_detector.get_average_duration()
+        blink_duration_ms = self.blink_detector.get_average_duration(now)
         blink_freq = self.blink_detector.get_blink_frequency(now)
         ear_norm = self.ear_calc.normalize(ear, thresholds["ear_baseline"])
         bd_norm = self.blink_detector.normalize_duration(
@@ -270,7 +339,14 @@ class MetricsPipeline:
         mar_norm = self.mar_calc.normalize(mar, thresholds["mar_baseline"])
         yawn_norm = mar_norm if self.yawn_detector.is_yawning else 1.0
 
-        frs_result = self.frs_calc.compute(ear_norm, bd_norm, bf_norm, perclos_norm, yawn_norm)
+        # Persistence term: repeated microsleeps keep the *score* elevated
+        # between episodes, which the override alone cannot do.
+        microsleep_count = self.microsleep_detector.get_microsleep_count(
+            MICROSLEEP_COUNT_WINDOW_S, now
+        )
+        frs_result = self.frs_calc.compute(
+            ear_norm, bd_norm, bf_norm, perclos_norm, yawn_norm, microsleep_count
+        )
 
         return FrameMetrics(
             t=now, ear=ear, mar=mar, perclos=perclos,
@@ -280,23 +356,61 @@ class MetricsPipeline:
             frs_result=frs_result, pose=pose,
             pose_override=self.pose_debounce.active, pose_event=pose_event,
             yawn_event=yawn_event, yawn_status=self.yawn_detector.get_status(now),
+            microsleep_override=self.microsleep_debounce.active,
+            microsleep_event=microsleep_event,
+            microsleep_count=microsleep_count,
+            microsleep_status=self.microsleep_detector.get_status(now),
         )
 
-    def note_no_face(self) -> None:
+    def note_no_face(self, now: Optional[float] = None) -> None:
         """
         Call on frames with no landmarks.
 
         No pose observation is possible, so the debounce must not keep a
         stale "alerting since" time - or a live override - across the gap.
+        The same applies to the microsleep closure timer: without clearing it
+        the timer would keep running across a gap in which no EAR was
+        observed at all, and the next frame with a face could confirm a
+        "microsleep" that was really a lost face.
+
+        Dropping a *live* microsleep override this way is the conservative
+        reading and it is logged at WARNING, because a driver whose head
+        leaves the frame mid-microsleep is exactly the case worth seeing in
+        the log - the alert level falls back to ALERT on a no-face frame
+        regardless, so nothing here changes behaviour, only visibility.
+
+        Args:
+            now: ``time.time()`` for the frame, used only to report how long
+                the eyes had been shut. Defaults to the wall clock.
         """
         if self.pose_debounce.active:
             logger.info("Face lost - clearing head-pose DANGER override")
         self.pose_debounce.reset()
 
+        abandoned = self.microsleep_detector.note_no_face(now)
+        if abandoned and abandoned["was_microsleeping"]:
+            logger.warning(
+                "FACE LOST MID-MICROSLEEP after %.2fs of eye closure - dropping the "
+                "microsleep DANGER override and abandoning the closure. The driver may "
+                "still be microsleeping; nothing can be measured without landmarks.",
+                abandoned["closed_s"],
+            )
+        elif self.microsleep_debounce.active:
+            # Eyes had already reopened; this was only the release hold.
+            logger.info("Face lost - clearing microsleep DANGER override (release hold)")
+        elif abandoned and float(abandoned["closed_s"]) >= self.microsleep_detector.min_duration / 2:
+            # A closure well on its way to a microsleep, interrupted. Too
+            # common to warn about, useful when reconstructing a session.
+            logger.debug("Face lost %.2fs into a closure - closure abandoned unconfirmed",
+                         abandoned["closed_s"])
+        self.microsleep_debounce.reset()
+
     def reset(self) -> None:
-        """Fresh per-driver history (blinks, PERCLOS, yawns, pose debounce)."""
+        """Fresh per-driver history (blinks, microsleeps, PERCLOS, yawns, debounces)."""
         self.blink_detector.reset()
         self.perclos_calc.reset()
         self.yawn_detector.reset()
+        self.microsleep_detector.reset()
+        self.microsleep_debounce.reset()
         self.pose_debounce.reset()
         self._frames = 0

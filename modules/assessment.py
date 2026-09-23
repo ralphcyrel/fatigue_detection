@@ -8,6 +8,7 @@ rolling window** of the scored FRS series:
 
     worst_window_mean = max over t of mean(frs_scored[t, t + W])   (W = 5 s)
     passed            = worst_window_mean < WARNING_THRESHOLD (0.40)
+                        and microsleeps == 0
 
 Why this aggregate and not the mean or median
 ---------------------------------------------
@@ -21,14 +22,26 @@ landmark can spike the EAR term for a frame. A 5 s window needs a
 the existing WARNING band edge (any window that would have shown a yellow
 LED fails) so no new tunable is introduced.
 
+Microsleep: an unconditional fail
+--------------------------------
+A single confirmed microsleep (:class:`~modules.blink.MicrosleepDetector`,
+≥ 1.0 s eyes closed) fails the assessment outright, whatever
+``worst_window_mean`` says. Pre-drive exists to decide whether someone should
+start driving at all, and sleep intrusion while sitting still in a stationary
+vehicle is disqualifying on its own - the aggregate is a measure of *risk*,
+whereas a microsleep is the event the whole system is trying to prevent,
+already happening. It is reported as ``failed_on_microsleep`` so the caller
+can raise ``LockReason.MICROSLEEP_DETECTED`` rather than a generic fatigue
+lock.
+
 Per-frame scoring
 -----------------
 Each frame is recorded twice: ``frs_raw`` (the pipeline's eye + mouth FRS)
-and ``frs_scored`` = ``max(frs_raw, DANGER_THRESHOLD)`` while the head-pose
-DANGER override is active, else ``frs_raw``. A sustained nod during the
-assessment therefore fails it, and the raw series is still available for
-analysis. Frames with no face are counted but not scored; if too many are
-missing the assessment is void.
+and ``frs_scored`` = ``max(frs_raw, DANGER_THRESHOLD)`` while a DANGER
+override (head pose or microsleep) is active, else ``frs_raw``. A sustained
+nod during the assessment therefore fails it, and the raw series is still
+available for analysis. Frames with no face are counted but not scored; if
+too many are missing the assessment is void.
 
 Every sample is kept and written to ``logs/assessments/<device>_<driver>_
 <timestamp>.csv`` (plus a ``.json`` summary) and returned in
@@ -55,8 +68,9 @@ SAMPLE_FIELDS: List[str] = [
     "t_rel", "t_abs", "ear", "mar", "perclos", "blink_duration_ms", "blink_freq",
     "ear_norm", "bd_norm", "bf_norm", "perclos_norm", "mar_norm", "yawn_norm",
     "ear_excess", "blink_duration_excess", "blink_frequency_excess", "perclos_excess",
-    "yawn_excess", "frs_raw", "frs_scored", "level",
+    "yawn_excess", "microsleep_excess", "frs_raw", "frs_scored", "level",
     "pitch", "yaw", "roll", "pose_alert", "pose_override", "yawn_state",
+    "microsleep_state", "microsleep_override", "microsleep_confirmed",
 ]
 
 
@@ -143,7 +157,7 @@ class PredriveAssessment:
             raise RuntimeError("PredriveAssessment.add() called before start()")
         t = m.t if now is None else now
         frs_raw = m.frs
-        frs_scored = max(frs_raw, DANGER_THRESHOLD) if m.pose_override else frs_raw
+        frs_scored = max(frs_raw, DANGER_THRESHOLD) if m.overridden else frs_raw
         comps = m.frs_result.get("components", {})
         pose = m.pose or {}
         self.samples.append({
@@ -158,10 +172,16 @@ class PredriveAssessment:
             "blink_frequency_excess": comps.get("blink_frequency_excess", 0.0),
             "perclos_excess": comps.get("perclos_excess", 0.0),
             "yawn_excess": comps.get("yawn_excess", 0.0),
+            "microsleep_excess": comps.get("microsleep_excess", 0.0),
             "frs_raw": frs_raw, "frs_scored": frs_scored, "level": m.level,
             "pitch": pose.get("pitch"), "yaw": pose.get("yaw"), "roll": pose.get("roll"),
             "pose_alert": bool(pose.get("alert", False)), "pose_override": bool(m.pose_override),
             "yawn_state": m.yawn_status.get("state", ""),
+            "microsleep_state": m.microsleep_status.get("state", ""),
+            "microsleep_override": bool(m.microsleep_override),
+            # True only on the frame a microsleep was confirmed, so counting
+            # these needs no edge detection.
+            "microsleep_confirmed": m.microsleep_event is not None,
         })
 
     def add_no_face(self, now: Optional[float] = None) -> None:
@@ -206,6 +226,10 @@ class PredriveAssessment:
             prev = s["yawn_state"]
         return count
 
+    def _count_microsleeps(self) -> int:
+        """Number of microsleeps confirmed during the assessment window."""
+        return sum(1 for s in self.samples if s["microsleep_confirmed"])
+
     def no_face_fraction(self) -> float:
         """Fraction of all frames (scored + unscored) that had no face."""
         total = len(self.samples) + self.no_face_frames
@@ -227,6 +251,7 @@ class PredriveAssessment:
         raw = np.array([s["frs_raw"] for s in self.samples], dtype=float)
         worst = self.worst_window_mean()
         void = self.is_void()
+        microsleeps = self._count_microsleeps()
         return {
             "started_at": self.start_time,
             "ended_at": self.end_time or self.start_time + self.duration_s,
@@ -242,9 +267,15 @@ class PredriveAssessment:
             "worst_window_s": self.worst_window_s,
             "pass_threshold": self.pass_threshold,
             "pose_override_frames": int(sum(1 for s in self.samples if s["pose_override"])),
+            "microsleep_override_frames": int(
+                sum(1 for s in self.samples if s["microsleep_override"])),
             "yawns": self._count_yawns(),
+            "microsleeps": microsleeps,
+            # Reported separately from ``passed`` so the caller can raise a
+            # distinguishable lock reason rather than a generic fatigue fail.
+            "failed_on_microsleep": microsleeps > 0,
             "void": void,
-            "passed": (not void) and worst < self.pass_threshold,
+            "passed": (not void) and worst < self.pass_threshold and microsleeps == 0,
             "samples": list(self.samples),
         }
 
