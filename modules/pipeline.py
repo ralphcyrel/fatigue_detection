@@ -59,6 +59,12 @@ POSE_LOG_INTERVAL: int = 30
 MICROSLEEP_DANGER_HOLD_S: float = 0.0
 MICROSLEEP_RELEASE_HOLD_S: float = 3.0
 
+# TEMPORARY DIAGNOSTIC (``MetricsPipeline(diag_ear=True)``, CLI ``--diag-ear``).
+# With it on, every change of the closed/open decision is logged, plus a
+# periodic heartbeat every this many frames so an unchanging decision is still
+# visible. Off by default: one line per frame at 30 fps is unreadable.
+DIAG_EAR_HEARTBEAT_FRAMES: int = 30
+
 
 class HeadPoseDebounce:
     """
@@ -207,6 +213,10 @@ class MetricsPipeline:
             override is released.
         microsleep_release_hold: Seconds after the eyes reopen before a
             microsleep DANGER override is released.
+        diag_ear: TEMPORARY DIAGNOSTIC. Log the raw EAR, the active closure
+            threshold and the resulting closed/open decision on every change
+            and periodically in between. Use when PERCLOS / blink / microsleep
+            all report nothing, which means the closure test is never firing.
     """
 
     def __init__(
@@ -216,6 +226,7 @@ class MetricsPipeline:
         pose_release_hold: float = HEAD_POSE_RELEASE_HOLD_S,
         pose_danger_hold: float = HEAD_POSE_DANGER_HOLD_S,
         microsleep_release_hold: float = MICROSLEEP_RELEASE_HOLD_S,
+        diag_ear: bool = False,
     ) -> None:
         self.head_pose = head_pose
         self.blink_window_s = float(blink_window_s)
@@ -233,6 +244,9 @@ class MetricsPipeline:
             MICROSLEEP_DANGER_HOLD_S, microsleep_release_hold
         )
         self._frames = 0
+        self.diag_ear = diag_ear
+        # Last closed/open decision, for edge-triggered diagnostic logging.
+        self._diag_last_closed: Optional[bool] = None
 
     # ------------------------------------------------------------------
 
@@ -282,6 +296,15 @@ class MetricsPipeline:
 
         # Raw metrics
         ear = self.ear_calc.compute_average_ear(landmarks)
+
+        # TEMPORARY DIAGNOSTIC. This single comparison gates PERCLOS, blink
+        # detection and microsleep detection alike - all three call
+        # ``ear < thresholds["ear_threshold"]`` - so when all three report
+        # nothing at once, this line shows whether the closure test is firing
+        # at all, and against what.
+        if self.diag_ear:
+            self._log_ear_decision(ear, thresholds, now)
+
         self.blink_detector.update(ear, thresholds["ear_threshold"], now)
         # Same EAR and same threshold as the blink detector, so the two can
         # never disagree about whether the eyes are shut. Closures of
@@ -360,6 +383,43 @@ class MetricsPipeline:
             microsleep_event=microsleep_event,
             microsleep_count=microsleep_count,
             microsleep_status=self.microsleep_detector.get_status(now),
+        )
+
+    def _log_ear_decision(
+        self, ear: float, thresholds: Dict[str, float], now: float
+    ) -> None:
+        """
+        TEMPORARY DIAGNOSTIC: report the per-frame closed/open decision.
+
+        Logged on every transition (so each closure is bracketed exactly) and
+        every :data:`DIAG_EAR_HEARTBEAT_FRAMES` frames in between (so a
+        decision that never changes is still visible). Enabled by
+        ``diag_ear``; see :meth:`__init__`.
+
+        Args:
+            ear: Raw EAR for this frame.
+            thresholds: The driver's threshold dict.
+            now: ``time.time()`` for the frame.
+        """
+        threshold = float(thresholds["ear_threshold"])
+        baseline = float(thresholds.get("ear_baseline", 0.0))
+        closed = ear < threshold
+        changed = closed != self._diag_last_closed
+        if not changed and self._frames % DIAG_EAR_HEARTBEAT_FRAMES != 0:
+            return
+        self._diag_last_closed = closed
+        logger.info(
+            "DIAG ear=%.4f threshold=%.4f -> %s | ear/baseline=%.3f "
+            "threshold/baseline=%.3f | perclos=%.1f%% closure=%.2fs "
+            "blinks_in_window=%d microsleeps=%d%s",
+            ear, threshold, "CLOSED" if closed else "open",
+            (ear / baseline) if baseline > 0 else float("nan"),
+            (threshold / baseline) if baseline > 0 else float("nan"),
+            self.perclos_calc.get_perclos(),
+            self.microsleep_detector.get_closed_duration(now),
+            int(self.blink_detector.get_blink_frequency(now)),
+            self.microsleep_detector.get_microsleep_count(MICROSLEEP_COUNT_WINDOW_S, now),
+            "  <-- transition" if changed else "",
         )
 
     def note_no_face(self, now: Optional[float] = None) -> None:

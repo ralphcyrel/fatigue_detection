@@ -799,7 +799,9 @@ def load_thresholds(
             return None
         logger.warning("No thresholds for driver %s - using defaults; "
                        "run `main.py --enroll` for this driver", driver_id)
-        return dict(DEFAULT_THRESHOLDS)
+        defaults = dict(DEFAULT_THRESHOLDS)
+        check_threshold_sanity(defaults, "DEFAULT_THRESHOLDS")
+        return defaults
 
     # Drivers enrolled before yawn detection have no MAR baseline; say so
     # explicitly because the generic default silently makes yawn detection
@@ -813,7 +815,71 @@ def load_thresholds(
     # a partial record.
     for key, val in DEFAULT_THRESHOLDS.items():
         thresholds.setdefault(key, val)
+    check_threshold_sanity(thresholds, f"backend, driver {driver_id}")
     return thresholds
+
+
+def check_threshold_sanity(thresholds: Dict[str, float], source: str) -> None:
+    """
+    Log whether ``ear_threshold`` is consistent with ``ear_baseline``.
+
+    TEMPORARY DIAGNOSTIC. Everything that decides "are the eyes shut" -
+    PERCLOS, the blink detector and the microsleep detector - tests
+    ``ear < thresholds["ear_threshold"]``, so a threshold that does not match
+    the baseline it was derived from silently disables all three at once:
+    PERCLOS stays at 0 %, no blink ever completes, and no closure is ever
+    long enough to confirm a microsleep. The FRS then rides on the EAR term
+    alone, which still responds to closure because it divides by the
+    baseline rather than comparing against the threshold.
+
+    Calibration sets ``ear_threshold = ear_baseline * EAR_THRESHOLD_RATIO``
+    (0.75), so the ratio below should read ~0.75. Anything much lower means
+    the two values came from different places - a stale threshold against a
+    re-enrolled baseline, or a partial backend record.
+
+    Args:
+        thresholds: The dict about to be handed to the pipeline.
+        source: Where it came from, for the log line.
+    """
+    baseline = float(thresholds.get("ear_baseline", 0.0))
+    threshold = float(thresholds.get("ear_threshold", 0.0))
+    if baseline <= 0.0:
+        logger.error("THRESHOLD CHECK (%s): ear_baseline is %.4f - EAR normalisation "
+                     "and the closure test are both meaningless", source, baseline)
+        return
+    ratio = threshold / baseline
+    logger.info(
+        "THRESHOLD CHECK (%s): ear_baseline=%.4f ear_threshold=%.4f ratio=%.3f "
+        "(expected %.2f) | perclos_baseline=%.3f blink_duration_baseline=%.1fms "
+        "blink_frequency_baseline=%.2f",
+        source, baseline, threshold, ratio, EAR_THRESHOLD_RATIO,
+        float(thresholds.get("perclos_baseline", 0.0)),
+        float(thresholds.get("blink_duration_baseline", 0.0)),
+        float(thresholds.get("blink_frequency_baseline", 0.0)),
+    )
+    if ratio < EAR_THRESHOLD_RATIO - 0.10:
+        logger.error(
+            "THRESHOLD TOO LOW (%s): ear_threshold is %.1f%% of ear_baseline, expected "
+            "%.0f%%. The eye must drop to %.1f%% of its open value (below %.4f) before "
+            "anything counts as closed. Real closures often only reach 40-50%% of "
+            "baseline, so PERCLOS, blink detection and microsleep detection may ALL "
+            "report nothing while the driver's eyes are visibly shut. Re-enrol this "
+            "driver, or check the backend is not serving a stale threshold against a "
+            "newer baseline.",
+            source, ratio * 100, EAR_THRESHOLD_RATIO * 100, ratio * 100, threshold,
+        )
+    elif ratio > EAR_THRESHOLD_RATIO + 0.10:
+        logger.error(
+            "THRESHOLD TOO HIGH (%s): ear_threshold is %.1f%% of ear_baseline, expected "
+            "%.0f%%. Partly-open eyes will register as closed, inflating PERCLOS and "
+            "manufacturing blinks. Re-enrol this driver.",
+            source, ratio * 100, EAR_THRESHOLD_RATIO * 100,
+        )
+    if float(thresholds.get("perclos_baseline", 0.0)) <= 0.0:
+        logger.error(
+            "THRESHOLD CHECK (%s): perclos_baseline is 0 - PERCLOSCalculator.normalize() "
+            "returns 0.0 for a zero baseline, so the PERCLOS term is dead regardless of "
+            "how long the eyes are shut", source)
 
 
 def identify_driver_bounded(
@@ -959,6 +1025,7 @@ def run_predrive_assessment(
     rate: LoopRate,
     debug_pose: bool = False,
     pose_release_hold: float = HEAD_POSE_RELEASE_HOLD_S,
+    diag_ear: bool = False,
 ) -> None:
     """
     One pre-drive cycle. Returns when the ignition turns ON (after a pass or
@@ -1004,6 +1071,7 @@ def run_predrive_assessment(
                 head_pose,
                 blink_window_s=config.PREDRIVE_ASSESSMENT_SECONDS,
                 pose_release_hold=pose_release_hold,
+                diag_ear=diag_ear,
             )
             assessment = PredriveAssessment()
             assessment.start(time.time())
@@ -1122,6 +1190,7 @@ def run_monitoring(
     rate: LoopRate,
     debug_pose: bool = False,
     pose_release_hold: float = HEAD_POSE_RELEASE_HOLD_S,
+    diag_ear: bool = False,
 ) -> None:
     """
     Monitor continuously while the ignition is ON. Returns when it turns OFF.
@@ -1137,13 +1206,17 @@ def run_monitoring(
     logger.info("=== MONITORING phase (ignition ON) - starter %s, lock refused ===",
                 alert_manager.get_relay_state())
 
-    pipeline = MetricsPipeline(head_pose, pose_release_hold=pose_release_hold)
+    pipeline = MetricsPipeline(head_pose, pose_release_hold=pose_release_hold,
+                               diag_ear=diag_ear)
     logger.info("Monitoring: FRS weights %s, theoretical max %s",
                 pipeline.frs_calc.weights, pipeline.frs_calc.theoretical_max())
 
     driver: Optional[Dict[str, Any]] = None
     current_driver_id: Optional[int] = None
     thresholds: Dict[str, float] = dict(DEFAULT_THRESHOLDS)
+    # The starting thresholds, before any driver is recognised; replaced by
+    # load_thresholds() (which runs the same check) once one is.
+    check_threshold_sanity(thresholds, "DEFAULT_THRESHOLDS (no driver yet)")
     defaults_logged = False
     last_danger_push = 0.0
     frame_count = 0
@@ -1279,6 +1352,12 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         help="overlay the head-pose debounce timers / override state on the preview",
     )
     parser.add_argument(
+        "--diag-ear", action="store_true",
+        help="TEMPORARY DIAGNOSTIC: log raw EAR, the active closure threshold and the "
+             "closed/open decision on every transition. Use when PERCLOS, blink and "
+             "microsleep all report nothing - they share this one comparison",
+    )
+    parser.add_argument(
         "--pose-release-hold", type=float, default=HEAD_POSE_RELEASE_HOLD_S, metavar="SECONDS",
         help="seconds the head pose must be normal before a head-pose DANGER "
              f"is released (default {HEAD_POSE_RELEASE_HOLD_S})",
@@ -1369,13 +1448,13 @@ def main(argv: Optional[list] = None) -> int:
                 if _ignition.phase() is Phase.PREDRIVE:
                     run_predrive_assessment(
                         api_client, extractor, recognizer, _alert_manager, _head_pose,
-                        _ignition, rate, debug_pose=args.debug_pose,
+                        _ignition, rate, debug_pose=args.debug_pose, diag_ear=args.diag_ear,
                         pose_release_hold=args.pose_release_hold,
                     )
                 else:
                     run_monitoring(
                         api_client, extractor, recognizer, _alert_manager, _head_pose,
-                        _ignition, rate, debug_pose=args.debug_pose,
+                        _ignition, rate, debug_pose=args.debug_pose, diag_ear=args.diag_ear,
                         pose_release_hold=args.pose_release_hold,
                     )
 
