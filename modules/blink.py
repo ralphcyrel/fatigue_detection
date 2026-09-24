@@ -309,6 +309,8 @@ class MicrosleepDetector:
         close_time: Timestamp at which the current closure started.
         is_microsleeping: ``True`` from the moment the closure is confirmed
             as a microsleep until the eyes reopen.
+        min_ear: Lowest EAR seen since the current closure began; ``nan``
+            before the first closure.
         microsleep_timestamps: Confirmation time of every microsleep since
             ``reset()``.
         microsleep_durations: Total closure duration (ms) of every completed
@@ -327,6 +329,7 @@ class MicrosleepDetector:
         self.eyes_closed: bool = False
         self.close_time: float = 0.0
         self.is_microsleeping: bool = False
+        self.min_ear: float = float("nan")
         self.microsleep_timestamps: List[float] = []
         self.microsleep_durations: List[float] = []
 
@@ -359,9 +362,12 @@ class MicrosleepDetector:
                 when replaying recorded video.
 
         Returns:
-            ``{"timestamp": float, "duration_ms": float}`` on the frame a
-            microsleep is *confirmed* (``duration_ms`` is the closure so far,
-            i.e. ≈ ``min_duration`` × 1000), otherwise ``None``.
+            ``{"timestamp": float, "duration_ms": float, "min_ear": float}``
+            on the frame a microsleep is *confirmed* (``duration_ms`` is the
+            closure so far, i.e. ≈ ``min_duration`` × 1000), otherwise
+            ``None``. ``min_ear`` is the lowest EAR observed since the closure
+            began - always below ``threshold``, unlike the confirming frame's
+            own EAR in the boundary case described below.
 
             Confirmation normally happens with the eyes still shut. The one
             exception is a closure that crosses ``min_duration`` between two
@@ -374,6 +380,14 @@ class MicrosleepDetector:
         now = time.time() if timestamp is None else timestamp
         currently_closed = ear < threshold
 
+        # Deepest (lowest) EAR seen since this closure began. Reported on the
+        # event so the log can show how far the eye actually shut, rather than
+        # whatever the confirming frame happened to read - which, in the
+        # boundary case below, is the *reopening* frame and therefore sits
+        # above the threshold.
+        if currently_closed:
+            self.min_ear = ear if not self.eyes_closed else min(self.min_ear, ear)
+
         if currently_closed and not self.eyes_closed:
             # Eyes just shut — start timing the closure.
             self.eyes_closed = True
@@ -385,7 +399,8 @@ class MicrosleepDetector:
             if held >= self.min_duration:
                 self.is_microsleeping = True
                 self.microsleep_timestamps.append(now)
-                return {"timestamp": now, "duration_ms": held * 1000.0}
+                return {"timestamp": now, "duration_ms": held * 1000.0,
+                        "min_ear": self.min_ear}
             return None
 
         if not currently_closed and self.eyes_closed:
@@ -405,7 +420,10 @@ class MicrosleepDetector:
                 # and vanish. Confirm it now instead, one frame late.
                 self.microsleep_timestamps.append(now)
                 self.microsleep_durations.append(duration_ms)
-                return {"timestamp": now, "duration_ms": duration_ms}
+                # ``min_ear`` is the minimum over the *closed* frames, so it
+                # excludes this reopening frame's (above-threshold) value.
+                return {"timestamp": now, "duration_ms": duration_ms,
+                        "min_ear": self.min_ear}
             return None
 
         # No transition (still open, or a confirmed microsleep still running).
@@ -507,6 +525,7 @@ class MicrosleepDetector:
         self.eyes_closed = False
         self.close_time = 0.0
         self.is_microsleeping = False
+        self.min_ear = float("nan")
         return abandoned
 
     def reset(self) -> None:
@@ -514,5 +533,6 @@ class MicrosleepDetector:
         self.eyes_closed = False
         self.close_time = 0.0
         self.is_microsleeping = False
+        self.min_ear = float("nan")
         self.microsleep_timestamps.clear()
         self.microsleep_durations.clear()

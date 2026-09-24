@@ -10,6 +10,8 @@ are reused across calls) and wraps every endpoint the other modules need:
                                                assigned to this device
     POST /drivers/{id}/enroll               -> save encoding + baselines
     POST /fatigue-events                    -> log a DANGER event (monitoring)
+    POST /monitoring-faults                 -> open / refresh / resolve a no-face
+                                               or danger-latched fault
     POST /assessments                       -> pre-drive verdict + per-frame series
     POST /override-requests                 -> starter stays inhibited; ask operator
     GET  /override-requests/{id}            -> operator decision (pending/approved/denied)
@@ -61,6 +63,13 @@ RELAY_CONFIRMED_STATE = {
     "LOCKED": "interrupted",
 }
 CONFIRMED_STATE_UNKNOWN = "unknown"
+
+# POST /monitoring-faults: fault_type -> severity. danger_latched is critical:
+# the last thing the unit saw was DANGER and it can no longer see the driver.
+MONITORING_FAULT_SEVERITY = {
+    "no_face": "warning",
+    "danger_latched": "critical",
+}
 
 # Statuses the operator portal may return for an override request.
 OVERRIDE_STATUSES = ("pending", "approved", "denied")
@@ -481,6 +490,101 @@ class APIClient:
         logger.error(
             "Fatigue event rejected: HTTP %s %s", resp.status_code, resp.text[:200]
         )
+        return False
+
+    def push_monitoring_fault(
+        self,
+        fault_uuid: str,
+        status: str,
+        fault_type: str,
+        driver_id: Optional[int],
+        entry_level: str,
+        started_at: datetime,
+        gap_s: float,
+        last_known: Optional[Dict[str, Any]] = None,
+        resolved_at: Optional[datetime] = None,
+        resolution: Optional[str] = None,
+        blocking: bool = False,
+    ) -> bool:
+        """
+        Open, refresh or resolve a monitoring fault (driver not observable).
+
+        ``POST /monitoring-faults``
+
+        Not a fatigue event: the driver must not be accused of fatigue for
+        something the camera failed to see. Both fault types share one body
+        shape (see :data:`MONITORING_FAULT_SEVERITY`):
+
+        * ``no_face`` - a gap from ALERT / WARNING crossed ``NO_FACE_FAULT_S``.
+        * ``danger_latched`` - a gap from DANGER passed ``NO_FACE_HOLD_S``;
+          the unit is holding DANGER for a driver it can no longer see.
+
+        Every POST for a fault carries the same client-generated
+        ``fault_uuid`` and the backend upserts on it: ``"open"`` when the
+        fault begins, ``"open"`` again every ``MONITORING_FAULT_REFRESH_S``
+        with an updated ``gap_s``, and ``"resolved"`` once. Keyed that way
+        the POSTs can go fire-and-forget from threads (no id round trip) and
+        a retried POST is idempotent. The portal should derive live duration
+        from ``started_at`` and use ``gap_s`` / ``timestamp`` of the latest
+        refresh only as a liveness check against the device heartbeat.
+
+        Args:
+            fault_uuid: Identifies the fault across all its POSTs.
+            status: ``"open"`` or ``"resolved"``.
+            fault_type: ``"no_face"`` or ``"danger_latched"``.
+            driver_id: Driver being monitored, or ``None`` if unrecognised.
+            entry_level: Level the gap began at.
+            started_at: When the face was lost (UTC), not when the fault
+                opened.
+            gap_s: Seconds of continuous no-face as of this POST.
+            last_known: :meth:`FrameMetrics.last_known` of the last scored
+                frame before the gap, or ``None`` if there was none.
+            resolved_at: When the fault ended (UTC); ``"resolved"`` only.
+            resolution: Why it ended - ``"face_reacquired"`` or
+                ``"ignition_off"``; ``"resolved"`` only.
+            blocking: If ``True``, send synchronously (tests).
+
+        Returns:
+            Non-blocking: ``True`` if queued. Blocking: ``True`` on 2xx.
+        """
+        body = {
+            "fault_uuid": fault_uuid,
+            "status": status,
+            "fault_type": fault_type,
+            "severity": MONITORING_FAULT_SEVERITY[fault_type],
+            "device_id": config.DEVICE_ID,
+            "driver_id": int(driver_id) if driver_id is not None else None,
+            "phase": Phase.MONITORING.value,
+            "entry_level": entry_level,
+            "started_at": started_at.isoformat(),
+            "gap_s": round(float(gap_s), 1),
+            "last_known": last_known,
+            "resolved_at": resolved_at.isoformat() if resolved_at else None,
+            "resolution": resolution,
+            "duration_s": (round((resolved_at - started_at).total_seconds(), 1)
+                           if resolved_at else None),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if blocking:
+            return self._send_monitoring_fault(body)
+        threading.Thread(
+            target=self._send_monitoring_fault, args=(body,),
+            name="monitoring-fault", daemon=True,
+        ).start()
+        return True
+
+    def _send_monitoring_fault(self, body: Dict[str, Any]) -> bool:
+        """POST one monitoring-fault body; log and return the outcome."""
+        resp = self._request("POST", "/monitoring-faults", json=body)
+        if resp is None:
+            return False
+        if resp.status_code in _CREATED_OK:
+            logger.info("Monitoring fault %s %s %s gap=%.1fs (driver %s)",
+                        body["fault_type"], body["fault_uuid"], body["status"],
+                        body["gap_s"], body["driver_id"])
+            return True
+        logger.error("Monitoring fault rejected: HTTP %s %s",
+                     resp.status_code, resp.text[:200])
         return False
 
     def check_relay_override(self, driver_id: int) -> Optional[bool]:

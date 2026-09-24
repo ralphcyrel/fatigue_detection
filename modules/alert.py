@@ -181,12 +181,17 @@ class AlertManager:
         ``main.py`` does) does not re-trigger the WARNING beep 30x a second
         or restart the continuous buzzer thread.
 
+        ``"FAULT"`` (monitoring: the driver has not been visible for
+        ``NO_FACE_FAULT_S``) lights yellow *and* red - a combination no
+        fatigue level uses, so it cannot be read as a calmer state than the
+        WARNING it may have replaced - with one long beep on entry.
+
         Args:
-            level: ``"ALERT"``, ``"WARNING"`` or ``"DANGER"``. Unknown values
-                are logged and treated as ``"ALERT"`` (fail safe).
+            level: ``"ALERT"``, ``"WARNING"``, ``"DANGER"`` or ``"FAULT"``.
+                Unknown values are logged and treated as ``"ALERT"``.
         """
         level = level.upper()
-        if level not in ("ALERT", "WARNING", "DANGER"):
+        if level not in ("ALERT", "WARNING", "DANGER", "FAULT"):
             logger.warning("Unknown alert level %r - treating as ALERT", level)
             level = "ALERT"
 
@@ -211,6 +216,15 @@ class AlertManager:
             # the frame loop.
             threading.Thread(
                 target=self.trigger_buzzer, args=("short",), daemon=True
+            ).start()
+
+        elif level == "FAULT":
+            self._stop_continuous_buzzer()
+            self._write(LED_GREEN, 0)
+            self._write(LED_YELLOW, 1)
+            self._write(LED_RED, 1)
+            threading.Thread(
+                target=self.trigger_buzzer, args=("long",), daemon=True
             ).start()
 
         else:  # DANGER - LEDs and buzzer only; the relay is never driven here.

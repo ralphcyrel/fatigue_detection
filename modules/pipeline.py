@@ -13,14 +13,22 @@ Keeping this in one place is what guarantees the two phases can never
 compute the metrics differently: ``main.py`` only decides what to *do* with
 the result (score an assessment, or drive alerts).
 
+Frames with no face go through :meth:`MetricsPipeline.note_no_face`, which
+returns a :class:`NoFaceVerdict` - the level to drive for that frame - from
+the same :class:`NoFacePolicy` in both phases. The policy is only *enabled*
+in monitoring; pre-drive keeps its own answer to a missing face (the
+assessment is voided and routed to an operator) and gets the old ALERT.
+
 The module imports no cv2 / dlib. The :class:`HeadPoseEstimator` (which
 needs cv2 for ``solvePnP``) is injected, so the pipeline can be exercised
 with a stub estimator on a machine without those libraries.
 """
 
 import logging
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -58,6 +66,18 @@ POSE_LOG_INTERVAL: int = 30
 # blinks awake.
 MICROSLEEP_DANGER_HOLD_S: float = 0.0
 MICROSLEEP_RELEASE_HOLD_S: float = 3.0
+
+# No-face policy (monitoring only; see NoFacePolicy). All wall-clock seconds
+# of *continuous* no-face, measured with time.monotonic().
+# Up to this long a gap is a detector dropout: the level is held silently.
+NO_FACE_HOLD_S: float = 2.0
+# From ALERT / WARNING, a gap this long means the system can no longer see the
+# driver at all - a FAULT for the operator, not a fatigue verdict.
+NO_FACE_FAULT_S: float = 10.0
+# A DANGER latched across a gap is released only after the face is back and
+# its own level has been below DANGER for this long continuously. Matches
+# MICROSLEEP_RELEASE_HOLD_S, the other "don't drop DANGER on one good frame".
+NO_FACE_LATCH_RELEASE_S: float = 3.0
 
 # TEMPORARY DIAGNOSTIC (``MetricsPipeline(diag_ear=True)``, CLI ``--diag-ear``).
 # With it on, every change of the closed/open decision is logged, plus a
@@ -134,6 +154,158 @@ class HeadPoseDebounce:
         return 0.0 if self._normal_since is None else now - self._normal_since
 
 
+@dataclass(frozen=True)
+class NoFaceVerdict:
+    """
+    What a no-face frame means for the alert level.
+
+    ``band`` is one of:
+
+    * ``"HOLD"``  - the gap began at ALERT / WARNING and is shorter than
+      :data:`NO_FACE_FAULT_S`; ``level`` is the level the gap began at.
+      ``face_lost`` turns true past :data:`NO_FACE_HOLD_S`, when it stops
+      being a detector dropout and is reported as a lost face.
+    * ``"LATCH"`` - the gap began at DANGER; ``level`` is DANGER for as long
+      as the gap lasts and never becomes FAULT.
+    * ``"FAULT"`` - the gap began at ALERT / WARNING and has lasted
+      :data:`NO_FACE_FAULT_S` or more; ``level`` is ``"FAULT"``.
+    * ``"OFF"``   - policy disabled (pre-drive); ``level`` is ALERT, as
+      before the policy existed.
+    """
+
+    band: str
+    level: str
+    gap_s: float
+    entry_level: str
+    face_lost: bool = False
+    # Set on the one frame a gap opens a backend fault, else None:
+    # "fault_entered" when a HOLD gap crosses into FAULT (fault_type
+    # "no_face"), "latch_lost" when a LATCH gap passes NO_FACE_HOLD_S
+    # (fault_type "danger_latched").
+    event: Optional[str] = None
+
+
+class NoFacePolicy:
+    """
+    Three-band handling of frames with no face, for the monitoring phase.
+
+    The rule it enforces is an asymmetry: **a missing face may never lower
+    the level, and may never manufacture DANGER from a calm baseline.**
+
+    * HOLD  - from ALERT / WARNING the last level is held (not lowered to
+      ALERT, not raised). Past :data:`NO_FACE_HOLD_S` the gap is reported
+      as a lost face; the level is still held.
+    * LATCH - from DANGER the level stays DANGER for the whole gap, and after
+      the face returns until its own level has been below DANGER for
+      :data:`NO_FACE_LATCH_RELEASE_S`. A driver whose head drops out of
+      frame mid-microsleep is exactly the case this exists for.
+    * FAULT - from ALERT / WARNING, past :data:`NO_FACE_FAULT_S` the level
+      becomes ``"FAULT"``: the unit cannot see the driver, which is a
+      condition for an operator, not evidence of fatigue. Never entered from
+      DANGER (that would replace the strongest signal with a weaker one).
+
+    The detectors' own state (pose debounce, microsleep closure) is still
+    cleared on every no-face frame by :meth:`MetricsPipeline.note_no_face`;
+    bridging *those* across a gap is what would manufacture DANGER. Only the
+    *level* is carried.
+
+    Args:
+        enabled: ``False`` makes every verdict ``OFF`` / ALERT (pre-drive).
+        hold_s, fault_s, latch_release_s: See the module constants.
+    """
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        hold_s: float = NO_FACE_HOLD_S,
+        fault_s: float = NO_FACE_FAULT_S,
+        latch_release_s: float = NO_FACE_LATCH_RELEASE_S,
+    ) -> None:
+        if not 0.0 <= hold_s <= fault_s:
+            raise ValueError(f"need 0 <= hold_s <= fault_s, got {hold_s}, {fault_s}")
+        self.enabled = enabled
+        self.hold_s = hold_s
+        self.fault_s = fault_s
+        # Engaged only from on_no_face (never by a face-present DANGER, so
+        # ordinary FRS DANGER gets no extra hysteresis); released by the same
+        # hold/release debounce the overrides use.
+        self.latch = HeadPoseDebounce(0.0, latch_release_s)
+        self._gap_start: Optional[float] = None
+        self._entry_level: str = "ALERT"
+        self._last: Optional[NoFaceVerdict] = None
+
+    @property
+    def in_gap(self) -> bool:
+        """Whether the previous frame had no face."""
+        return self._gap_start is not None
+
+    def on_no_face(self, last_level: Optional[str], now_mono: float) -> NoFaceVerdict:
+        """
+        Classify one no-face frame.
+
+        Args:
+            last_level: Effective level of the last scored frame before this
+                gap (``None`` if no face has been scored yet - treated as
+                ALERT). Only read on the first frame of a gap.
+            now_mono: ``time.monotonic()`` for the frame.
+        """
+        if self._gap_start is None:
+            self._gap_start = now_mono
+            entry = last_level if last_level in ("ALERT", "WARNING", "DANGER") else "ALERT"
+            # A gap that begins inside a latch release window re-arms it.
+            if self.latch.active:
+                entry = "DANGER"
+            self._entry_level = entry
+        gap = now_mono - self._gap_start
+        entry = self._entry_level
+
+        if not self.enabled:
+            verdict = NoFaceVerdict("OFF", "ALERT", gap, entry)
+        elif entry == "DANGER":
+            self.latch.update(True, now_mono)
+            lost = gap > self.hold_s
+            was_lost = self._last is not None and self._last.face_lost
+            verdict = NoFaceVerdict("LATCH", "DANGER", gap, entry, lost,
+                                    "latch_lost" if lost and not was_lost else None)
+        elif gap >= self.fault_s:
+            was_fault = self._last is not None and self._last.band == "FAULT"
+            verdict = NoFaceVerdict("FAULT", "FAULT", gap, entry, True,
+                                    None if was_fault else "fault_entered")
+        else:
+            verdict = NoFaceVerdict("HOLD", entry, gap, entry, gap > self.hold_s)
+        self._last = verdict
+        return verdict
+
+    def on_face(self, level: str, now_mono: float) -> Tuple[bool, Optional[NoFaceVerdict]]:
+        """
+        Feed a face frame's own level (FRS band, or DANGER under an override).
+
+        Args:
+            level: The frame's level before the latch is applied.
+            now_mono: ``time.monotonic()`` for the frame.
+
+        Returns:
+            ``(latched, ended_gap)``: whether the latch still forces DANGER
+            this frame, and the last verdict of the gap that just ended (on
+            the first face frame after one, else ``None``).
+        """
+        ended = self._last if self._gap_start is not None else None
+        self._gap_start = None
+        self._last = None
+        if self.latch.active:
+            if self.latch.update(level == "DANGER", now_mono) == "released":
+                logger.info("Face back and below DANGER for %.1fs - releasing no-face "
+                            "DANGER latch", self.latch.release_hold)
+        return self.latch.active, ended
+
+    def reset(self) -> None:
+        """Drop any gap and latch (new driver)."""
+        self.latch.reset()
+        self._gap_start = None
+        self._entry_level = "ALERT"
+        self._last = None
+
+
 @dataclass
 class FrameMetrics:
     """Everything the pipeline derived from one frame."""
@@ -160,6 +332,8 @@ class FrameMetrics:
     microsleep_event: Optional[Dict[str, float]] = None   # set on confirmation
     microsleep_count: int = 0                   # confirmed in the trailing window
     microsleep_status: Dict[str, Any] = field(default_factory=dict)
+    no_face_latch: bool = False                 # DANGER carried over from a no-face gap
+    gap_ended: Optional[NoFaceVerdict] = None   # last verdict of a gap that just ended
 
     @property
     def frs(self) -> float:
@@ -168,8 +342,8 @@ class FrameMetrics:
 
     @property
     def overridden(self) -> bool:
-        """Whether either DANGER override (head pose or microsleep) is active."""
-        return self.pose_override or self.microsleep_override
+        """Whether any DANGER override (head pose, microsleep, no-face latch) is active."""
+        return self.pose_override or self.microsleep_override or self.no_face_latch
 
     @property
     def override_reason(self) -> str:
@@ -179,12 +353,34 @@ class FrameMetrics:
             reasons.append("microsleep")
         if self.pose_override:
             reasons.append("head pose")
+        if self.no_face_latch:
+            reasons.append("no-face latch")
         return " + ".join(reasons)
 
     @property
     def level(self) -> str:
         """Effective alert level: ``DANGER`` while either override is active."""
         return "DANGER" if self.overridden else str(self.frs_result["level"])
+
+    def last_known(self) -> Dict[str, Any]:
+        """
+        The measurements a monitoring-fault report carries as ``last_known``.
+
+        Taken from the last scored frame before a no-face gap, so the portal
+        can show what state the driver was in when they stopped being seen.
+        """
+        return {
+            "at": datetime.fromtimestamp(self.t, timezone.utc).isoformat(),
+            "level": self.level,
+            "frs": round(self.frs, 4),
+            "ear": round(float(self.ear), 4),
+            "perclos": round(float(self.perclos), 2),
+            "blink_duration_ms": round(float(self.blink_duration_ms), 1),
+            "blink_freq": round(float(self.blink_freq), 1),
+            "mar": round(float(self.mar), 4),
+            "microsleep_count": int(self.microsleep_count),
+            "override_reason": self.override_reason or None,
+        }
 
     def effective_result(self) -> Dict[str, Any]:
         """``frs_result`` with ``level``/``color`` forced to DANGER under an override."""
@@ -213,6 +409,9 @@ class MetricsPipeline:
             override is released.
         microsleep_release_hold: Seconds after the eyes reopen before a
             microsleep DANGER override is released.
+        no_face_policy: Enable the HOLD / LATCH / FAULT handling of no-face
+            frames (:class:`NoFacePolicy`). Monitoring only; with it off,
+            :meth:`note_no_face` returns ALERT as it always did.
         diag_ear: TEMPORARY DIAGNOSTIC. Log the raw EAR, the active closure
             threshold and the resulting closed/open decision on every change
             and periodically in between. Use when PERCLOS / blink / microsleep
@@ -226,6 +425,7 @@ class MetricsPipeline:
         pose_release_hold: float = HEAD_POSE_RELEASE_HOLD_S,
         pose_danger_hold: float = HEAD_POSE_DANGER_HOLD_S,
         microsleep_release_hold: float = MICROSLEEP_RELEASE_HOLD_S,
+        no_face_policy: bool = False,
         diag_ear: bool = False,
     ) -> None:
         self.head_pose = head_pose
@@ -243,6 +443,10 @@ class MetricsPipeline:
         self.microsleep_debounce = HeadPoseDebounce(
             MICROSLEEP_DANGER_HOLD_S, microsleep_release_hold
         )
+        self.no_face = NoFacePolicy(enabled=no_face_policy)
+        # Effective level of the last scored frame: what a no-face gap is
+        # judged against. None until the first face.
+        self.last_level: Optional[str] = None
         self._frames = 0
         self.diag_ear = diag_ear
         # Last closed/open decision, for edge-triggered diagnostic logging.
@@ -314,11 +518,15 @@ class MetricsPipeline:
             ear, thresholds["ear_threshold"], now
         )
         if microsleep_event:
+            # min_ear, not the confirming frame's ear: when the closure
+            # crosses 1.0 s between two frames the confirming frame is the
+            # *reopening* one, whose EAR is above the threshold and would
+            # make this line read "EAR 0.266 < threshold 0.191".
             logger.warning(
-                "MICROSLEEP confirmed: eyes closed %.2fs (EAR %.3f < threshold %.3f) - "
+                "MICROSLEEP confirmed: eyes closed %.2fs (min EAR %.3f < threshold %.3f) - "
                 "%d in the last %.0fs -> DANGER override",
-                microsleep_event["duration_ms"] / 1000.0, ear,
-                thresholds["ear_threshold"],
+                microsleep_event["duration_ms"] / 1000.0,
+                microsleep_event["min_ear"], thresholds["ear_threshold"],
                 self.microsleep_detector.get_microsleep_count(
                     MICROSLEEP_COUNT_WINDOW_S, now),
                 MICROSLEEP_COUNT_WINDOW_S,
@@ -371,7 +579,12 @@ class MetricsPipeline:
             ear_norm, bd_norm, bf_norm, perclos_norm, yawn_norm, microsleep_count
         )
 
-        return FrameMetrics(
+        # The latch is released on this frame's own level, overrides included.
+        own_level = ("DANGER" if self.pose_debounce.active or self.microsleep_debounce.active
+                     else str(frs_result["level"]))
+        no_face_latch, gap_ended = self.no_face.on_face(own_level, now_mono)
+
+        metrics = FrameMetrics(
             t=now, ear=ear, mar=mar, perclos=perclos,
             blink_duration_ms=blink_duration_ms, blink_freq=blink_freq,
             ear_norm=ear_norm, bd_norm=bd_norm, bf_norm=bf_norm,
@@ -383,7 +596,11 @@ class MetricsPipeline:
             microsleep_event=microsleep_event,
             microsleep_count=microsleep_count,
             microsleep_status=self.microsleep_detector.get_status(now),
+            no_face_latch=no_face_latch,
+            gap_ended=gap_ended,
         )
+        self.last_level = metrics.level
+        return metrics
 
     def _log_ear_decision(
         self, ear: float, thresholds: Dict[str, float], now: float
@@ -422,38 +639,62 @@ class MetricsPipeline:
             "  <-- transition" if changed else "",
         )
 
-    def note_no_face(self, now: Optional[float] = None) -> None:
+    def note_no_face(
+        self, now: Optional[float] = None, now_mono: Optional[float] = None
+    ) -> NoFaceVerdict:
         """
-        Call on frames with no landmarks.
+        Call on frames with no landmarks; returns the level to drive.
 
-        No pose observation is possible, so the debounce must not keep a
-        stale "alerting since" time - or a live override - across the gap.
-        The same applies to the microsleep closure timer: without clearing it
-        the timer would keep running across a gap in which no EAR was
-        observed at all, and the next frame with a face could confirm a
-        "microsleep" that was really a lost face.
+        Two separate things happen here, deliberately kept apart:
 
-        Dropping a *live* microsleep override this way is the conservative
-        reading and it is logged at WARNING, because a driver whose head
-        leaves the frame mid-microsleep is exactly the case worth seeing in
-        the log - the alert level falls back to ALERT on a no-face frame
-        regardless, so nothing here changes behaviour, only visibility.
+        1. **Detector state is cleared.** No pose observation is possible, so
+           the debounce must not keep a stale "alerting since" time - or a
+           live override - across the gap. Likewise the microsleep closure
+           timer: left running, the next face frame could confirm a
+           "microsleep" that was really a lost face. Bridging either across a
+           gap is how a missing face would manufacture DANGER.
+        2. **The level is decided by** :class:`NoFacePolicy` from the level
+           the gap began at. A DANGER in force when the face went (an active
+           microsleep or head-pose override included) is latched, so
+           clearing the overrides in step 1 no longer drops the level.
 
         Args:
-            now: ``time.time()`` for the frame, used only to report how long
-                the eyes had been shut. Defaults to the wall clock.
+            now: ``time.time()`` for the frame, used to report how long the
+                eyes had been shut. Defaults to the wall clock.
+            now_mono: ``time.monotonic()`` for the frame (policy timing).
+                Defaults to the monotonic clock.
+
+        Returns:
+            A :class:`NoFaceVerdict`; drive ``verdict.level``.
         """
+        if now_mono is None:
+            now_mono = time.monotonic()
+        # Judge the gap against the level before step 1 clears anything.
+        verdict = self.no_face.on_no_face(self.last_level, now_mono)
+        if verdict.event == "fault_entered":
+            logger.warning(
+                "NO FACE for %.1fs from %s - FAULT: the driver cannot be observed",
+                verdict.gap_s, verdict.entry_level,
+            )
+        elif verdict.event == "latch_lost":
+            logger.warning(
+                "NO FACE for %.1fs at DANGER - DANGER latched, driver unobserved",
+                verdict.gap_s,
+            )
+
         if self.pose_debounce.active:
-            logger.info("Face lost - clearing head-pose DANGER override")
+            logger.info("Face lost - clearing head-pose DANGER override%s",
+                        " (level latched at DANGER)" if verdict.band == "LATCH" else "")
         self.pose_debounce.reset()
 
         abandoned = self.microsleep_detector.note_no_face(now)
         if abandoned and abandoned["was_microsleeping"]:
             logger.warning(
-                "FACE LOST MID-MICROSLEEP after %.2fs of eye closure - dropping the "
-                "microsleep DANGER override and abandoning the closure. The driver may "
-                "still be microsleeping; nothing can be measured without landmarks.",
+                "FACE LOST MID-MICROSLEEP after %.2fs of eye closure - abandoning the "
+                "closure; level %s. The driver may still be microsleeping; nothing "
+                "can be measured without landmarks.",
                 abandoned["closed_s"],
+                "latched at DANGER" if verdict.band == "LATCH" else verdict.level,
             )
         elif self.microsleep_debounce.active:
             # Eyes had already reopened; this was only the release hold.
@@ -464,6 +705,7 @@ class MetricsPipeline:
             logger.debug("Face lost %.2fs into a closure - closure abandoned unconfirmed",
                          abandoned["closed_s"])
         self.microsleep_debounce.reset()
+        return verdict
 
     def reset(self) -> None:
         """Fresh per-driver history (blinks, microsleeps, PERCLOS, yawns, debounces)."""
@@ -473,4 +715,6 @@ class MetricsPipeline:
         self.microsleep_detector.reset()
         self.microsleep_debounce.reset()
         self.pose_debounce.reset()
+        self.no_face.reset()
+        self.last_level = None
         self._frames = 0

@@ -38,6 +38,9 @@ import argparse
 import logging
 import sys
 import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, Optional
 
@@ -74,6 +77,41 @@ IDENTIFY_INTERVAL: int = 30
 # While the driver stays in DANGER (monitoring), log at most one event per
 # this many seconds - otherwise a 30 fps loop would POST 30 events per second.
 DANGER_EVENT_INTERVAL: float = 5.0
+
+# An open monitoring fault is re-POSTed (status "open", updated gap_s) this
+# often, so the portal can tell a fault that is still live from one whose
+# device went silent.
+MONITORING_FAULT_REFRESH_S: float = 5.0
+
+# NoFaceVerdict.event -> the fault_type it opens on POST /monitoring-faults.
+FAULT_TYPE_FOR_EVENT: Dict[str, str] = {
+    "fault_entered": "no_face",
+    "latch_lost": "danger_latched",
+}
+
+
+@dataclass
+class OpenFault:
+    """A monitoring fault that has been opened on the backend and not resolved."""
+
+    fault_uuid: str
+    fault_type: str
+    driver_id: Optional[int]
+    entry_level: str
+    started_at: datetime                  # UTC, when the face was lost
+    last_known: Optional[Dict[str, Any]]  # FrameMetrics.last_known() before the gap
+    gap_s: float                          # latest no-face duration seen
+    last_push_mono: float                 # time.monotonic() of the last POST
+
+    def push(self, api_client: APIClient, status: str, now_mono: float,
+             resolved_at: Optional[datetime] = None,
+             resolution: Optional[str] = None) -> None:
+        """POST this fault's current state (fire-and-forget)."""
+        api_client.push_monitoring_fault(
+            self.fault_uuid, status, self.fault_type, self.driver_id, self.entry_level,
+            self.started_at, self.gap_s, self.last_known, resolved_at, resolution,
+        )
+        self.last_push_mono = now_mono
 
 # Frames of face captured for the enrollment encoding.
 ENROLL_FRAMES: int = 30
@@ -113,6 +151,7 @@ LEVEL_BGR: Dict[str, tuple] = {
     "ALERT": (0, 200, 0),
     "WARNING": (0, 220, 255),
     "DANGER": (0, 0, 255),
+    "FAULT": (255, 0, 255),   # magenta: not a fatigue level
 }
 WHITE = (255, 255, 255)
 GREY = (160, 160, 160)
@@ -1089,9 +1128,11 @@ def run_predrive_assessment(
 
                 landmarks, _rect = extractor.extract(frame)
                 if landmarks is None:
-                    pipeline.note_no_face(now)
+                    # Policy disabled here: verdict.level is ALERT. A face
+                    # missing for too long voids the assessment instead.
+                    verdict = pipeline.note_no_face(now, now_mono)
                     assessment.add_no_face(now)
-                    alert_manager.set_alert_level("ALERT")
+                    alert_manager.set_alert_level(verdict.level)
                     display_text(frame, "NO FACE")
                     draw_banner(frame, banner, (0, 220, 255))
                     if debug_pose:
@@ -1200,6 +1241,15 @@ def run_monitoring(
     phase, so nothing in this loop can inhibit the starter even by mistake.
     An unrecognised driver, or one without a baseline, is monitored with
     :data:`DEFAULT_THRESHOLDS` - degraded monitoring is better than none.
+
+    Frames with no face follow ``modules.pipeline.NoFacePolicy``: the level
+    is held (never lowered), a DANGER is latched, and ALERT / WARNING turn
+    into FAULT after ``NO_FACE_FAULT_S``. Two cases become backend faults
+    on ``POST /monitoring-faults``: FAULT (``no_face``) and a latched DANGER
+    past ``NO_FACE_HOLD_S`` (``danger_latched``, critical). Each is opened
+    with the last scored frame's metrics, re-POSTed every
+    ``MONITORING_FAULT_REFRESH_S`` while open, and resolved when the face
+    returns or the ignition turns off.
     """
     alert_manager.set_phase(Phase.MONITORING)
     alert_manager.set_alert_level("ALERT")
@@ -1207,7 +1257,7 @@ def run_monitoring(
                 alert_manager.get_relay_state())
 
     pipeline = MetricsPipeline(head_pose, pose_release_hold=pose_release_hold,
-                               diag_ear=diag_ear)
+                               no_face_policy=True, diag_ear=diag_ear)
     logger.info("Monitoring: FRS weights %s, theoretical max %s",
                 pipeline.frs_calc.weights, pipeline.frs_calc.theoretical_max())
 
@@ -1224,6 +1274,10 @@ def run_monitoring(
     # of the previous scored frame, so transitions can be logged once rather
     # than every frame. ``None`` until the first face is processed.
     last_level: Optional[str] = None
+    # Last scored frame, for the last_known block of a fault report.
+    last_m: Optional[FrameMetrics] = None
+    # Open monitoring fault (no_face or danger_latched), if any.
+    open_fault: Optional[OpenFault] = None
 
     while ignition.phase() is Phase.MONITORING:
         frame_count += 1
@@ -1238,22 +1292,50 @@ def run_monitoring(
         else:
             banner, banner_color = "MONITORING  |  relay never engages", (0, 200, 0)
 
-        # Landmarks - no face is treated as the safe state
+        # Landmarks. No face never lowers the level and never raises it to
+        # DANGER: the pipeline's NoFacePolicy holds, latches or faults.
         landmarks, _rect = extractor.extract(frame)
         if landmarks is None:
-            pipeline.note_no_face(now)
-            # No face is the safe state; record it as an ALERT transition so
-            # a brief dropout and re-acquire at the same level stays quiet.
-            if last_level not in (None, "ALERT"):
-                logger.info("Level %s -> ALERT (no face - metrics unavailable)", last_level)
-            last_level = "ALERT"
-            alert_manager.set_alert_level("ALERT")
-            display_text(frame, "NO FACE")
+            verdict = pipeline.note_no_face(now, now_mono)
+            if verdict.level != last_level:
+                logger.info("Level %s -> %s (no face %.1fs, %s)", last_level or "(none)",
+                            verdict.level, verdict.gap_s, verdict.band)
+            last_level = verdict.level
+            alert_manager.set_alert_level(verdict.level)
+            if verdict.event in FAULT_TYPE_FOR_EVENT:
+                open_fault = OpenFault(
+                    fault_uuid=str(uuid.uuid4()),
+                    fault_type=FAULT_TYPE_FOR_EVENT[verdict.event],
+                    driver_id=current_driver_id,
+                    entry_level=verdict.entry_level,
+                    started_at=datetime.now(timezone.utc) - timedelta(seconds=verdict.gap_s),
+                    last_known=last_m.last_known() if last_m is not None else None,
+                    gap_s=verdict.gap_s,
+                    last_push_mono=now_mono,
+                )
+                open_fault.push(api_client, "open", now_mono)
+            elif open_fault is not None:
+                open_fault.gap_s = verdict.gap_s
+                if now_mono - open_fault.last_push_mono >= MONITORING_FAULT_REFRESH_S:
+                    open_fault.push(api_client, "open", now_mono)
+            display_text(frame, f"NO FACE {verdict.gap_s:.1f}s  [{verdict.band}]",
+                         LEVEL_BGR.get(verdict.level, WHITE))
             draw_banner(frame, banner, banner_color)
             if debug_pose:
                 draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
             present(frame)
             continue
+
+        # First face after a fault resolves it. Done here rather than from
+        # m.gap_ended: a driver change below resets the pipeline first.
+        fault_resolved = open_fault is not None
+        if open_fault is not None:
+            resolved = datetime.now(timezone.utc)
+            logger.info("Face re-acquired after %.1fs - %s fault resolved",
+                        (resolved - open_fault.started_at).total_seconds(),
+                        open_fault.fault_type)
+            open_fault.push(api_client, "resolved", now_mono, resolved, "face_reacquired")
+            open_fault = None
 
         # Identify - every IDENTIFY_INTERVAL frames, or every frame until
         # someone has been recognised at all.
@@ -1280,6 +1362,13 @@ def run_monitoring(
                 driver = match
 
         m = pipeline.process(landmarks, thresholds, now, now_mono)
+        last_m = m
+        # (A gap that opened a fault was already logged above when it was resolved.)
+        if m.gap_ended is not None and m.gap_ended.face_lost and not fault_resolved:
+            logger.info("Face re-acquired after %.1fs (%s from %s)%s",
+                        m.gap_ended.gap_s, m.gap_ended.band, m.gap_ended.entry_level,
+                        " - DANGER latched until %.0fs below DANGER"
+                        % pipeline.no_face.latch.release_hold if m.no_face_latch else "")
 
         # Log the full FRS breakdown whenever the effective level changes, so
         # the session log shows which term carried the score into the new
@@ -1319,6 +1408,11 @@ def run_monitoring(
             draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
         present(frame)
 
+    if open_fault is not None:
+        # Ignition OFF with the driver still unseen: close the record so the
+        # portal does not show a fault open forever.
+        open_fault.push(api_client, "resolved", time.monotonic(),
+                        datetime.now(timezone.utc), "ignition_off")
     logger.info("Monitoring: ignition turned OFF - returning to pre-drive")
 
 
