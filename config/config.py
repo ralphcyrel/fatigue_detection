@@ -195,7 +195,8 @@ PREDRIVE_ASSESSMENT_SECONDS: Final[int] = 30
 # a 5 s microsleep in 25 s of alertness is exactly what a pre-drive check
 # exists to catch, and a plain mean or median would dilute it. A window
 # rather than a single-frame max keeps one landmark glitch from failing a
-# driver. The pass threshold itself is modules.frs.WARNING_THRESHOLD.
+# driver. The pass threshold itself is modules.frs.WARNING_THRESHOLD, which the
+# recorded assessments do not determine - see the note there.
 PREDRIVE_WORST_WINDOW_SECONDS: Final[float] = 5.0
 
 # Face recognition at pre-drive: try for this long and accept once the same

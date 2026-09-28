@@ -18,7 +18,8 @@ the per-frame EAR produced here, and the calibration module (Module 7) uses it
 to learn each driver's personal open-eye baseline.
 """
 
-from typing import Tuple
+from collections import deque
+from typing import Deque, Tuple
 
 import numpy as np
 from scipy.spatial.distance import euclidean
@@ -156,3 +157,48 @@ class EARCalculator:
             ``True`` if ``ear`` is strictly below ``threshold``.
         """
         return ear < threshold
+
+
+class RollingMedian:
+    """
+    Median of the values seen in the trailing ``window_s`` seconds.
+
+    Used to feed the FRS a blink-free normalised EAR (see
+    ``modules.frs.EAR_MEDIAN_WINDOW_S``): a closure shorter than about half
+    the window is outvoted by the open-eye frames around it and never reaches
+    the score, while a sustained change comes through after about half the
+    window. The window is in seconds rather than frames because the real loop
+    rate varies (~20 fps on the Pi, lower while face recognition runs).
+
+    Typical usage::
+
+        smoother = RollingMedian(0.5)
+        ear_norm_frs = smoother.update(ear_norm, time.monotonic())
+    """
+
+    def __init__(self, window_s: float) -> None:
+        if window_s < 0.0:
+            raise ValueError(f"window_s must be >= 0, got {window_s}")
+        self.window_s = float(window_s)
+        self._samples: Deque[Tuple[float, float]] = deque()
+
+    def update(self, value: float, now: float) -> float:
+        """
+        Add one sample and return the median of the window ending at ``now``.
+
+        Args:
+            value: The new sample.
+            now: Its timestamp in seconds (any monotonic clock).
+
+        Returns:
+            The median over every sample within ``window_s`` of ``now``,
+            including this one; ``value`` itself when the window is 0.
+        """
+        self._samples.append((now, float(value)))
+        while now - self._samples[0][0] > self.window_s:
+            self._samples.popleft()
+        return float(np.median([v for _, v in self._samples]))
+
+    def reset(self) -> None:
+        """Drop the history (face lost, new driver)."""
+        self._samples.clear()

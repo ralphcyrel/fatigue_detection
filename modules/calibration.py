@@ -98,6 +98,144 @@ MIN_MAR_BASELINE: float = 0.2               # outer-lip MAR; ~0.4-0.6 is typical
 # Blink frequency is expressed per this many seconds regardless of duration.
 BLINK_FREQUENCY_WINDOW_S: float = 60.0
 
+# Range of credible open-eye EAR *baselines*. A baseline outside it is itself
+# the suspect value - a seed taken with the eyes shut, or a corrupt record -
+# so it is discarded, never repaired (recomputing a threshold from it would
+# launder the corruption). From the 13 recordings (2 drivers, 2026-09-21..28):
+#   * lower 0.18 - above the median closed-frame EAR (0.164; closed frames
+#     span 0.116-0.197), so a baseline measured mostly shut falls outside;
+#   * upper 0.35 - just above the highest single frame in any calibration
+#     (0.345; per-frame p99 <= 0.299). 0.46-0.50 appears only in assessment
+#     artefact frames.
+# Recorded baselines are 0.249-0.263, so this is roughly +/-30 % around them.
+# Two drivers cannot establish a population range: the bounds are
+# UNDER-DETERMINED, and a discard is logged so a legitimate outlier shows up.
+EAR_BASELINE_PLAUSIBLE_MIN: float = 0.18
+EAR_BASELINE_PLAUSIBLE_MAX: float = 0.35
+
+
+def ear_baseline_plausible(value: Optional[float]) -> bool:
+    """Whether ``value`` is a credible open-eye EAR baseline."""
+    return value is not None and EAR_BASELINE_PLAUSIBLE_MIN <= value <= EAR_BASELINE_PLAUSIBLE_MAX
+
+
+# Monitoring with no usable calibration (driver unrecognised, no record for
+# them, backend unreachable) derives the EAR baseline and closure threshold
+# from the driver's own EAR (:class:`EarSelfSeed`) instead of a population
+# default. A population threshold at 75 % of a population baseline lands
+# inside landmark noise for a driver whose real baseline is lower: 0.225 is
+# 88 % of a 0.255 EAR, and on 2026-09-23 that produced false long "blinks"
+# and 130 level changes in 71 s. Measured on the three recorded calibrations,
+# the median EAR over 5 s lands within -7 %..+10 % of the 60 s calibrated
+# baseline (1 s: -11 %..+26 %; the 0.30 default was +14..+18 % for both
+# drivers), and longer windows barely improve on it.
+SELF_SEED_S: float = 5.0
+# From this long, the running median gives a provisional closure threshold so
+# microsleep detection can run while the FRS is still off (2 s: within
+# -6 %..+16 % of the calibrated baseline, keeping the provisional threshold
+# below every recorded driver's open-eye p1 of ~0.88 x baseline).
+SELF_SEED_PROVISIONAL_S: float = 2.0
+# A seed median outside EAR_BASELINE_PLAUSIBLE_MIN/MAX (below: the eyes were
+# shut for most of the seed window) is discarded and the seed restarts.
+SELF_SEED_MIN_SAMPLES: int = 25
+
+
+class EarSelfSeed:
+    """
+    Personal EAR baseline and closure threshold from the driver's own EAR.
+
+    Collects EAR for :data:`SELF_SEED_S` seconds, then freezes
+    ``baseline = median`` and ``threshold = baseline * EAR_THRESHOLD_RATIO``.
+    It is deliberately **frozen**, not a running estimate: a baseline that
+    kept following the driver would follow a slow droop down and the EAR
+    term would never rise. The price is that a driver who is already drowsy
+    while seeding gets a lowered baseline - the FRS then measures change
+    from the start of observation, not from an alert calibration.
+
+    Typical usage::
+
+        seed = EarSelfSeed()
+        seed.update(ear, now)
+        if seed.frozen:
+            ... score with seed.baseline / seed.threshold
+        else:
+            ... overrides only; microsleep on seed.provisional_threshold()
+    """
+
+    def __init__(
+        self,
+        seed_s: float = SELF_SEED_S,
+        provisional_s: float = SELF_SEED_PROVISIONAL_S,
+        min_samples: int = SELF_SEED_MIN_SAMPLES,
+    ) -> None:
+        self.seed_s = seed_s
+        self.provisional_s = provisional_s
+        self.min_samples = min_samples
+        self.baseline: Optional[float] = None
+        self.threshold: Optional[float] = None
+        self._values: List[float] = []
+        self._start: Optional[float] = None
+
+    @property
+    def frozen(self) -> bool:
+        """Whether the baseline has been fixed."""
+        return self.baseline is not None
+
+    def elapsed(self, now: float) -> float:
+        """Seconds since the seed started collecting (0 before the first sample)."""
+        return 0.0 if self._start is None else now - self._start
+
+    def update(self, ear: float, now: float) -> bool:
+        """
+        Feed one face frame's EAR.
+
+        Returns:
+            ``True`` on the frame the baseline freezes.
+        """
+        if self.frozen:
+            return False
+        if self._start is None:
+            self._start = now
+        self._values.append(float(ear))
+        if self.elapsed(now) < self.seed_s or len(self._values) < self.min_samples:
+            return False
+        median = float(np.median(self._values))
+        if not ear_baseline_plausible(median):
+            logger.warning("EAR self-seed discarded: median EAR %.3f over %.1fs is outside the "
+                           "plausible open-eye range %.2f-%.2f%s - restarting", median,
+                           self.elapsed(now), EAR_BASELINE_PLAUSIBLE_MIN,
+                           EAR_BASELINE_PLAUSIBLE_MAX,
+                           " (eyes shut for most of it)"
+                           if median < EAR_BASELINE_PLAUSIBLE_MIN else "")
+            self._values, self._start = [], now
+            return False
+        self.baseline = median
+        self.threshold = median * EAR_THRESHOLD_RATIO
+        logger.info("EAR self-seed frozen: baseline %.4f, threshold %.4f from %d frames "
+                    "over %.1fs", self.baseline, self.threshold, len(self._values),
+                    self.elapsed(now))
+        return True
+
+    def provisional_threshold(self, now: float) -> Optional[float]:
+        """
+        Closure threshold usable before the baseline freezes, or ``None``.
+
+        The frozen threshold once there is one; before that, the running
+        median's after :data:`SELF_SEED_PROVISIONAL_S`, unless that median
+        is implausibly low.
+        """
+        if self.frozen:
+            return self.threshold
+        if self.elapsed(now) < self.provisional_s or not self._values:
+            return None
+        median = float(np.median(self._values))
+        return median * EAR_THRESHOLD_RATIO if ear_baseline_plausible(median) else None
+
+    def reset(self) -> None:
+        """Forget everything (new driver)."""
+        self.baseline = self.threshold = None
+        self._values, self._start = [], None
+
 
 class CalibrationManager:
     """

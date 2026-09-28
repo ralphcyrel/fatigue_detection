@@ -18,7 +18,12 @@ pre-drive; all of them resolve through the same operator override request
 (``APIClient.request_override``). ``MICROSLEEP_DETECTED`` is kept distinct
 from ``FATIGUE_DETECTED`` because it is a categorically different finding:
 not "scored above the fatigue threshold" but "lost consciousness while
-sitting still in a stationary vehicle".
+sitting still in a stationary vehicle". ``FOREIGN_DEVICE_BASELINE`` is kept
+distinct from ``NO_BASELINE`` for the same reason: the driver *is* enrolled,
+but only on another unit. A baseline captured at a different camera mounting
+is not trusted to release the starter - one that reads low would let a
+fatigued driver pass - so the unit locks without assessing, and the operator
+response differs (re-enrol on this unit, versus enrol at all).
 
 Both enums are ``str`` subclasses so they serialise directly into the JSON
 payloads sent to the Laravel backend.
@@ -41,3 +46,4 @@ class LockReason(str, Enum):
     MICROSLEEP_DETECTED = "microsleep_detected"
     DRIVER_NOT_RECOGNIZED = "driver_not_recognized"
     NO_BASELINE = "no_baseline"
+    FOREIGN_DEVICE_BASELINE = "foreign_device_baseline"

@@ -8,17 +8,23 @@ FRS (Module 6)::
 
     PERCLOS = (frames with EAR < threshold) / (frames in window) * 100
 
-Here the window is expressed in frames (``window_seconds * fps``) rather than
-wall-clock seconds so the rolling buffer stays a fixed size regardless of
-timing jitter. On the Pi 4B at 30 fps a 60 s window is 1 800 booleans, which
-``collections.deque`` handles trivially.
+The window is wall-clock seconds (``config.PERCLOS_WINDOW_SECONDS``), not a
+frame count. Until 2026-09-28 it was ``window_seconds * config.CAMERA_FPS``
+frames, which assumed the loop ran at the camera's 30 fps; the Pi runs at
+~20 fps, so the "60 s" window actually covered ~90 s.
 
-The window defaults come from ``config.PERCLOS_WINDOW_SECONDS`` and
-``config.CAMERA_FPS``.
+Warm-up: a window that has only seen a few seconds of frames swings wildly -
+one 2-frame blink 1.5 s into a session read as 6.7 % PERCLOS and scored DANGER
+on its own. When the driver's baseline is known, the unobserved part of the
+window is assumed to be at that baseline rate, up to :data:`WARMUP_PRIOR_S`
+seconds' worth; the assumption fades out as the window fills, so a full
+window is pure measurement (and matches how calibration measured the
+baseline). Replayed over all recorded assessments this kept every verdict
+and delayed DANGER onset by 0.10-0.28 s.
 """
 
 from collections import deque
-from typing import Deque
+from typing import Deque, Optional, Tuple
 
 from config import config
 
@@ -27,75 +33,92 @@ from config import config
 # a ratio of 20, swamping every other term in the FRS.
 MAX_NORMALIZED_PERCLOS: float = 5.0
 
+# Seconds of the not-yet-observed window counted at the driver's baseline
+# rate (see module docstring). The weight is min(this, window - observed), so
+# it is this much for the first (window - this) seconds, then falls to zero
+# as the window fills. At 10 s, a driver at 10 % true PERCLOS (baseline
+# 1.86 %) reaches a PERCLOS term of 0.65 after ~8 s, and at 20 % after ~2.5 s;
+# the microsleep and head-pose overrides are unaffected.
+WARMUP_PRIOR_S: float = 10.0
+
 
 class PERCLOSCalculator:
     """
-    Maintain a rolling buffer of eye-closed flags and report PERCLOS.
+    Maintain a time-bounded buffer of eye-closed flags and report PERCLOS.
 
     Typical usage (once per frame)::
 
-        perclos_calc = PERCLOSCalculator()          # 60 s @ 30 fps
-        perclos = perclos_calc.update(ear, threshold)
+        perclos_calc = PERCLOSCalculator()          # 60 s window
+        perclos = perclos_calc.update(ear, threshold, time.monotonic(),
+                                      baseline=baselines["perclos_baseline"])
         perclos_norm = perclos_calc.normalize(perclos, baselines["perclos_baseline"])
 
     Attributes:
         window_seconds: Length of the rolling window in seconds.
-        fps: Expected frame rate used to size the buffer.
-        max_frames: ``window_seconds * fps`` — the buffer capacity.
-        frames: Deque of booleans, ``True`` = eyes closed on that frame.
+        prior_s: Seconds of warm-up prior (:data:`WARMUP_PRIOR_S`).
+        samples: Deque of ``(timestamp, closed)`` within the window.
     """
 
     def __init__(
         self,
-        window_seconds: int = config.PERCLOS_WINDOW_SECONDS,
-        fps: int = config.CAMERA_FPS,
+        window_seconds: float = config.PERCLOS_WINDOW_SECONDS,
+        prior_s: float = WARMUP_PRIOR_S,
     ) -> None:
         """
         Create a calculator with an empty buffer.
 
         Args:
             window_seconds: Rolling window length in seconds.
-            fps: Frame rate the pipeline is expected to run at. Together with
-                ``window_seconds`` this fixes the buffer size in frames.
+            prior_s: Warm-up prior in seconds; ``0`` disables it.
         """
-        self.window_seconds: int = window_seconds
-        self.fps: int = fps
-        self.max_frames: int = max(1, window_seconds * fps)
+        self.window_seconds: float = float(window_seconds)
+        self.prior_s: float = float(prior_s)
+        self.samples: Deque[Tuple[float, bool]] = deque()
+        # Timestamp of the first sample since reset: how much of the window
+        # has been observed, which the first sample still in the deque stops
+        # telling us once the window starts sliding.
+        self._first_t: Optional[float] = None
+        self._last: float = 0.0
 
-        # ``maxlen`` makes the deque evict the oldest frame automatically once
-        # it is full, so ``update()`` never has to trim manually.
-        self.frames: Deque[bool] = deque(maxlen=self.max_frames)
-
-    def update(self, ear: float, threshold: float) -> float:
+    def update(
+        self,
+        ear: float,
+        threshold: float,
+        now: float,
+        baseline: Optional[float] = None,
+    ) -> float:
         """
         Record the current frame and return the updated PERCLOS.
 
         Args:
             ear: Raw EAR for the current frame.
-            threshold: The driver's calibrated closure threshold.
+            threshold: The driver's closure threshold.
+            now: Timestamp in seconds (``time.monotonic()``).
+            baseline: The driver's calibrated PERCLOS (percent) for the
+                warm-up prior. ``None`` (enrollment, where it is being
+                measured) gives the plain frame ratio from the first frame.
 
         Returns:
             PERCLOS over the current window, in the range ``0.0``–``100.0``.
         """
-        self.frames.append(ear < threshold)
-        return self.get_perclos()
+        if self._first_t is None:
+            self._first_t = now
+        self.samples.append((now, ear < threshold))
+        while now - self.samples[0][0] > self.window_seconds:
+            self.samples.popleft()
+
+        measured = sum(c for _, c in self.samples) / len(self.samples) * 100.0
+        observed = min(now - self._first_t, self.window_seconds)
+        prior = min(self.prior_s, self.window_seconds - observed)
+        if baseline is None or prior <= 0.0:
+            self._last = float(measured)
+        else:
+            self._last = float((measured * observed + baseline * prior) / (observed + prior))
+        return self._last
 
     def get_perclos(self) -> float:
-        """
-        Return the PERCLOS for the frames currently in the buffer.
-
-        Until the buffer fills, the percentage is taken over however many
-        frames have been seen so far, so the value is meaningful (if noisier)
-        from the very first frames of a session.
-
-        Returns:
-            Percentage of closed-eye frames, ``0.0`` if the buffer is empty.
-        """
-        total = len(self.frames)
-        if total == 0:
-            return 0.0
-        closed = sum(self.frames)  # bools sum as 0/1
-        return float(closed / total * 100.0)
+        """The value returned by the last :meth:`update` (``0.0`` before any)."""
+        return self._last
 
     def normalize(self, perclos: float, baseline_perclos: float) -> float:
         """
@@ -117,4 +140,6 @@ class PERCLOSCalculator:
 
     def reset(self) -> None:
         """Discard all buffered frames (call when a new driver is detected)."""
-        self.frames.clear()
+        self.samples.clear()
+        self._first_t = None
+        self._last = 0.0

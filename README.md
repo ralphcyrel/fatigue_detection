@@ -30,8 +30,8 @@ selects the phase:
 | Phase | Ignition | What happens | Starter relay |
 |---|---|---|---|
 | **Enrollment** (`--enroll`) | — | Operator-supervised, at hiring: face encoding + 60 s alert-state calibration → backend. | untouched |
-| **Pre-drive assessment** | OFF | Recognise the driver (≤ 10 s, 3 consistent matches) → fetch *their* thresholds (no defaults) → 30 s assessment through the shared pipeline. Verdict = worst 5 s rolling mean of FRS `< 0.40`. | **Only phase that drives it.** Starts inhibited; released on PASS or an approved operator override. |
-| **Continuous monitoring** | ON | Same pipeline; LEDs, buzzer and `POST /fatigue-events` only. Unrecognised driver / no baseline → generic defaults (degraded monitoring beats none). | **Never engaged.** `AlertManager.lock_relay()` refuses with a WARNING in this phase. Entering the phase does not release it either (key-ON precedes cranking). |
+| **Pre-drive assessment** | OFF | Recognise the driver (≤ 10 s, 3 consistent matches) → fetch *their* calibration captured on this unit (none → lock `no_baseline`; only another unit's → lock `foreign_device_baseline`; never another driver's, never defaults) → 30 s assessment through the shared pipeline. Verdict = worst 5 s rolling mean of FRS `< 0.40`. | **Only phase that drives it.** Starts inhibited; released on PASS or an approved operator override. |
+| **Continuous monitoring** | ON | Same pipeline; LEDs, buzzer and `POST /fatigue-events` only. Unrecognised driver / no usable calibration → EAR baseline self-seeded from the driver's own EAR over the first 5 s (head-pose and microsleep overrides only until then); other baselines generic. | **Never engaged.** `AlertManager.lock_relay()` refuses with a WARNING in this phase. Entering the phase does not release it either (key-ON precedes cranking). |
 
 Three lock reasons keep the starter inhibited after pre-drive — `fatigue_detected`,
 `driver_not_recognized`, `no_baseline` — and all three resolve through one operator

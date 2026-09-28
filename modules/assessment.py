@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 # Column order of the per-frame CSV; also the keys of each ``samples`` entry.
 SAMPLE_FIELDS: List[str] = [
     "t_rel", "t_abs", "ear", "mar", "perclos", "blink_duration_ms", "blink_freq",
-    "ear_norm", "bd_norm", "bf_norm", "perclos_norm", "mar_norm", "yawn_norm",
+    "ear_norm", "ear_norm_frs", "bd_norm", "bf_norm", "perclos_norm", "mar_norm", "yawn_norm",
     "ear_excess", "blink_duration_excess", "blink_frequency_excess", "perclos_excess",
     "yawn_excess", "microsleep_excess", "frs_raw", "frs_scored", "level",
     "pitch", "yaw", "roll", "pose_alert", "pose_override", "yawn_state",
@@ -113,6 +113,10 @@ class PredriveAssessment:
         self.samples: List[Dict[str, Any]] = []
         self.no_face_frames: int = 0
         self._started = False
+        # Which calibration the run was scored against (api.Calibration
+        # .provenance()); set by the caller, echoed in result() so it lands in
+        # the JSON summary and POST /assessments.
+        self.calibration: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
 
@@ -165,7 +169,8 @@ class PredriveAssessment:
             "t_abs": t,
             "ear": m.ear, "mar": m.mar, "perclos": m.perclos,
             "blink_duration_ms": m.blink_duration_ms, "blink_freq": m.blink_freq,
-            "ear_norm": m.ear_norm, "bd_norm": m.bd_norm, "bf_norm": m.bf_norm,
+            "ear_norm": m.ear_norm, "ear_norm_frs": m.ear_norm_frs,
+            "bd_norm": m.bd_norm, "bf_norm": m.bf_norm,
             "perclos_norm": m.perclos_norm, "mar_norm": m.mar_norm, "yawn_norm": m.yawn_norm,
             "ear_excess": comps.get("ear_excess", 0.0),
             "blink_duration_excess": comps.get("blink_duration_excess", 0.0),
@@ -276,6 +281,7 @@ class PredriveAssessment:
             "failed_on_microsleep": microsleeps > 0,
             "void": void,
             "passed": (not void) and worst < self.pass_threshold and microsleeps == 0,
+            "calibration": dict(self.calibration),
             "samples": list(self.samples),
         }
 

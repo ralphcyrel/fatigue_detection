@@ -25,8 +25,10 @@ driver's own normal. Flooring each excess at ``0`` means being *better* than
 baseline (wider eyes, shorter blinks) does not offset a genuinely worrying
 term elsewhere.
 
-* ``EAR_norm``     — current EAR / calibrated EAR. Inverted because a lower
-                     EAR (droopier eyes) means *more* fatigue.
+* ``EAR_norm``     — current EAR / calibrated EAR, taken as the median over
+                     the trailing :data:`EAR_MEDIAN_WINDOW_S` (applied in
+                     ``modules.pipeline``). Inverted because a lower EAR
+                     (droopier eyes) means *more* fatigue.
 * ``BD_norm``      — blink duration / calibrated blink duration.
 * ``BF_norm``      — blink frequency / calibrated blink frequency.
 * ``PERCLOS_norm`` — PERCLOS / calibrated PERCLOS.
@@ -67,6 +69,35 @@ Anything consuming the score (the operator portal, ``modules.api``) must
 either accept the 0–4.3 range or clamp explicitly; the bands above only need
 the score to be *monotonic*, not normalised.
 
+Formula history
+---------------
+
+Scores from different versions are **not directly comparable**; compare
+across a boundary only by replaying the raw per-frame inputs through one
+version. Times are the Pi's local time (UTC+8); assessment file stamps are
+UTC.
+
+* **Before 2026-09-23 ~11:02–11:49** (every assessment up to and including
+  ``20260923T030201Z``): no microsleep term or microsleep/blink split, and the
+  blink-duration / blink-frequency excesses uncapped (single runs reached
+  3.2 on the duration term alone).
+* **2026-09-23 (landed between 11:02 and 11:49)**: microsleep split and
+  persistence term; blink excess caps of 4.0.
+* **2026-09-28**: the EAR term takes the 0.5 s rolling median of
+  ``EAR_norm`` instead of the per-frame value (:data:`EAR_MEDIAN_WINDOW_S`).
+  Assessment CSVs from this version carry an ``ear_norm_frs`` column; its
+  absence marks an older run.
+* **2026-09-28 (same day, later)**: the PERCLOS window is 60 s of wall clock
+  instead of 1800 frames (which at the Pi's ~20 fps was ~90 s), and a
+  partially filled window counts its unobserved part at the driver's
+  baseline rate, up to 10 s (``modules.perclos``). Steady-state monitoring
+  PERCLOS now reacts over 60 s rather than 90 s; pre-drive (30 s, window
+  never full) is affected only through the warm-up prior. Separately - not
+  a score change - the *level* gained release hysteresis
+  (``modules.pipeline.BandHysteresis``), and monitoring without a usable
+  calibration scores against a self-seeded EAR baseline instead of the
+  population 0.30 / 0.225. Assessment JSONs from this version carry a
+  ``calibration`` block naming the calibration used.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -81,6 +112,18 @@ BASELINE: float = 1.0
 # the reciprocal would explode and swamp the other three terms. 4.0 is
 # reached at EAR = 20 % of baseline, which is already "eyes fully closed".
 MAX_EAR_EXCESS: float = 4.0
+
+# Window of the rolling median taken over EAR_norm before the EAR term
+# (2026-09-28). The other eye terms already count every blink - PERCLOS, blink
+# duration and blink frequency - so a per-frame EAR added a fourth, spiky copy
+# of the same closure: in the recorded assessments each closed frame lifted the
+# score by the EAR term (0.12-0.40) plus the PERCLOS step, and caused 10 of 19
+# level changes in 1-2-frame spikes. The median rejects closures shorter than
+# ~0.25 s and passes a sustained droop after ~0.25 s; replayed over every
+# recorded run it delayed DANGER onset by at most 0.05 s. What the EAR term
+# measures that nothing else does is lid droop *above* the closure threshold,
+# which changes over minutes and is unaffected by the window.
+EAR_MEDIAN_WINDOW_S: float = 0.5
 
 # Cap on the yawn excess term, i.e. YAWN_norm - 1. A wide yawn is ~2.5-3.5x
 # the closed-mouth MAR (excess 1.5-2.5); capping at 2.0 bounds a single yawn
@@ -131,6 +174,17 @@ MAX_MICROSLEEP_EXCESS: float = 3.0
 MICROSLEEP_COUNT_WINDOW_S: float = 300.0
 
 # FRS thresholds delimiting the three alert bands.
+#
+# WARNING_THRESHOLD is also the pre-drive pass threshold (worst 5 s mean must
+# be below it), and as such it is UNDER-DETERMINED. It was tuned against the
+# per-frame-EAR score. Replaying all ten recorded assessments (2 drivers,
+# 2026-09-21..28) through the 2026-09-28 formula, the original verdicts are
+# reproduced by any threshold from ~0.26 to ~1.18: the passes top out at 0.257
+# and the fails start at 1.186, with no run in between. 0.40 is kept because
+# the data cannot place it anywhere else, not because it was fitted. Matching
+# the old verdicts would in any case only reproduce the old formula's
+# judgement; placing the threshold needs graded (mildly drowsy) runs scored
+# against a reference independent of the FRS.
 WARNING_THRESHOLD: float = 0.40
 DANGER_THRESHOLD: float = 0.65
 
@@ -216,7 +270,9 @@ class FRSCalculator:
         :meth:`theoretical_max` (5.05 with the shipped weights).
 
         Args:
-            ear_norm: EAR / EAR baseline.
+            ear_norm: EAR / EAR baseline. ``MetricsPipeline`` passes the
+                :data:`EAR_MEDIAN_WINDOW_S` rolling median, not the frame's
+                own value.
             blink_duration_norm: blink duration / duration baseline.
             blink_freq_norm: blink frequency / frequency baseline.
             perclos_norm: PERCLOS / PERCLOS baseline (already capped at 5.0).

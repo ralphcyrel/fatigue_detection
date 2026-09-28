@@ -6,8 +6,10 @@ API. It owns a ``requests.Session`` (so the TCP connection and auth headers
 are reused across calls) and wraps every endpoint the other modules need:
 
     GET  /drivers/encodings                 -> DriverRecognizer.load_encodings()
-    GET  /devices/{device_id}/calibration   -> active calibration of the driver
-                                               assigned to this device
+    GET  /drivers/{id}/calibration          -> that driver's calibration, preferring
+         ?device_id={device_id}                one captured on this device
+    GET  /devices/{device_id}/calibration   -> (legacy fallback) calibration of the
+                                               driver assigned to this device
     POST /drivers/{id}/enroll               -> save encoding + baselines
     POST /fatigue-events                    -> log a DANGER event (monitoring)
     POST /monitoring-faults                 -> open / refresh / resolve a no-face
@@ -18,6 +20,11 @@ are reused across calls) and wraps every endpoint the other modules need:
     GET  /drivers/{id}/relay-override       -> (deprecated) per-driver unlock flag
     GET  /ping                              -> backend reachability
     POST /devices/{device_id}/heartbeat     -> "still online" + actual relay state
+
+The 2026-09-28 build needs backend changes - the calibration endpoint, the
+``foreign_device_baseline`` lock reason and the ``calibration_*`` provenance
+fields - listed in ``deploy/BACKEND_CHANGES_2026-09-28.md``. They must be
+live before this build is deployed.
 
 ``config.API_BASE_URL`` already ends in ``/api`` (e.g.
 ``http://localhost:8000/api``), so paths here are written relative to it.
@@ -36,8 +43,9 @@ Design rules, because this runs inside a real-time detection loop:
 
 import logging
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -90,6 +98,63 @@ CALIBRATION_FIELD_MAP = (
 )
 
 
+# Where the EAR / PERCLOS / blink baselines a score was computed against came
+# from. Carried on every assessment and fatigue event so a score can always
+# be traced to the baseline behind it.
+CALIBRATION_SOURCE_DEVICE = "device"                  # this driver, captured on this unit
+CALIBRATION_SOURCE_FOREIGN_DEVICE = "foreign_device"  # this driver, captured elsewhere
+CALIBRATION_SOURCE_SELF_SEEDED = "self_seeded"        # monitoring: no usable calibration
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """One driver's calibration as returned by :meth:`APIClient.get_driver_calibration`."""
+
+    thresholds: Dict[str, float]          # flat pipeline keys (CALIBRATION_FIELD_MAP)
+    driver_id: int
+    source: str                           # CALIBRATION_SOURCE_DEVICE / _FOREIGN_DEVICE
+    calibration_id: Optional[int] = None
+    captured_on_device_id: Optional[str] = None
+    # Monitoring-only corrections applied to a broken record (REPAIR_* codes
+    # in main.load_calibration); empty for an intact one. Sent as
+    # ``calibration_repairs`` so a repair is never invisible.
+    repairs: Tuple[str, ...] = ()
+
+    @property
+    def self_seed_ear(self) -> bool:
+        """The record had no EAR baseline: the EAR pair is self-seeded, the rest used."""
+        return REPAIR_EAR_PAIR_SELF_SEEDED in self.repairs
+
+    def provenance(self) -> Dict[str, Any]:
+        """Fields sent with assessments, events and override requests."""
+        return {
+            "calibration_source": self.source,
+            "calibration_id": self.calibration_id,
+            "calibration_device_id": self.captured_on_device_id,
+            "calibration_repairs": list(self.repairs) or None,
+        }
+
+
+# Repair codes (monitoring only; see main.load_calibration).
+REPAIR_EAR_THRESHOLD_RECOMPUTED = "ear_threshold_recomputed"
+REPAIR_EAR_PAIR_SELF_SEEDED = "ear_pair_self_seeded"
+REPAIR_PERCLOS_BASELINE_FLOORED = "perclos_baseline_floored"
+
+
+def repair_defaulted(key: str) -> str:
+    """Repair code for a non-EAR field missing from the record and filled from defaults."""
+    return f"{key}_defaulted"
+
+
+# Provenance when there is no calibration and the EAR baseline is self-seeded.
+SELF_SEEDED_PROVENANCE: Dict[str, Any] = {
+    "calibration_source": CALIBRATION_SOURCE_SELF_SEEDED,
+    "calibration_id": None,
+    "calibration_device_id": None,
+    "calibration_repairs": None,
+}
+
+
 class APIClient:
     """
     Thin, fault-tolerant wrapper around the Laravel REST API.
@@ -99,7 +164,7 @@ class APIClient:
         api = APIClient()                      # reads URL + token from config
         if not api.ping():
             logger.warning("backend offline - running with cached data")
-        thresholds = api.get_driver_thresholds(driver_id)
+        calibration = api.get_driver_calibration(driver_id)
 
     Attributes:
         base_url: API root without a trailing slash.
@@ -126,6 +191,8 @@ class APIClient:
         # Only used to log the offline -> online transition once rather
         # than every 30 s; races between heartbeat threads are harmless.
         self._heartbeat_ok: Optional[bool] = None
+        # The legacy-calibration-endpoint fallback is announced once.
+        self._legacy_calibration_logged = False
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -254,81 +321,117 @@ class APIClient:
         logger.info("Fetched %d face encoding records", len(payload))
         return payload
 
-    def get_device_calibration(
-        self,
-        device_id: Optional[str] = None,
-        expected_driver_id: Optional[int] = None,
-    ) -> Optional[Dict[str, float]]:
+    def get_driver_calibration(
+        self, driver_id: int, device_id: Optional[str] = None
+    ) -> Optional[Calibration]:
         """
-        Fetch the active calibration profile for the driver assigned to
-        this device.
+        Fetch the calibration of the driver in the seat, for this device.
 
-        ``GET /devices/{device_id}/calibration``
+        ``GET /drivers/{driver_id}/calibration?device_id={device_id}``
 
-        The backend resolves device -> assigned driver -> active calibration
-        itself, so the Pi never handles calibration or driver database ids
-        here. It answers 404 in three operationally distinct situations,
-        each with ``lock_reason: "no_baseline"`` and its own ``status``
-        (device not registered, no driver assigned, no active calibration).
-        All three are the same lock condition for the Pi, so this method
-        returns ``None`` for each, but logs the ``status`` so an operator
-        can tell which one it was.
+        Keyed by driver *and* device (2026-09-28). The backend returns the
+        driver's active calibration captured on ``device_id`` if one exists,
+        else that driver's most recent active calibration from any device;
+        the Pi classifies the result itself from ``captured_on_device_id``
+        (:data:`CALIBRATION_SOURCE_DEVICE` / ``_FOREIGN_DEVICE``), because a
+        baseline captured at another mounting position does not transfer
+        and must never be used silently. A record for any other driver is
+        rejected outright - before this change the Pi used the calibration
+        of whoever was *assigned* to the device, which on 2026-09-22 scored
+        driver 5 against driver 6's baseline.
+
+        Expected success body::
+
+            {"status": "ok", "data": {
+                "driver_id": 6, "calibration_id": 12,
+                "captured_on_device_id": "pi-01", "captured_at": "...",
+                "baselines": {"ear": ..., "perclos": ..., "blink_duration": ...,
+                              "blink_frequency": ..., "mar": ...},
+                "thresholds": {"ear_threshold": ..., "yawn_threshold": ...}}}
+
+        404 with ``lock_reason: "no_baseline"`` means the driver has no
+        active calibration anywhere. Until the backend serves this route
+        (404 without that lock reason, or 405), the legacy
+        ``GET /devices/{id}/calibration`` is used, accepted only when it
+        names this same driver.
 
         Args:
-            device_id: Device string (``pi-01``). Defaults to
-                ``config.DEVICE_ID``.
-            expected_driver_id: The driver the Pi recognised on camera. If
-                the record names a different ``driver_id`` a warning is
-                logged - the calibration belongs to whoever is *assigned* to
-                the device, not necessarily whoever is in the seat.
+            driver_id: The driver the camera recognised.
+            device_id: This unit. Defaults to ``config.DEVICE_ID``.
 
         Returns:
-            ``{"ear_baseline", "ear_threshold", "perclos_baseline",
-            "blink_duration_baseline", "blink_frequency_baseline",
-            "mar_baseline", "yawn_threshold"}`` as floats, or ``None`` on
-            404 / failure. The two MAR keys are absent for drivers enrolled
-            before yawn detection existed; ``main.py`` fills them from
-            ``DEFAULT_THRESHOLDS``.
+            A :class:`Calibration`, or ``None`` if there is no usable one
+            for this driver (or the backend is unreachable).
         """
         device_id = device_id or config.DEVICE_ID
+        path = f"/drivers/{int(driver_id)}/calibration"
+        resp = self._request("GET", path, params={"device_id": device_id})
+        if resp is None:
+            return None
+        if resp.status_code in (404, 405):
+            info = self._unwrap(self._safe_json(resp))
+            info = info if isinstance(info, dict) else {}
+            if info.get("lock_reason") == LockReason.NO_BASELINE.value:
+                logger.warning("No calibration for driver %s: status=%r (%s)", driver_id,
+                               info.get("status"), info.get("message", "no message"))
+                return None
+            if not self._legacy_calibration_logged:
+                logger.warning("GET %s not served by the backend (HTTP %s) - falling back to "
+                               "the device endpoint, accepted only for driver %s",
+                               path, resp.status_code, driver_id)
+                self._legacy_calibration_logged = True
+            return self._get_legacy_device_calibration(driver_id, device_id)
+        if not resp.ok:
+            logger.error("GET %s returned HTTP %s: %s", path, resp.status_code, resp.text[:200])
+            return None
+        payload = self._safe_json(resp)
+        record = payload.get("data") if isinstance(payload, dict) else None
+        return self._parse_calibration(record, driver_id, device_id, path)
+
+    def _get_legacy_device_calibration(
+        self, driver_id: int, device_id: str
+    ) -> Optional[Calibration]:
+        """
+        ``GET /devices/{device_id}/calibration``, restricted to ``driver_id``.
+
+        This endpoint resolves device -> *assigned* driver -> calibration, so
+        it answers for whoever is assigned, not whoever is in the seat. The
+        answer is used only when it names ``driver_id``.
+        """
         path = f"/devices/{device_id}/calibration"
         resp = self._request("GET", path)
         if resp is None:
             return None
-
         if resp.status_code == 404:
-            payload = self._unwrap(self._safe_json(resp))
-            info = payload if isinstance(payload, dict) else {}
-            if info.get("lock_reason") == LockReason.NO_BASELINE.value:
-                logger.warning(
-                    "No baseline for device %s: status=%r (%s)",
-                    device_id, info.get("status"), info.get("message", "no message"),
-                )
-            else:
-                logger.error("GET %s returned HTTP 404 without a no_baseline lock reason: %s",
-                             path, resp.text[:200])
+            info = self._unwrap(self._safe_json(resp))
+            info = info if isinstance(info, dict) else {}
+            logger.warning("No baseline for device %s: status=%r (%s)", device_id,
+                           info.get("status"), info.get("message", "no message"))
             return None
-
         if not resp.ok:
             logger.error("GET %s returned HTTP %s: %s", path, resp.status_code, resp.text[:200])
             return None
-
         # Success body is {"status": "ok", "data": {...}} - two keys, so the
         # generic single-key ``_unwrap`` does not apply.
         payload = self._safe_json(resp)
         record = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(record, dict):
-            logger.error("GET %s: expected {\"data\": {...}}, got %s", path, resp.text[:200])
-            return None
+        return self._parse_calibration(record, driver_id, device_id, path)
 
+    def _parse_calibration(
+        self, record: Any, driver_id: int, device_id: str, path: str
+    ) -> Optional[Calibration]:
+        """Validate one calibration record for ``driver_id`` and flatten it."""
+        if not isinstance(record, dict):
+            logger.error("GET %s: expected {\"data\": {...}}, got %r", path, record)
+            return None
         record_driver = record.get("driver_id")
-        if (expected_driver_id is not None and record_driver is not None
-                and int(record_driver) != int(expected_driver_id)):
-            logger.warning(
-                "Device %s is assigned to driver %s (%s) but the camera recognised driver %s - "
-                "using the assigned driver's calibration",
-                device_id, record_driver, record.get("driver_name", "?"), expected_driver_id,
+        if record_driver is None or int(record_driver) != int(driver_id):
+            logger.error(
+                "GET %s returned the calibration of driver %s (%s), not of driver %s who is "
+                "in the seat - REJECTED; another driver's baseline is never used",
+                path, record_driver, record.get("driver_name", "?"), driver_id,
             )
+            return None
 
         # Flatten the grouped record into pipeline names, coercing to float -
         # Laravel may serialise decimals as strings. A missing or null field
@@ -343,19 +446,26 @@ class APIClient:
                 thresholds[name] = float(value)
             except (TypeError, ValueError):
                 logger.debug("Ignoring non-numeric calibration field %s.%s=%r", group, key, value)
-        logger.info("Loaded calibration for device %s (driver %s): %s",
-                    device_id, record_driver, thresholds)
-        return thresholds
 
-    def get_driver_thresholds(self, driver_id: int) -> Optional[Dict[str, float]]:
-        """
-        Backward-compatible alias for :meth:`get_device_calibration`.
-
-        ``GET /drivers/{id}/thresholds`` no longer exists; the calibration
-        is keyed by this device (``config.DEVICE_ID``). ``driver_id`` is
-        only used to warn if the assigned driver differs.
-        """
-        return self.get_device_calibration(expected_driver_id=driver_id)
+        captured_on = record.get("captured_on_device_id")
+        source = (CALIBRATION_SOURCE_DEVICE if captured_on == device_id
+                  else CALIBRATION_SOURCE_FOREIGN_DEVICE)
+        calibration_id = record.get("calibration_id", record.get("id"))
+        calibration = Calibration(
+            thresholds=thresholds, driver_id=int(driver_id), source=source,
+            calibration_id=int(calibration_id) if calibration_id is not None else None,
+            captured_on_device_id=captured_on,
+        )
+        if source == CALIBRATION_SOURCE_FOREIGN_DEVICE:
+            logger.warning(
+                "FOREIGN-DEVICE CALIBRATION for driver %s: captured on %s, running on %s. "
+                "The camera mounting differs, so the EAR/MAR baselines may not transfer; "
+                "scores are flagged foreign_device. Re-enrol this driver on %s.",
+                driver_id, captured_on or "an unrecorded device", device_id, device_id,
+            )
+        logger.info("Loaded calibration %s for driver %s (%s): %s",
+                    calibration.calibration_id, driver_id, source, thresholds)
+        return calibration
 
     def save_driver_enrollment(
         self,
@@ -418,6 +528,7 @@ class APIClient:
         relay_triggered: bool,
         blocking: bool = False,
         phase: Phase = Phase.MONITORING,
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
         Log a fatigue event to the backend.
@@ -443,6 +554,9 @@ class APIClient:
             blocking: If ``True``, send synchronously and return the real
                 outcome (useful for tests and the enrollment flow).
             phase: Operating phase the event was raised in.
+            provenance: :meth:`Calibration.provenance` (or
+                :data:`SELF_SEEDED_PROVENANCE`) - which baseline the score
+                was computed against.
 
         Returns:
             Non-blocking: ``True`` if the request was queued.
@@ -462,6 +576,7 @@ class APIClient:
             # ISO 8601 with explicit UTC offset, e.g. 2026-09-15T09:31:07.123456+00:00
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        body.update(provenance or {})
 
         if blocking:
             return self._send_fatigue_event(body)
@@ -671,6 +786,7 @@ class APIClient:
             "void": bool(result["void"]),
             "passed": bool(result["passed"]),
             "lock_reason": LockReason(lock_reason).value if lock_reason else None,
+            **result.get("calibration", {}),
             "samples": [
                 {k: (None if v is None else (bool(v) if isinstance(v, bool) else
                      (v if isinstance(v, str) else float(v))))
@@ -696,6 +812,7 @@ class APIClient:
         driver_id: Optional[int],
         reason: LockReason,
         assessment_id: Optional[int] = None,
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> Optional[int]:
         """
         Tell the operator portal the starter is inhibited and why.
@@ -705,8 +822,12 @@ class APIClient:
         Args:
             device_id: This vehicle unit.
             driver_id: Recognised driver, or ``None`` (``DRIVER_NOT_RECOGNIZED``).
-            reason: One of the three :class:`LockReason` values.
+            reason: A :class:`LockReason`. The backend must accept every
+                value, including ``foreign_device_baseline`` (2026-09-28).
             assessment_id: Id returned by :meth:`post_assessment`, if any.
+            provenance: :meth:`Calibration.provenance` of the calibration
+                involved, if any - for ``foreign_device_baseline`` this names
+                the unit it was captured on.
 
         Returns:
             The request id to poll with :meth:`check_override_request`, or
@@ -718,6 +839,7 @@ class APIClient:
             "reason": LockReason(reason).value,
             "assessment_id": assessment_id,
             "requested_at": datetime.now(timezone.utc).isoformat(),
+            **(provenance or {}),
         }
         resp = self._request("POST", "/override-requests", json=body)
         if resp is None:

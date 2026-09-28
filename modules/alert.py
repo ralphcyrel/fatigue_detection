@@ -68,6 +68,14 @@ BUZZER_PATTERNS: Dict[str, float] = {
     "long": 0.5,
 }
 
+# The WARNING chirp only draws the driver's eye to the yellow LED, so it
+# sounds on a rise from ALERT and at most once per this many seconds. A score
+# near the WARNING boundary would otherwise chirp on every crossing, and an
+# alert that repeats without new information is one a driver learns to
+# ignore. The LEDs still follow every level change, and the DANGER buzzer is
+# never rate-limited.
+WARNING_CHIRP_MIN_INTERVAL_S: float = 30.0
+
 # Logic levels for the relay (see module docstring for the wiring assumption).
 _RELAY_ALLOW: int = 1    # HIGH -> coil energised -> NO contacts closed -> start allowed
 _RELAY_INHIBIT: int = 0  # LOW  -> coil released  -> contacts open       -> start inhibited
@@ -84,7 +92,7 @@ class AlertManager:
     Typical usage::
 
         alerts = AlertManager(phase=Phase.PREDRIVE)   # auto-detects GPIO; relay inhibited
-        alerts.set_alert_level("WARNING")             # yellow LED + short beep
+        alerts.set_alert_level("WARNING")             # yellow LED + short beep (rate-limited)
         alerts.set_alert_level("DANGER")              # red LED + buzzer (relay untouched)
         alerts.unlock_relay()                         # assessment passed / override approved
         alerts.set_phase(Phase.MONITORING)            # ignition ON: lock_relay() now refused,
@@ -123,6 +131,8 @@ class AlertManager:
         self._buzzer_thread: Optional[threading.Thread] = None
         self._buzzer_stop = threading.Event()
         self._buzzer_lock = threading.Lock()
+        # time.monotonic() of the last WARNING chirp (rate limit).
+        self._last_warning_chirp: Optional[float] = None
 
         if self.mock:
             reason = "forced by caller" if mock else "RPi.GPIO not available"
@@ -179,7 +189,9 @@ class AlertManager:
 
         Only acts on a *change* of level, so calling this every frame (as
         ``main.py`` does) does not re-trigger the WARNING beep 30x a second
-        or restart the continuous buzzer thread.
+        or restart the continuous buzzer thread. The WARNING beep is further
+        limited: only on a rise from ALERT (not on the way down from DANGER
+        or FAULT), and at most once per :data:`WARNING_CHIRP_MIN_INTERVAL_S`.
 
         ``"FAULT"`` (monitoring: the driver has not been visible for
         ``NO_FACE_FAULT_S``) lights yellow *and* red - a combination no
@@ -212,11 +224,21 @@ class AlertManager:
             self._write(LED_GREEN, 0)
             self._write(LED_YELLOW, 1)
             self._write(LED_RED, 0)
-            # Single beep, run on a thread so the 100 ms sleep doesn't stall
-            # the frame loop.
-            threading.Thread(
-                target=self.trigger_buzzer, args=("short",), daemon=True
-            ).start()
+            # No chirp on the way down from DANGER / FAULT: the continuous
+            # buzzer stopping is the cue there.
+            now = time.monotonic()
+            since = (None if self._last_warning_chirp is None
+                     else now - self._last_warning_chirp)
+            if previous == "ALERT" and since is not None \
+                    and since < WARNING_CHIRP_MIN_INTERVAL_S:
+                logger.debug("WARNING chirp suppressed (last one %.1fs ago)", since)
+            elif previous == "ALERT":
+                self._last_warning_chirp = now
+                # Single beep, run on a thread so the 100 ms sleep doesn't
+                # stall the frame loop.
+                threading.Thread(
+                    target=self.trigger_buzzer, args=("short",), daemon=True
+                ).start()
 
         elif level == "FAULT":
             self._stop_continuous_buzzer()

@@ -42,17 +42,21 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from config import config
 from modules.alert import AlertManager
-from modules.api import APIClient
+from modules.api import (CALIBRATION_SOURCE_DEVICE, REPAIR_EAR_PAIR_SELF_SEEDED,
+                         REPAIR_EAR_THRESHOLD_RECOMPUTED, REPAIR_PERCLOS_BASELINE_FLOORED,
+                         SELF_SEEDED_PROVENANCE, APIClient, Calibration, repair_defaulted)
 from modules.assessment import PredriveAssessment
 from modules.blink import BlinkDetector, MicrosleepDetector
-from modules.calibration import EAR_THRESHOLD_RATIO, CalibrationManager
+from modules.calibration import (EAR_BASELINE_PLAUSIBLE_MAX, EAR_BASELINE_PLAUSIBLE_MIN,
+                                 EAR_THRESHOLD_RATIO, MIN_PERCLOS_BASELINE, SELF_SEED_S,
+                                 CalibrationManager, ear_baseline_plausible)
 from modules.ear import EARCalculator
 from modules.face_recognition_module import DriverRecognizer
 from modules.head_pose import HeadPoseEstimator
@@ -70,9 +74,11 @@ logger = logging.getLogger("fatigue")
 # ---------------------------------------------------------------------------
 
 # Face recognition is ~10x more expensive than landmark extraction, so in the
-# monitoring phase it is only re-run every N frames; the last result is
-# cached in between.
-IDENTIFY_INTERVAL: int = 30
+# monitoring phase it is only re-run this often (wall-clock seconds); the last
+# result is cached in between. Was "every 30 frames", meant as 1 s at the
+# camera's 30 fps but 1.5 s at the Pi's real ~20 fps - and slower still when
+# recognition itself dragged the loop down. 1.5 s keeps the measured cadence.
+IDENTIFY_INTERVAL_S: float = 1.5
 
 # While the driver stays in DANGER (monitoring), log at most one event per
 # this many seconds - otherwise a 30 fps loop would POST 30 events per second.
@@ -126,13 +132,18 @@ SEED_MIN_SAMPLES: int = 5
 # Log the measured loop rate every N frames.
 FPS_LOG_INTERVAL: int = 30
 
-# Used in the MONITORING phase only, when the backend has no thresholds for
-# a driver (or is offline, or the driver is unrecognised) so monitoring can
-# still run - degraded monitoring is better than none. Pre-drive never uses
-# these: a missing baseline there is a lock condition.
+# Population values for the non-EAR baselines. Used in MONITORING when there
+# is no usable calibration (driver unrecognised, no record, backend offline),
+# and to fill fields missing from a partial backend record. Pre-drive never
+# runs on them: a missing baseline there is a lock condition.
+#
+# There is deliberately no EAR baseline or threshold here. The old population
+# pair (0.30 / 0.225) put the closure threshold at 88 % of a 0.255 EAR -
+# inside landmark noise - and on 2026-09-23 drove 130 level changes in 71 s
+# for an unrecognised driver. Without a calibration the EAR pair is seeded
+# from the driver's own EAR (modules.calibration.EarSelfSeed), and until then
+# only the overrides run.
 DEFAULT_THRESHOLDS: Dict[str, float] = {
-    "ear_baseline": 0.30,
-    "ear_threshold": 0.225,
     "perclos_baseline": 5.0,
     "blink_duration_baseline": 150.0,
     "blink_frequency_baseline": 5.0,
@@ -142,6 +153,10 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "mar_baseline": 0.45,
     "yawn_threshold": 0.90,
 }
+
+# check_threshold_sanity: how far ear_threshold / ear_baseline may stray from
+# EAR_THRESHOLD_RATIO before the pair counts as inconsistent.
+EAR_RATIO_TOLERANCE: float = 0.10
 
 # Threshold keys that only exist for drivers enrolled with yawn detection.
 MAR_THRESHOLD_KEYS = ("mar_baseline", "yawn_threshold")
@@ -169,6 +184,7 @@ LOCK_REASON_TEXT: Dict[LockReason, str] = {
     LockReason.MICROSLEEP_DETECTED: "MICROSLEEP DETECTED",
     LockReason.DRIVER_NOT_RECOGNIZED: "DRIVER NOT RECOGNIZED",
     LockReason.NO_BASELINE: "NO BASELINE ON FILE",
+    LockReason.FOREIGN_DEVICE_BASELINE: "BASELINE FROM ANOTHER UNIT - RE-ENROL",
 }
 
 # ---------------------------------------------------------------------------
@@ -483,7 +499,8 @@ def draw_overlay(
     cv2.putText(frame, f"Driver: {name}", (10, 25), font, 0.6, WHITE, 1, cv2.LINE_AA)
     cv2.putText(frame, f"FPS: {fps:.1f}" if fps is not None else "FPS: --",
                 (w - 150, 25), font, 0.5, WHITE, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"FRS: {m.frs:.3f}", (10, 50), font, 0.6, color, 2, cv2.LINE_AA)
+    cv2.putText(frame, f"FRS: {m.frs:.3f}" if m.scored else "FRS: -- (learning EAR baseline)",
+                (10, 50), font, 0.6, color, 2, cv2.LINE_AA)
     cv2.putText(frame, level, (w - 150, 50), font, 0.9, color, 2, cv2.LINE_AA)
     cv2.putText(frame, f"EAR: {m.ear:.3f}", (10, 75), font, 0.55, WHITE, 1, cv2.LINE_AA)
     cv2.putText(frame, f"PERCLOS: {m.perclos:.1f}%", (10, 100), font, 0.55, WHITE, 1, cv2.LINE_AA)
@@ -756,7 +773,8 @@ def run_enrollment(
         # rejected by the blink detector, so they must be collected here or
         # they would vanish from the calibration record entirely.
         ms_event = microsleep_detector.update(ear, threshold, now)
-        perclos = perclos_calc.update(ear, threshold)
+        # No warm-up prior: the baseline is what is being measured.
+        perclos = perclos_calc.update(ear, threshold, now)
         status = calib.update(
             ear,
             event["duration_ms"] if event else None,
@@ -807,62 +825,137 @@ def check_phase(ignition: Any, expected: Phase) -> None:
         raise PhaseChanged()
 
 
-def load_thresholds(
-    api_client: APIClient, driver_id: int, allow_defaults: bool
-) -> Optional[Dict[str, float]]:
+def load_calibration(
+    api_client: APIClient, driver_id: int, phase: Phase
+) -> Tuple[Optional[Calibration], Optional[Dict[str, Any]]]:
     """
-    Fetch the calibrated baselines for this device and fill any omitted field.
+    Fetch the recognised driver's calibration, and decide whether it is usable.
 
-    The backend keys calibration by device (``config.DEVICE_ID``) and
-    resolves the assigned driver itself; ``driver_id`` is the driver the
-    camera recognised and is only used for logging / a mismatch warning.
+    Keyed by driver and device (``APIClient.get_driver_calibration``): the
+    driver's calibration captured on this unit, else - flagged
+    ``foreign_device`` - one captured on another unit. Never another
+    driver's. (Pre-drive locks on ``foreign_device`` itself; see
+    :func:`run_predrive_assessment`.)
+
+    **Pre-drive and monitoring treat a broken record differently, on
+    purpose.** Pre-drive can release the starter, so it is fail-secure: any
+    defect - an EAR key or core baseline missing, a threshold inconsistent
+    with its baseline, a zero PERCLOS baseline - returns ``None`` and the unit
+    locks with ``NO_BASELINE``. Monitoring cannot release anything and a
+    driver's real alert-state baseline is worth keeping, so there a broken
+    record is *repaired* - but only where its EAR baseline is independently
+    credible (``ear_baseline_plausible``):
+
+    * threshold missing / inconsistent -> recomputed as
+      ``ear_baseline * EAR_THRESHOLD_RATIO``;
+    * EAR baseline missing -> the EAR pair is self-seeded, the record's other
+      baselines are kept;
+    * PERCLOS baseline <= 0 -> floored at calibration's MIN_PERCLOS_BASELINE;
+    * another core baseline missing -> filled from DEFAULT_THRESHOLDS.
+
+    An EAR baseline *present but implausible* is never repaired in either
+    phase: it is the suspect value, and a threshold recomputed from it would
+    launder the corruption. The record is discarded (monitoring then
+    self-seeds everything). Every repair is logged at WARNING with original
+    and new values and listed in ``Calibration.repairs``, which travels as
+    ``calibration_repairs`` on every fatigue event. Frequent repairs point at
+    a problem in the enrollment path.
 
     Args:
         api_client: Backend client.
         driver_id: Recognised driver.
-        allow_defaults: ``True`` (monitoring) substitutes
-            :data:`DEFAULT_THRESHOLDS` when no usable record exists;
-            ``False`` (pre-drive) returns ``None`` instead, because a
-            missing baseline is a lock condition there.
+        phase: ``Phase.PREDRIVE`` (no repairs) or ``Phase.MONITORING``.
 
     Returns:
-        A complete thresholds dict, or ``None`` (pre-drive only).
+        ``(calibration, provenance)``. ``calibration`` is usable - every
+        pipeline key present except, when ``self_seed_ear``, the EAR pair -
+        or ``None``. ``provenance`` describes the record the backend
+        returned *whether or not it was used* (``None`` only if there was
+        none), so a lock on a rejected record still shows the operator which
+        calibration was refused and where it was captured.
     """
-    thresholds = api_client.get_device_calibration(
-        config.DEVICE_ID, expected_driver_id=driver_id
-    )
-    if not thresholds or "ear_threshold" not in thresholds:
-        if not allow_defaults:
-            logger.warning("No baseline on file for driver %s (backend returned %r)",
-                           driver_id, thresholds)
-            return None
-        logger.warning("No thresholds for driver %s - using defaults; "
-                       "run `main.py --enroll` for this driver", driver_id)
-        defaults = dict(DEFAULT_THRESHOLDS)
-        check_threshold_sanity(defaults, "DEFAULT_THRESHOLDS")
-        return defaults
+    fetched = api_client.get_driver_calibration(driver_id)
+    if fetched is None:
+        return None, None
+    thresholds = dict(fetched.thresholds)
+    source = f"backend, driver {driver_id} ({fetched.source}, calibration {fetched.calibration_id})"
+    monitoring = Phase(phase) is Phase.MONITORING
+
+    baseline = thresholds.get("ear_baseline")
+    if baseline is not None and not ear_baseline_plausible(baseline):
+        logger.error("CALIBRATION DISCARDED (%s): ear_baseline %.4f is outside the plausible "
+                     "open-eye range %.2f-%.2f - the baseline itself is suspect, so the record "
+                     "is not repaired%s", source, baseline, EAR_BASELINE_PLAUSIBLE_MIN,
+                     EAR_BASELINE_PLAUSIBLE_MAX,
+                     "; self-seeding instead" if monitoring else "; locking")
+        return None, fetched.provenance()
 
     # Drivers enrolled before yawn detection have no MAR baseline; say so
     # explicitly because the generic default silently makes yawn detection
-    # non-personal.
+    # non-personal. Allowed in both phases (a known enrollment vintage, not
+    # a broken record).
     missing_mar = [k for k in MAR_THRESHOLD_KEYS if k not in thresholds]
     if missing_mar:
         logger.warning("Driver %s has no MAR baseline (%s missing) - yawn detection will "
                        "use generic defaults; re-enrol with `main.py --enroll` to calibrate it",
                        driver_id, ", ".join(missing_mar))
-    # Fill any field the backend omitted so the pipeline never KeyErrors on
-    # a partial record.
-    for key, val in DEFAULT_THRESHOLDS.items():
-        thresholds.setdefault(key, val)
-    check_threshold_sanity(thresholds, f"backend, driver {driver_id}")
-    return thresholds
+        for key in missing_mar:
+            thresholds[key] = DEFAULT_THRESHOLDS[key]
+    missing_core = [k for k in DEFAULT_THRESHOLDS if k not in thresholds]
+
+    if not monitoring:
+        # Pre-drive: fail-secure, no repairs.
+        missing = [k for k in ("ear_baseline", "ear_threshold") if k not in thresholds]
+        if missing + missing_core:
+            logger.error("Calibration unusable for pre-drive (%s): missing %s",
+                         source, ", ".join(missing + missing_core))
+            return None, fetched.provenance()
+        if not check_threshold_sanity(thresholds, source):
+            return None, fetched.provenance()
+        usable = Calibration(thresholds, fetched.driver_id, fetched.source,
+                             fetched.calibration_id, fetched.captured_on_device_id)
+        return usable, usable.provenance()
+
+    # Monitoring-only repairs (see docstring).
+    repairs = []
+    for key in missing_core:
+        thresholds[key] = DEFAULT_THRESHOLDS[key]
+        repairs.append(repair_defaulted(key))
+        logger.warning("CALIBRATION REPAIRED (%s): %s missing -> default %.3f",
+                       source, key, thresholds[key])
+    if baseline is None:
+        thresholds.pop("ear_threshold", None)
+        repairs.append(REPAIR_EAR_PAIR_SELF_SEEDED)
+        logger.warning("CALIBRATION REPAIRED (%s): no ear_baseline -> EAR pair self-seeded, "
+                       "other baselines kept", source)
+    else:
+        original = thresholds.get("ear_threshold")
+        if original is None or abs(original / baseline - EAR_THRESHOLD_RATIO) > EAR_RATIO_TOLERANCE:
+            thresholds["ear_threshold"] = baseline * EAR_THRESHOLD_RATIO
+            repairs.append(REPAIR_EAR_THRESHOLD_RECOMPUTED)
+            logger.warning("CALIBRATION REPAIRED (%s): ear_threshold %s (ratio %s) -> %.4f "
+                           "(%.2f x ear_baseline %.4f)", source,
+                           "missing" if original is None else f"{original:.4f}",
+                           "-" if original is None else f"{original / baseline:.3f}",
+                           thresholds["ear_threshold"], EAR_THRESHOLD_RATIO, baseline)
+    if thresholds["perclos_baseline"] <= 0.0:
+        original = thresholds["perclos_baseline"]
+        thresholds["perclos_baseline"] = MIN_PERCLOS_BASELINE
+        repairs.append(REPAIR_PERCLOS_BASELINE_FLOORED)
+        logger.warning("CALIBRATION REPAIRED (%s): perclos_baseline %.3f -> %.3f (calibration "
+                       "floor)", source, original, MIN_PERCLOS_BASELINE)
+    if baseline is not None:
+        check_threshold_sanity(thresholds, source)   # logs the (now consistent) pair
+    usable = Calibration(thresholds, fetched.driver_id, fetched.source,
+                         fetched.calibration_id, fetched.captured_on_device_id, tuple(repairs))
+    return usable, usable.provenance()
 
 
-def check_threshold_sanity(thresholds: Dict[str, float], source: str) -> None:
+def check_threshold_sanity(thresholds: Dict[str, float], source: str) -> bool:
     """
-    Log whether ``ear_threshold`` is consistent with ``ear_baseline``.
+    Check that ``ear_threshold`` is consistent with ``ear_baseline``.
 
-    TEMPORARY DIAGNOSTIC. Everything that decides "are the eyes shut" -
+    Everything that decides "are the eyes shut" -
     PERCLOS, the blink detector and the microsleep detector - tests
     ``ear < thresholds["ear_threshold"]``, so a threshold that does not match
     the baseline it was derived from silently disables all three at once:
@@ -876,17 +969,25 @@ def check_threshold_sanity(thresholds: Dict[str, float], source: str) -> None:
     the two values came from different places - a stale threshold against a
     re-enrolled baseline, or a partial backend record.
 
+    Until 2026-09-28 this only logged, and monitoring then ran on the record
+    anyway; now a failing record is not used (pre-drive locks, monitoring
+    self-seeds).
+
     Args:
         thresholds: The dict about to be handed to the pipeline.
         source: Where it came from, for the log line.
+
+    Returns:
+        ``True`` if the record is usable.
     """
     baseline = float(thresholds.get("ear_baseline", 0.0))
     threshold = float(thresholds.get("ear_threshold", 0.0))
     if baseline <= 0.0:
         logger.error("THRESHOLD CHECK (%s): ear_baseline is %.4f - EAR normalisation "
                      "and the closure test are both meaningless", source, baseline)
-        return
+        return False
     ratio = threshold / baseline
+    usable = True
     logger.info(
         "THRESHOLD CHECK (%s): ear_baseline=%.4f ear_threshold=%.4f ratio=%.3f "
         "(expected %.2f) | perclos_baseline=%.3f blink_duration_baseline=%.1fms "
@@ -896,7 +997,7 @@ def check_threshold_sanity(thresholds: Dict[str, float], source: str) -> None:
         float(thresholds.get("blink_duration_baseline", 0.0)),
         float(thresholds.get("blink_frequency_baseline", 0.0)),
     )
-    if ratio < EAR_THRESHOLD_RATIO - 0.10:
+    if ratio < EAR_THRESHOLD_RATIO - EAR_RATIO_TOLERANCE:
         logger.error(
             "THRESHOLD TOO LOW (%s): ear_threshold is %.1f%% of ear_baseline, expected "
             "%.0f%%. The eye must drop to %.1f%% of its open value (below %.4f) before "
@@ -907,18 +1008,24 @@ def check_threshold_sanity(thresholds: Dict[str, float], source: str) -> None:
             "newer baseline.",
             source, ratio * 100, EAR_THRESHOLD_RATIO * 100, ratio * 100, threshold,
         )
-    elif ratio > EAR_THRESHOLD_RATIO + 0.10:
+        usable = False
+    elif ratio > EAR_THRESHOLD_RATIO + EAR_RATIO_TOLERANCE:
         logger.error(
             "THRESHOLD TOO HIGH (%s): ear_threshold is %.1f%% of ear_baseline, expected "
             "%.0f%%. Partly-open eyes will register as closed, inflating PERCLOS and "
             "manufacturing blinks. Re-enrol this driver.",
             source, ratio * 100, EAR_THRESHOLD_RATIO * 100,
         )
+        usable = False
     if float(thresholds.get("perclos_baseline", 0.0)) <= 0.0:
         logger.error(
             "THRESHOLD CHECK (%s): perclos_baseline is 0 - PERCLOSCalculator.normalize() "
             "returns 0.0 for a zero baseline, so the PERCLOS term is dead regardless of "
             "how long the eyes are shut", source)
+        usable = False
+    if not usable:
+        logger.error("THRESHOLD CHECK (%s): record NOT USED", source)
+    return usable
 
 
 def identify_driver_bounded(
@@ -994,19 +1101,24 @@ def await_override(
     driver_id: Optional[int],
     reason: LockReason,
     assessment_id: Optional[int],
+    provenance: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Starter stays inhibited: raise one override request and poll the
     operator's decision until approved (-> release starter, wait for
     ignition), the user presses ``r`` (-> re-assess) or the phase changes.
 
-    All three :class:`LockReason` values resolve through this one path.
+    Every :class:`LockReason` resolves through this one path. ``provenance``
+    (``Calibration.provenance()``) goes on the request so the operator can
+    see which calibration was involved - for ``FOREIGN_DEVICE_BASELINE``,
+    which unit it was captured on.
     """
     reason_text = LOCK_REASON_TEXT[reason]
     logger.warning("Pre-drive: starter stays LOCKED - %s (driver=%s)", reason.value, driver_id)
     alert_manager.lock_relay()  # already locked; explicit for clarity + log
 
-    request_id = api_client.request_override(config.DEVICE_ID, driver_id, reason, assessment_id)
+    request_id = api_client.request_override(config.DEVICE_ID, driver_id, reason, assessment_id,
+                                             provenance)
     status = "pending"
     last_poll = time.monotonic()
     offline_logged = request_id is None
@@ -1021,7 +1133,7 @@ def await_override(
             last_poll = now
             if request_id is None:
                 request_id = api_client.request_override(
-                    config.DEVICE_ID, driver_id, reason, assessment_id)
+                    config.DEVICE_ID, driver_id, reason, assessment_id, provenance)
             elif status == "pending":
                 polled = api_client.check_override_request(request_id)
                 if polled is not None and polled != status:
@@ -1072,7 +1184,8 @@ def run_predrive_assessment(
 
     1. Relay inhibited (``set_phase(PREDRIVE)``).
     2. Recognise the driver (bounded)          -> else DRIVER_NOT_RECOGNIZED.
-    3. Fetch thresholds, no defaults           -> else NO_BASELINE.
+    3. This driver's calibration from this unit  -> none at all: NO_BASELINE;
+       only from another unit: FOREIGN_DEVICE_BASELINE (never assessed on it).
     4. 30 s assessment through the shared pipeline; every frame recorded.
     5. Persist CSV/JSON + POST /assessments.
     6. PASS -> release starter, wait for ignition.
@@ -1089,6 +1202,9 @@ def run_predrive_assessment(
 
     driver: Optional[Dict[str, Any]] = None
     driver_id: Optional[int] = None
+    calibration: Optional[Calibration] = None
+    # Provenance of the record the backend returned, used or not.
+    calibration_record: Optional[Dict[str, Any]] = None
     lock_reason: Optional[LockReason] = None
     assessment_id: Optional[int] = None
 
@@ -1099,10 +1215,30 @@ def run_predrive_assessment(
             lock_reason = LockReason.DRIVER_NOT_RECOGNIZED
         else:
             driver_id = int(driver["driver_id"])
-            # 3. Thresholds - no defaults at pre-drive
-            thresholds = load_thresholds(api_client, driver_id, allow_defaults=False)
-            if thresholds is None:
+            # 3. Calibration - this driver's own, captured on this unit, or
+            # lock. One captured on another unit is never allowed to release
+            # the starter (fail-secure: a baseline that reads low passes a
+            # fatigued driver), so it locks without an assessment and the
+            # override request carries its provenance for the operator.
+            calibration, calibration_record = load_calibration(api_client, driver_id,
+                                                               Phase.PREDRIVE)
+            if calibration is None:
+                # No record, or a broken one. A broken record from another
+                # unit also lands here, deliberately: no_baseline is the
+                # accurate category and the operator's action is the same,
+                # whereas foreign_device_baseline would imply that approving
+                # leaves a usable baseline. Its provenance still goes on the
+                # override request as context.
                 lock_reason = LockReason.NO_BASELINE
+            elif calibration.source != CALIBRATION_SOURCE_DEVICE:
+                logger.warning("Pre-drive: driver %s's only calibration (%s) was captured on "
+                               "%s, not %s - locking for operator override",
+                               driver_id, calibration.calibration_id,
+                               calibration.captured_on_device_id or "an unrecorded device",
+                               config.DEVICE_ID)
+                lock_reason = LockReason.FOREIGN_DEVICE_BASELINE
+            else:
+                thresholds = calibration.thresholds
 
         if lock_reason is None:
             # 4. Assessment
@@ -1113,9 +1249,12 @@ def run_predrive_assessment(
                 diag_ear=diag_ear,
             )
             assessment = PredriveAssessment()
+            assessment.calibration = calibration.provenance()
             assessment.start(time.time())
-            logger.info("Pre-drive: %d s assessment started for driver %s (%s)",
-                        config.PREDRIVE_ASSESSMENT_SECONDS, driver_id, driver["name"])
+            logger.info("Pre-drive: %d s assessment started for driver %s (%s), "
+                        "calibration %s (%s)", config.PREDRIVE_ASSESSMENT_SECONDS,
+                        driver_id, driver["name"], calibration.calibration_id,
+                        calibration.source)
 
             while not assessment.is_complete(time.time()):
                 check_phase(ignition, Phase.PREDRIVE)
@@ -1210,7 +1349,8 @@ def run_predrive_assessment(
         # 7. Lock path (every lock reason)
         alert_manager.set_alert_level("ALERT")
         await_override(api_client, alert_manager, ignition, rate, driver_id,
-                       lock_reason, assessment_id)
+                       lock_reason, assessment_id,
+                       calibration_record)
 
     except PhaseChanged:
         logger.info("Pre-drive: ignition turned ON - leaving pre-drive (starter %s)",
@@ -1239,8 +1379,12 @@ def run_monitoring(
     Alerts (LEDs, buzzer) and backend DANGER notifications only. The relay is
     never driven here; ``AlertManager`` refuses ``lock_relay()`` in this
     phase, so nothing in this loop can inhibit the starter even by mistake.
-    An unrecognised driver, or one without a baseline, is monitored with
-    :data:`DEFAULT_THRESHOLDS` - degraded monitoring is better than none.
+    A driver without a usable calibration (unrecognised, no record, record
+    failing the threshold check, backend offline) is monitored on an EAR
+    baseline self-seeded from their own EAR over the first
+    ``SELF_SEED_S`` of face time; until it freezes, only the head-pose and
+    microsleep overrides run. The remaining baselines are
+    :data:`DEFAULT_THRESHOLDS`.
 
     Frames with no face follow ``modules.pipeline.NoFacePolicy``: the level
     is held (never lowered), a DANGER is latched, and ALERT / WARNING turn
@@ -1263,13 +1407,13 @@ def run_monitoring(
 
     driver: Optional[Dict[str, Any]] = None
     current_driver_id: Optional[int] = None
+    # None = no usable calibration: the pipeline self-seeds the EAR pair and
+    # takes the other baselines from DEFAULT_THRESHOLDS.
+    calibration: Optional[Calibration] = None
     thresholds: Dict[str, float] = dict(DEFAULT_THRESHOLDS)
-    # The starting thresholds, before any driver is recognised; replaced by
-    # load_thresholds() (which runs the same check) once one is.
-    check_threshold_sanity(thresholds, "DEFAULT_THRESHOLDS (no driver yet)")
     defaults_logged = False
     last_danger_push = 0.0
-    frame_count = 0
+    last_identify = float("-inf")
     # Effective level (FRS band, or DANGER under the head-pose override) as
     # of the previous scored frame, so transitions can be logged once rather
     # than every frame. ``None`` until the first face is processed.
@@ -1280,7 +1424,6 @@ def run_monitoring(
     open_fault: Optional[OpenFault] = None
 
     while ignition.phase() is Phase.MONITORING:
-        frame_count += 1
         frame = next_frame()
         fps = rate.tick()
         now, now_mono = time.time(), time.monotonic()
@@ -1337,31 +1480,51 @@ def run_monitoring(
             open_fault.push(api_client, "resolved", now_mono, resolved, "face_reacquired")
             open_fault = None
 
-        # Identify - every IDENTIFY_INTERVAL frames, or every frame until
-        # someone has been recognised at all.
-        if current_driver_id is None or frame_count % IDENTIFY_INTERVAL == 0:
+        # Identify - every IDENTIFY_INTERVAL_S, or every frame until someone
+        # has been recognised at all.
+        if current_driver_id is None or now_mono - last_identify >= IDENTIFY_INTERVAL_S:
+            last_identify = now_mono
             match = recognizer.identify(frame)
             if match is None:
                 if current_driver_id is None and not defaults_logged:
-                    logger.warning("Monitoring: driver not recognised - monitoring with "
-                                   "DEFAULT_THRESHOLDS until a face is recognised")
+                    logger.warning("Monitoring: driver not recognised - self-seeding the EAR "
+                                   "baseline from this driver's own EAR (overrides only for "
+                                   "the first %.0fs of face time)", SELF_SEED_S)
                     defaults_logged = True
                 # else: a known driver's periodic re-identify failed; keep
-                # the cached driver and thresholds.
+                # the cached driver and calibration.
             elif int(match["driver_id"]) != current_driver_id:
                 driver = match
                 current_driver_id = int(match["driver_id"])
                 logger.info("Driver identified: %s (id=%s, confidence %.2f)",
                             match["name"], current_driver_id, match["confidence"])
-                thresholds = load_thresholds(api_client, current_driver_id, allow_defaults=True)
+                # A foreign-device calibration IS used here (flagged on every
+                # event), unlike pre-drive where it locks. Decided 2026-09-28:
+                # a real alert-state baseline measured at the wrong camera
+                # angle beats one self-seeded from a driver who may already
+                # be drowsy - that failure is silent and defeats detection
+                # for exactly the drivers who need it. The angle error is
+                # unquantified (a stated limitation). Self-seed only when
+                # there is no calibration, or (a flagged repair) when the
+                # record has no EAR baseline.
+                calibration, _ = load_calibration(api_client, current_driver_id,
+                                                  Phase.MONITORING)
+                if calibration is None:
+                    logger.warning("Monitoring: no usable calibration for driver %s - "
+                                   "self-seeding the EAR baseline; re-enrol with "
+                                   "`main.py --enroll`", current_driver_id)
+                thresholds = (calibration.thresholds if calibration is not None
+                              else dict(DEFAULT_THRESHOLDS))
                 # Fresh per-driver history so the previous driver's blinks
-                # and yawns don't leak into this driver's metrics.
+                # and yawns (and any self-seeded baseline) don't leak into
+                # this driver's metrics.
                 pipeline.reset()
                 last_danger_push = 0.0
             else:
                 driver = match
 
-        m = pipeline.process(landmarks, thresholds, now, now_mono)
+        m = pipeline.process(landmarks, thresholds, now, now_mono,
+                             self_seed=calibration is None or calibration.self_seed_ear)
         last_m = m
         # (A gap that opened a fault was already logged above when it was resolved.)
         if m.gap_ended is not None and m.gap_ended.face_lost and not fault_resolved:
@@ -1375,10 +1538,13 @@ def run_monitoring(
         # band rather than just the total.
         if m.level != last_level:
             logger.info(
-                "Level %s -> %s: %s%s",
+                "Level %s -> %s: %s%s%s",
                 last_level or "(none)", m.level,
-                pipeline.frs_calc.format_breakdown(m.frs_result),
+                pipeline.frs_calc.format_breakdown(m.frs_result) if m.scored
+                else "not scored (self-seeding EAR baseline)",
                 f"  [{m.override_reason} override forcing DANGER]" if m.overridden else "",
+                f"  [band {m.band} held; raw {m.frs_result['level']}]"
+                if m.scored and not m.overridden and m.band != m.frs_result["level"] else "",
             )
             logger.debug(
                 "Level %s inputs: ear=%.3f (norm %.3f) perclos=%.1f%% (norm %.3f) "
@@ -1399,6 +1565,8 @@ def run_monitoring(
             api_client.push_fatigue_event(
                 current_driver_id, m.effective_result(), m.ear, m.perclos,
                 relay_triggered=False, phase=Phase.MONITORING,
+                provenance=(calibration.provenance() if calibration is not None
+                            else SELF_SEEDED_PROVENANCE),
             )
             last_danger_push = now
 

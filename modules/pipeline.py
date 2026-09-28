@@ -33,8 +33,10 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from modules.blink import BlinkDetector, MicrosleepDetector
-from modules.ear import EARCalculator
-from modules.frs import MICROSLEEP_COUNT_WINDOW_S, FRSCalculator
+from modules.calibration import EAR_THRESHOLD_RATIO, EarSelfSeed
+from modules.ear import EARCalculator, RollingMedian
+from modules.frs import (DANGER_THRESHOLD, EAR_MEDIAN_WINDOW_S, LEVEL_COLORS,
+                         MICROSLEEP_COUNT_WINDOW_S, WARNING_THRESHOLD, FRSCalculator)
 from modules.mar import MARCalculator, YawnDetector
 from modules.perclos import PERCLOSCalculator
 
@@ -66,6 +68,18 @@ POSE_LOG_INTERVAL: int = 30
 # blinks awake.
 MICROSLEEP_DANGER_HOLD_S: float = 0.0
 MICROSLEEP_RELEASE_HOLD_S: float = 3.0
+
+# Hysteresis on the FRS bands (2026-09-28; see BandHysteresis). A band is
+# entered on the first frame the score reaches its threshold - no engage
+# hold, so escalation is never delayed - and left only once the score has
+# stayed below (threshold - margin) for the release hold. Sized on the
+# 2026-09-23 11:49 flicker rebuilt from real EAR (driver 6's calibration
+# series against the population baseline, on the log's blink-duration
+# plateau): with the 0.5 s EAR median the smoothed EAR term still spans
+# ~0.06 (p5-p95), and 6-26 changes/min remained at 0.40; 0.06 / 1.0 s took
+# that to 0, and to 1-3/min at 0.65.
+BAND_RELEASE_MARGIN: float = 0.06
+BAND_RELEASE_HOLD_S: float = 1.0
 
 # No-face policy (monitoring only; see NoFacePolicy). All wall-clock seconds
 # of *continuous* no-face, measured with time.monotonic().
@@ -142,6 +156,10 @@ class HeadPoseDebounce:
     def reset(self) -> None:
         """Forget all timers and drop any active override (e.g. face lost, new driver)."""
         self.active = False
+        self.clear_timers()
+
+    def clear_timers(self) -> None:
+        """Forget both timers but keep ``active`` (a no-face gap under band hysteresis)."""
         self._alert_since = None
         self._normal_since = None
 
@@ -152,6 +170,48 @@ class HeadPoseDebounce:
     def normal_elapsed(self, now: float) -> float:
         """Seconds the pose has been continuously normal *while the override is active*."""
         return 0.0 if self._normal_since is None else now - self._normal_since
+
+
+class BandHysteresis:
+    """
+    FRS band (ALERT / WARNING / DANGER) with release hysteresis.
+
+    One :class:`HeadPoseDebounce` per threshold, with no engage hold. A gate
+    switches on the first frame ``frs >= threshold`` and off once
+    ``frs < threshold - margin`` has held for ``release_hold`` seconds, so a
+    score sitting on a threshold holds the higher band instead of flipping
+    every frame. Only the way *down* is slowed; the overrides (microsleep,
+    head pose, no-face latch) sit on top of the band in
+    :attr:`FrameMetrics.level` and are not affected by it.
+    """
+
+    def __init__(self, margin: float = BAND_RELEASE_MARGIN,
+                 release_hold: float = BAND_RELEASE_HOLD_S) -> None:
+        self.margin = margin
+        self.gates = ((WARNING_THRESHOLD, HeadPoseDebounce(0.0, release_hold)),
+                      (DANGER_THRESHOLD, HeadPoseDebounce(0.0, release_hold)))
+
+    @property
+    def level(self) -> str:
+        """Current band."""
+        warning, danger = (gate.active for _, gate in self.gates)
+        return "DANGER" if danger else "WARNING" if warning else "ALERT"
+
+    def update(self, frs: float, now: float) -> str:
+        """Feed one score (``time.monotonic()`` timestamp); returns the band."""
+        for threshold, gate in self.gates:
+            gate.update(frs >= threshold - (self.margin if gate.active else 0.0), now)
+        return self.level
+
+    def clear_timers(self) -> None:
+        """Keep the band, forget the timers (no-face gap: only the level carries)."""
+        for _, gate in self.gates:
+            gate.clear_timers()
+
+    def reset(self) -> None:
+        """Back to ALERT (new driver)."""
+        for _, gate in self.gates:
+            gate.reset()
 
 
 @dataclass(frozen=True)
@@ -328,6 +388,15 @@ class FrameMetrics:
     pose_event: Optional[str]      # "engaged" | "released" | None
     yawn_event: Optional[Dict[str, float]]
     yawn_status: Dict[str, Any] = field(default_factory=dict)
+    # ear_norm as the FRS saw it: the EAR_MEDIAN_WINDOW_S rolling median.
+    # ``ear_norm`` stays the frame's own value, so ear / ear_norm is still the
+    # baseline a recording was scored against.
+    ear_norm_frs: float = 0.0
+    # FRS band after BandHysteresis; frs_result["level"] is the raw band.
+    band: str = "ALERT"
+    # False while an unrecognised driver's EAR baseline is still being
+    # self-seeded: no FRS, frs_result is a zero placeholder.
+    scored: bool = True
     microsleep_override: bool = False           # microsleep DANGER override active
     microsleep_event: Optional[Dict[str, float]] = None   # set on confirmation
     microsleep_count: int = 0                   # confirmed in the trailing window
@@ -359,8 +428,8 @@ class FrameMetrics:
 
     @property
     def level(self) -> str:
-        """Effective alert level: ``DANGER`` while either override is active."""
-        return "DANGER" if self.overridden else str(self.frs_result["level"])
+        """Effective alert level: ``DANGER`` while any override is active, else the band."""
+        return "DANGER" if self.overridden else self.band
 
     def last_known(self) -> Dict[str, Any]:
         """
@@ -383,10 +452,8 @@ class FrameMetrics:
         }
 
     def effective_result(self) -> Dict[str, Any]:
-        """``frs_result`` with ``level``/``color`` forced to DANGER under an override."""
-        if self.overridden:
-            return dict(self.frs_result, level="DANGER", color="red")
-        return self.frs_result
+        """``frs_result`` with ``level``/``color`` set to the effective level."""
+        return dict(self.frs_result, level=self.level, color=LEVEL_COLORS[self.level])
 
 
 class MetricsPipeline:
@@ -431,6 +498,7 @@ class MetricsPipeline:
         self.head_pose = head_pose
         self.blink_window_s = float(blink_window_s)
         self.ear_calc = EARCalculator()
+        self.ear_median = RollingMedian(EAR_MEDIAN_WINDOW_S)
         self.mar_calc = MARCalculator()
         self.blink_detector = BlinkDetector(frequency_window=int(blink_window_s))
         self.perclos_calc = PERCLOSCalculator()
@@ -444,6 +512,9 @@ class MetricsPipeline:
             MICROSLEEP_DANGER_HOLD_S, microsleep_release_hold
         )
         self.no_face = NoFacePolicy(enabled=no_face_policy)
+        self.band = BandHysteresis()
+        # EAR baseline for a driver with no usable calibration (process(self_seed=True)).
+        self.ear_seed = EarSelfSeed()
         # Effective level of the last scored frame: what a no-face gap is
         # judged against. None until the first face.
         self.last_level: Optional[str] = None
@@ -460,6 +531,7 @@ class MetricsPipeline:
         thresholds: Dict[str, float],
         now: float,
         now_mono: float,
+        self_seed: bool = False,
     ) -> FrameMetrics:
         """
         Run the full metric chain on one frame's landmarks.
@@ -469,6 +541,12 @@ class MetricsPipeline:
             thresholds: The driver's baseline dict (all keys present).
             now: ``time.time()`` for the frame (blink / yawn timestamps).
             now_mono: ``time.monotonic()`` for the frame (pose debounce).
+            self_seed: No usable calibration (monitoring only):
+                ``ear_baseline`` / ``ear_threshold`` are taken from
+                :attr:`ear_seed` instead of ``thresholds``, which then need
+                only the other keys. Until the seed freezes the frame is not
+                scored (``FrameMetrics.scored`` is ``False``): the level is
+                ALERT unless an override forces DANGER.
 
         Returns:
             A :class:`FrameMetrics`.
@@ -501,22 +579,37 @@ class MetricsPipeline:
         # Raw metrics
         ear = self.ear_calc.compute_average_ear(landmarks)
 
+        # No calibration: the EAR baseline and threshold come from this
+        # driver's own EAR. Until the seed freezes there is no FRS (overrides
+        # only), and until it has a provisional threshold not even microsleep
+        # detection - see modules.calibration.EarSelfSeed.
+        scored = True
+        if self_seed:
+            if self.ear_seed.update(ear, now_mono):
+                logger.info("Scoring on self-seeded EAR baseline %.4f / threshold %.4f "
+                            "(ratio %.2f) - FRS starts now", self.ear_seed.baseline,
+                            self.ear_seed.threshold, EAR_THRESHOLD_RATIO)
+            thresholds = dict(thresholds, ear_baseline=self.ear_seed.baseline,
+                              ear_threshold=self.ear_seed.provisional_threshold(now_mono))
+            scored = self.ear_seed.frozen
+        ear_threshold = thresholds["ear_threshold"]
+
         # TEMPORARY DIAGNOSTIC. This single comparison gates PERCLOS, blink
         # detection and microsleep detection alike - all three call
         # ``ear < thresholds["ear_threshold"]`` - so when all three report
         # nothing at once, this line shows whether the closure test is firing
         # at all, and against what.
-        if self.diag_ear:
+        if self.diag_ear and ear_threshold is not None:
             self._log_ear_decision(ear, thresholds, now)
 
-        self.blink_detector.update(ear, thresholds["ear_threshold"], now)
+        if scored:
+            self.blink_detector.update(ear, ear_threshold, now)
         # Same EAR and same threshold as the blink detector, so the two can
         # never disagree about whether the eyes are shut. Closures of
         # MICROSLEEP_MIN_DURATION_S or more are reported here and rejected
         # there, which is the whole split.
-        microsleep_event = self.microsleep_detector.update(
-            ear, thresholds["ear_threshold"], now
-        )
+        microsleep_event = (None if ear_threshold is None else
+                            self.microsleep_detector.update(ear, ear_threshold, now))
         if microsleep_event:
             # min_ear, not the confirming frame's ear: when the closure
             # crosses 1.0 s between two frames the confirming frame is the
@@ -526,7 +619,7 @@ class MetricsPipeline:
                 "MICROSLEEP confirmed: eyes closed %.2fs (min EAR %.3f < threshold %.3f) - "
                 "%d in the last %.0fs -> DANGER override",
                 microsleep_event["duration_ms"] / 1000.0,
-                microsleep_event["min_ear"], thresholds["ear_threshold"],
+                microsleep_event["min_ear"], ear_threshold,
                 self.microsleep_detector.get_microsleep_count(
                     MICROSLEEP_COUNT_WINDOW_S, now),
                 MICROSLEEP_COUNT_WINDOW_S,
@@ -541,43 +634,59 @@ class MetricsPipeline:
                 (self.microsleep_detector.microsleep_durations[-1] / 1000.0
                  if self.microsleep_detector.microsleep_durations else 0.0),
             )
-        perclos = self.perclos_calc.update(ear, thresholds["ear_threshold"])
         mar = self.mar_calc.compute_mar(landmarks)
-        yawn_event = self.yawn_detector.update(mar, thresholds["yawn_threshold"], now)
-        if yawn_event:
-            logger.info("Yawn detected (mouth open %.1fs, MAR %.3f vs threshold %.3f) - "
-                        "%d this session",
-                        yawn_event["duration_ms"] / 1000.0, mar,
-                        thresholds["yawn_threshold"], self.yawn_detector.get_yawn_count())
-
-        # Normalise against this driver's calibration
-        blink_duration_ms = self.blink_detector.get_average_duration(now)
-        blink_freq = self.blink_detector.get_blink_frequency(now)
-        ear_norm = self.ear_calc.normalize(ear, thresholds["ear_baseline"])
-        bd_norm = self.blink_detector.normalize_duration(
-            blink_duration_ms, thresholds["blink_duration_baseline"]
-        )
-        # The frequency baseline was calibrated over 60 s; if this pipeline
-        # counts over a shorter window, scale the baseline to the same units.
-        bf_baseline = thresholds["blink_frequency_baseline"] * (
-            self.blink_window_s / CALIBRATION_BLINK_WINDOW_S
-        )
-        bf_norm = self.blink_detector.normalize_frequency(blink_freq, bf_baseline)
-        perclos_norm = self.perclos_calc.normalize(perclos, thresholds["perclos_baseline"])
-        # Yawn-gated: the mouth only contributes to the FRS while a confirmed
-        # (sustained) yawn is in progress. Talking, laughing and the 1.5 s
-        # of a yawn before it is confirmed all pass 1.0 = zero excess.
-        mar_norm = self.mar_calc.normalize(mar, thresholds["mar_baseline"])
-        yawn_norm = mar_norm if self.yawn_detector.is_yawning else 1.0
-
-        # Persistence term: repeated microsleeps keep the *score* elevated
-        # between episodes, which the override alone cannot do.
         microsleep_count = self.microsleep_detector.get_microsleep_count(
             MICROSLEEP_COUNT_WINDOW_S, now
         )
-        frs_result = self.frs_calc.compute(
-            ear_norm, bd_norm, bf_norm, perclos_norm, yawn_norm, microsleep_count
-        )
+        if scored:
+            perclos = self.perclos_calc.update(ear, ear_threshold, now_mono,
+                                               baseline=thresholds["perclos_baseline"])
+            yawn_event = self.yawn_detector.update(mar, thresholds["yawn_threshold"], now)
+            if yawn_event:
+                logger.info("Yawn detected (mouth open %.1fs, MAR %.3f vs threshold %.3f) - "
+                            "%d this session",
+                            yawn_event["duration_ms"] / 1000.0, mar,
+                            thresholds["yawn_threshold"], self.yawn_detector.get_yawn_count())
+
+            # Normalise against this driver's calibration
+            blink_duration_ms = self.blink_detector.get_average_duration(now)
+            blink_freq = self.blink_detector.get_blink_frequency(now)
+            ear_norm = self.ear_calc.normalize(ear, thresholds["ear_baseline"])
+            # The FRS gets the rolling median, so a blink - already counted by
+            # PERCLOS and the blink terms - does not also spike the EAR term.
+            ear_norm_frs = self.ear_median.update(ear_norm, now_mono)
+            bd_norm = self.blink_detector.normalize_duration(
+                blink_duration_ms, thresholds["blink_duration_baseline"]
+            )
+            # The frequency baseline was calibrated over 60 s; if this pipeline
+            # counts over a shorter window, scale the baseline to the same units.
+            bf_baseline = thresholds["blink_frequency_baseline"] * (
+                self.blink_window_s / CALIBRATION_BLINK_WINDOW_S
+            )
+            bf_norm = self.blink_detector.normalize_frequency(blink_freq, bf_baseline)
+            perclos_norm = self.perclos_calc.normalize(perclos, thresholds["perclos_baseline"])
+            # Yawn-gated: the mouth only contributes to the FRS while a confirmed
+            # (sustained) yawn is in progress. Talking, laughing and the 1.5 s
+            # of a yawn before it is confirmed all pass 1.0 = zero excess.
+            mar_norm = self.mar_calc.normalize(mar, thresholds["mar_baseline"])
+            yawn_norm = mar_norm if self.yawn_detector.is_yawning else 1.0
+
+            # Persistence term: repeated microsleeps keep the *score* elevated
+            # between episodes, which the override alone cannot do.
+            frs_result = self.frs_calc.compute(
+                ear_norm_frs, bd_norm, bf_norm, perclos_norm, yawn_norm, microsleep_count
+            )
+            band = self.band.update(float(frs_result["frs"]), now_mono)
+        else:
+            # Self-seeding: no baseline yet, so nothing is normalised and
+            # the score is a zero placeholder the level never reads.
+            perclos, yawn_event = 0.0, None
+            blink_duration_ms = blink_freq = 0.0
+            nan = float("nan")
+            ear_norm = ear_norm_frs = bd_norm = bf_norm = perclos_norm = mar_norm = nan
+            yawn_norm = 1.0
+            frs_result = self.frs_calc.compute(1.0, 1.0, 1.0, 1.0)
+            band = self.band.level
 
         # The latch is released on this frame's own level, overrides included.
         own_level = ("DANGER" if self.pose_debounce.active or self.microsleep_debounce.active
@@ -598,6 +707,9 @@ class MetricsPipeline:
             microsleep_status=self.microsleep_detector.get_status(now),
             no_face_latch=no_face_latch,
             gap_ended=gap_ended,
+            ear_norm_frs=ear_norm_frs,
+            band=band,
+            scored=scored,
         )
         self.last_level = metrics.level
         return metrics
@@ -705,6 +817,10 @@ class MetricsPipeline:
             logger.debug("Face lost %.2fs into a closure - closure abandoned unconfirmed",
                          abandoned["closed_s"])
         self.microsleep_debounce.reset()
+        # Pre-gap EAR samples say nothing about the face that comes back.
+        self.ear_median.reset()
+        # The band is a level, which carries; its release timer is not.
+        self.band.clear_timers()
         return verdict
 
     def reset(self) -> None:
@@ -715,6 +831,9 @@ class MetricsPipeline:
         self.microsleep_detector.reset()
         self.microsleep_debounce.reset()
         self.pose_debounce.reset()
+        self.ear_median.reset()
+        self.band.reset()
+        self.ear_seed.reset()
         self.no_face.reset()
         self.last_level = None
         self._frames = 0
