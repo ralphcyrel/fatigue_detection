@@ -166,9 +166,9 @@ class ForcedIgnition:
 
     mock = True
 
-    def __init__(self, phase: Phase) -> None:
+    def __init__(self, phase: Phase, source: str = "--force-phase") -> None:
         self.forced_phase = Phase(phase)
-        logger.info("Ignition FORCED to %s by --force-phase", self.forced_phase.value)
+        logger.info("Ignition FORCED to %s by %s", self.forced_phase.value, source)
 
     def read(self, now: Optional[float] = None) -> bool:
         """``True`` if the forced phase is MONITORING."""

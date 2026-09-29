@@ -10,13 +10,22 @@ Three phases, selected by the vehicle's ignition state (Module 11)::
 
     ignition OFF    Pre-drive assessment: recognise the driver, fetch their
                     thresholds, run a 30 s assessment. PASS -> starter relay
-                    released. FAIL / not recognised / no baseline -> starter
-                    stays inhibited and an operator override request is raised.
-                    This is the ONLY phase in which the relay engages.
+                    released and monitoring begins straight away (no key
+                    press). FAIL / not recognised / no baseline -> starter
+                    stays inhibited and an operator override request is raised;
+                    an approval releases it and likewise continues into
+                    monitoring. This is the ONLY phase in which the relay engages.
 
     ignition ON     Continuous monitoring: same metrics, LEDs / buzzer /
                     backend notification only. The relay is never touched -
                     AlertManager refuses to lock in this phase (Module 8).
+                    Entered on key-ON, or directly from a pre-drive release
+                    (then it ends at the next ignition ON -> OFF, not while
+                    the key has yet to be turned).
+
+    --force-phase P tests one phase alone (a pre-drive release does not
+                    continue); --sequence runs pre-drive -> monitoring with no
+                    ignition input (the touchscreen launcher's default).
 
 Per-frame metrics are computed by one shared pipeline (Module 12) in both
 phases::
@@ -119,6 +128,11 @@ class OpenFault:
         )
         self.last_push_mono = now_mono
 
+# Pre-drive -> monitoring hand-off: after a pass or an approved override the
+# relay is released and a green confirmation is shown on live frames for this
+# long, so the driver sees the verdict, before monitoring starts. Kept under 2 s.
+RELEASE_INDICATOR_S: float = 1.5
+
 # Frames of face captured for the enrollment encoding.
 ENROLL_FRAMES: int = 30
 
@@ -196,6 +210,8 @@ _head_pose: Optional[HeadPoseEstimator] = None
 _ignition: Any = None
 _heartbeat: Optional["Heartbeat"] = None
 _display_available: bool = True
+# LoopProfiler under --profile-loop (monitoring only), else a no-op.
+_profiler: Any = None
 
 
 class QuitRequested(Exception):
@@ -340,6 +356,176 @@ class LoopRate:
         return self.fps
 
 
+class _NullSection:
+    """Context manager that does nothing (profiling off / outside a frame)."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+
+_NULL_SECTION = _NullSection()
+
+
+class LoopProfiler:
+    """
+    ``--profile-loop``: where the monitoring loop's wall time goes, per frame.
+
+    ``frame()`` is called once at the top of every loop iteration and closes
+    the previous frame, so a frame's total is the full iteration time
+    including every ``continue`` path, and the frame totals of a window add
+    up to its wall time. Work inside a frame is attributed with
+    ``with profiler.section(name):``. Sections may nest (``present()`` times
+    the heartbeat inside the display section); a parent is charged only its
+    own time, never its children's. Whatever no section covers is reported
+    as ``other``.
+
+    Every ``window_s`` of wall time a summary is logged and the window's
+    frames are appended to a CSV (``logs/loop_profile_<UTC>.csv``, one row
+    per frame, milliseconds).
+
+    Only main-thread time is measured. The heartbeat / event / fault POSTs
+    and the buzzer run on their own threads; their cost can only appear as
+    slower main-thread sections (GIL contention), never under ``api``.
+    """
+
+    CATEGORIES = ("capture", "landmarks", "recognition", "pipeline", "gpio", "api", "display")
+
+    def __init__(self, window_s: float = 60.0, label: str = "monitoring") -> None:
+        self.window_s = window_s
+        self.label = label
+        self._csv_path = config.LOGS_DIR / (
+            f"loop_profile_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.csv")
+        self._csv_header_written = False
+        self._rows: list = []                 # finished frames of the current window
+        self._frame: Optional[Dict[str, float]] = None
+        self._frame_start = 0.0
+        self._window_start: Optional[float] = None
+        self._stack: list = []                # [name, start, child_time] of open sections
+
+    # ---- per-frame hooks ---------------------------------------------------
+
+    def frame(self) -> None:
+        """Close the previous frame (if any) and open a new one."""
+        now = time.perf_counter()
+        self._close_frame(now)
+        if self._window_start is None:
+            self._window_start = now
+        elif now - self._window_start >= self.window_s:
+            self.report(now)
+            self._window_start = now
+        self._frame = dict.fromkeys(self.CATEGORIES, 0.0)
+        self._frame_start = now
+
+    def section(self, name: str) -> Any:
+        """Time a block under ``name`` (no-op outside a frame)."""
+        if self._frame is None:
+            return _NULL_SECTION
+        return _Section(self, name)
+
+    def stop(self) -> None:
+        """Close the last frame and report the partial window (loop exit)."""
+        now = time.perf_counter()
+        self._close_frame(now)
+        if self._rows:
+            self.report(now)
+        self._window_start = None
+
+    # ---- internals ---------------------------------------------------------
+
+    def _enter(self, name: str) -> None:
+        self._stack.append([name, time.perf_counter(), 0.0])
+
+    def _exit(self) -> None:
+        name, start, child = self._stack.pop()
+        elapsed = time.perf_counter() - start
+        if self._frame is not None:
+            self._frame[name] = self._frame.get(name, 0.0) + elapsed - child
+        if self._stack:
+            self._stack[-1][2] += elapsed
+
+    def _close_frame(self, now: float) -> None:
+        if self._frame is None:
+            return
+        row = self._frame
+        row["total"] = now - self._frame_start
+        row["other"] = max(0.0, row["total"] - sum(row[c] for c in self.CATEGORIES))
+        self._rows.append(row)
+        self._frame = None
+
+    def report(self, now: Optional[float] = None) -> None:
+        """Log the summary of the finished frames and flush them to the CSV."""
+        rows, self._rows = self._rows, []
+        if not rows:
+            return
+        wall = sum(r["total"] for r in rows)
+        totals = np.array([r["total"] for r in rows]) * 1000.0
+        lines = [
+            f"LOOP PROFILE ({self.label}) - {wall:.1f} s wall, {len(rows)} frames, "
+            f"{len(rows) / wall:.1f} fps",
+            f"  frame time ms: mean {totals.mean():.1f}  p50 {np.percentile(totals, 50):.1f}  "
+            f"p95 {np.percentile(totals, 95):.1f}  max {totals.max():.1f}  |  "
+            f"frames > 100 ms: {int((totals > 100).sum())}",
+            f"  {'category':<12} {'total s':>8} {'share':>7} {'frames':>7} "
+            f"{'ms/frame':>9} {'ms/call':>8} {'max ms':>8}",
+        ]
+        for cat in self.CATEGORIES + ("other",):
+            vals = np.array([r[cat] for r in rows]) * 1000.0
+            ran = vals[vals > 0]
+            lines.append(
+                f"  {cat:<12} {vals.sum() / 1000:8.2f} {vals.sum() / 10 / wall:6.1f}% "
+                f"{len(ran):7d} {vals.mean():9.2f} "
+                f"{(ran.mean() if len(ran) else 0.0):8.2f} {vals.max():8.1f}")
+        summary = "\n".join(lines)
+        logger.info("\n%s", summary)
+        try:
+            config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            cols = ("total",) + self.CATEGORIES + ("other",)
+            with open(self._csv_path, "a", encoding="utf-8") as fh:
+                if not self._csv_header_written:
+                    fh.write(",".join(f"{c}_ms" for c in cols) + "\n")
+                    self._csv_header_written = True
+                for r in rows:
+                    fh.write(",".join(f"{r[c] * 1000:.3f}" for c in cols) + "\n")
+        except OSError as exc:
+            logger.warning("Could not write loop profile CSV %s: %s", self._csv_path, exc)
+
+
+class _Section:
+    """One timed block of a :class:`LoopProfiler` frame."""
+
+    __slots__ = ("profiler", "name")
+
+    def __init__(self, profiler: LoopProfiler, name: str) -> None:
+        self.profiler = profiler
+        self.name = name
+
+    def __enter__(self) -> None:
+        self.profiler._enter(self.name)
+
+    def __exit__(self, *exc: Any) -> bool:
+        self.profiler._exit()
+        return False
+
+
+class _NoProfiler:
+    """Stand-in when ``--profile-loop`` is off: every hook is a no-op."""
+
+    def frame(self) -> None:
+        pass
+
+    def section(self, name: str) -> _NullSection:
+        return _NULL_SECTION
+
+    def stop(self) -> None:
+        pass
+
+
+_NO_PROFILER = _NoProfiler()
+
+
 class Heartbeat:
     """
     Periodic "still online" post to the portal, ticked from the frame loop.
@@ -448,9 +634,12 @@ def present(frame: np.ndarray) -> int:
     is also where the :class:`Heartbeat` is ticked (a no-op until
     ``config.HEARTBEAT_INTERVAL_SECONDS`` have elapsed; never blocks).
     """
+    prof = _profiler if _profiler is not None else _NO_PROFILER
     if _heartbeat is not None:
-        _heartbeat.tick()
-    key = show_frame(frame)
+        with prof.section("api"):
+            _heartbeat.tick()
+    with prof.section("display"):
+        key = show_frame(frame)
     if key == KEY_QUIT:
         raise QuitRequested()
     if key == KEY_IGNITION and _ignition is not None:
@@ -626,8 +815,12 @@ def display_text(frame: np.ndarray, text: str, color: tuple = (0, 0, 255), dy: i
 
 def cleanup() -> None:
     """Release the camera, reset GPIO and close any OpenCV windows."""
-    global _camera
+    global _camera, _profiler
     logger.info("Shutting down...")
+    if _profiler is not None:
+        # Quit ('q' / Ctrl-C / launcher STOP) mid-window: report what was timed.
+        _profiler.stop()
+        _profiler = None
     if _camera is not None:
         _camera.release()
         _camera = None
@@ -1093,6 +1286,25 @@ def wait_for_ignition(ignition: Any, rate: LoopRate, message: str, color: tuple)
             return False
 
 
+def show_release(rate: LoopRate, message: str) -> None:
+    """
+    Pre-drive -> monitoring hand-off: show ``message`` in green on live
+    frames for :data:`RELEASE_INDICATOR_S`. Called after the relay has been
+    released; does not read the ignition (monitoring follows either way).
+    """
+    logger.info("Pre-drive: %s - starter released, monitoring starts in %.1fs",
+                message, RELEASE_INDICATOR_S)
+    deadline = time.monotonic() + RELEASE_INDICATOR_S
+    while time.monotonic() < deadline:
+        frame = next_frame()
+        rate.tick()
+        display_text(frame, message, (0, 200, 0))
+        display_text(frame, "starter released - monitoring starting", GREY, dy=40)
+        relay = _alert_manager.get_relay_state() if _alert_manager else "n/a"
+        draw_banner(frame, f"PRE-DRIVE  |  starter {relay}", (0, 200, 0))
+        present(frame)
+
+
 def await_override(
     api_client: APIClient,
     alert_manager: AlertManager,
@@ -1102,16 +1314,25 @@ def await_override(
     reason: LockReason,
     assessment_id: Optional[int],
     provenance: Optional[Dict[str, Any]] = None,
-) -> None:
+    continue_to_monitoring: bool = True,
+) -> bool:
     """
     Starter stays inhibited: raise one override request and poll the
-    operator's decision until approved (-> release starter, wait for
-    ignition), the user presses ``r`` (-> re-assess) or the phase changes.
+    operator's decision until approved (-> release starter), the user
+    presses ``r`` (-> re-assess) or the phase changes.
 
     Every :class:`LockReason` resolves through this one path. ``provenance``
     (``Calibration.provenance()``) goes on the request so the operator can
     see which calibration was involved - for ``FOREIGN_DEVICE_BASELINE``,
     which unit it was captured on.
+
+    Returns:
+        ``True`` if the override was approved and ``continue_to_monitoring``
+        is set: the starter is released and the caller goes straight into
+        monitoring. ``False`` otherwise (``r``, or - with
+        ``continue_to_monitoring`` off, i.e. ``--force-phase predrive`` - an
+        approval followed by ``r`` on the "start vehicle" screen). A phase
+        change raises :class:`PhaseChanged` as before.
     """
     reason_text = LOCK_REASON_TEXT[reason]
     logger.warning("Pre-drive: starter stays LOCKED - %s (driver=%s)", reason.value, driver_id)
@@ -1143,8 +1364,11 @@ def await_override(
         if status == "approved":
             logger.warning("Operator override APPROVED (request %s) - releasing starter", request_id)
             alert_manager.unlock_relay()
+            if continue_to_monitoring:
+                show_release(rate, "OVERRIDE APPROVED")
+                return True
             wait_for_ignition(ignition, rate, "OVERRIDE APPROVED - start vehicle", (0, 200, 0))
-            return
+            return False
 
         frame = next_frame()
         rate.tick()
@@ -1159,7 +1383,7 @@ def await_override(
         draw_banner(frame, "PRE-DRIVE  |  starter LOCKED", (0, 0, 255))
         if present(frame) == KEY_RETRY:
             logger.info("Pre-drive: re-assessment requested from the preview window")
-            return
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -1177,10 +1401,10 @@ def run_predrive_assessment(
     debug_pose: bool = False,
     pose_release_hold: float = HEAD_POSE_RELEASE_HOLD_S,
     diag_ear: bool = False,
-) -> None:
+    continue_to_monitoring: bool = True,
+) -> bool:
     """
-    One pre-drive cycle. Returns when the ignition turns ON (after a pass or
-    an approved override), or when the user asks to re-run (``r``).
+    One pre-drive cycle.
 
     1. Relay inhibited (``set_phase(PREDRIVE)``).
     2. Recognise the driver (bounded)          -> else DRIVER_NOT_RECOGNIZED.
@@ -1188,9 +1412,20 @@ def run_predrive_assessment(
        only from another unit: FOREIGN_DEVICE_BASELINE (never assessed on it).
     4. 30 s assessment through the shared pipeline; every frame recorded.
     5. Persist CSV/JSON + POST /assessments.
-    6. PASS -> release starter, wait for ignition.
+    6. PASS -> release starter, then hand off to monitoring.
        FAIL -> FATIGUE_DETECTED.
-    7. Any lock reason -> :func:`await_override`.
+    7. Any lock reason -> :func:`await_override`; the starter stays
+       inhibited until an operator approves (then as for a pass).
+
+    With ``continue_to_monitoring`` off (``--force-phase predrive``, the
+    phase tested alone) a release instead waits on the "start vehicle"
+    screen, where ``r`` re-runs the assessment - the pre-2026-09-29 flow.
+
+    Returns:
+        ``True`` if the starter was released (pass, or approved override)
+        and the caller should go straight into monitoring. ``False`` if the
+        user asked to re-run (``r``), or the ignition turned ON before a
+        release (the caller re-reads the phase; the starter stays inhibited).
     """
     alert_manager.set_phase(Phase.PREDRIVE)
     # Every pre-drive cycle starts inhibited, including a re-run requested
@@ -1343,18 +1578,22 @@ def run_predrive_assessment(
                             result["pass_threshold"])
                 alert_manager.unlock_relay()
                 alert_manager.set_alert_level("ALERT")
+                if continue_to_monitoring:
+                    show_release(rate, "ASSESSMENT PASSED")
+                    return True
                 wait_for_ignition(ignition, rate, "ASSESSMENT PASSED - start vehicle", (0, 200, 0))
-                return
+                return False
 
         # 7. Lock path (every lock reason)
         alert_manager.set_alert_level("ALERT")
-        await_override(api_client, alert_manager, ignition, rate, driver_id,
-                       lock_reason, assessment_id,
-                       calibration_record)
+        return await_override(api_client, alert_manager, ignition, rate, driver_id,
+                              lock_reason, assessment_id, calibration_record,
+                              continue_to_monitoring=continue_to_monitoring)
 
     except PhaseChanged:
         logger.info("Pre-drive: ignition turned ON - leaving pre-drive (starter %s)",
                     alert_manager.get_relay_state())
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1372,9 +1611,21 @@ def run_monitoring(
     debug_pose: bool = False,
     pose_release_hold: float = HEAD_POSE_RELEASE_HOLD_S,
     diag_ear: bool = False,
+    from_release: bool = False,
+    profile_s: Optional[float] = None,
 ) -> None:
     """
     Monitor continuously while the ignition is ON. Returns when it turns OFF.
+
+    ``from_release``: entered straight from a pre-drive release (pass or
+    approved override), when the key may not have been turned yet. The
+    ignition reading OFF then means "not started yet", not "trip over", so
+    this returns only once the ignition has been seen ON and has gone OFF
+    again. Under ``--sequence`` (no ignition input) that never happens and
+    monitoring runs until stopped.
+
+    ``profile_s``: ``--profile-loop`` - time every frame by category and log
+    a :class:`LoopProfiler` summary every ``profile_s`` seconds.
 
     Alerts (LEDs, buzzer) and backend DANGER notifications only. The relay is
     never driven here; ``AlertManager`` refuses ``lock_relay()`` in this
@@ -1395,10 +1646,18 @@ def run_monitoring(
     ``MONITORING_FAULT_REFRESH_S`` while open, and resolved when the face
     returns or the ignition turns off.
     """
+    global _profiler
     alert_manager.set_phase(Phase.MONITORING)
     alert_manager.set_alert_level("ALERT")
-    logger.info("=== MONITORING phase (ignition ON) - starter %s, lock refused ===",
+    logger.info("=== MONITORING phase (%s) - starter %s, lock refused ===",
+                "entered from pre-drive release" if from_release else "ignition ON",
                 alert_manager.get_relay_state())
+
+    prof: Any = _NO_PROFILER
+    if profile_s:
+        prof = _profiler = LoopProfiler(profile_s)
+        logger.info("Loop profiling ON: summary every %.0fs, per-frame CSV %s",
+                    profile_s, prof._csv_path)
 
     pipeline = MetricsPipeline(head_pose, pose_release_hold=pose_release_hold,
                                no_face_policy=True, diag_ear=diag_ear)
@@ -1422,9 +1681,19 @@ def run_monitoring(
     last_m: Optional[FrameMetrics] = None
     # Open monitoring fault (no_face or danger_latched), if any.
     open_fault: Optional[OpenFault] = None
+    # See from_release: whether this session has seen the ignition ON yet.
+    ignition_seen_on = False
 
-    while ignition.phase() is Phase.MONITORING:
-        frame = next_frame()
+    while True:
+        prof.frame()
+        with prof.section("gpio"):
+            ignition_on = ignition.phase() is Phase.MONITORING
+        if ignition_on:
+            ignition_seen_on = True
+        elif ignition_seen_on or not from_release:
+            break
+        with prof.section("capture"):
+            frame = next_frame()
         fps = rate.tick()
         now, now_mono = time.time(), time.monotonic()
         if alert_manager.relay_locked:
@@ -1437,14 +1706,17 @@ def run_monitoring(
 
         # Landmarks. No face never lowers the level and never raises it to
         # DANGER: the pipeline's NoFacePolicy holds, latches or faults.
-        landmarks, _rect = extractor.extract(frame)
+        with prof.section("landmarks"):
+            landmarks, _rect = extractor.extract(frame)
         if landmarks is None:
-            verdict = pipeline.note_no_face(now, now_mono)
+            with prof.section("pipeline"):
+                verdict = pipeline.note_no_face(now, now_mono)
             if verdict.level != last_level:
                 logger.info("Level %s -> %s (no face %.1fs, %s)", last_level or "(none)",
                             verdict.level, verdict.gap_s, verdict.band)
             last_level = verdict.level
-            alert_manager.set_alert_level(verdict.level)
+            with prof.section("gpio"):
+                alert_manager.set_alert_level(verdict.level)
             if verdict.event in FAULT_TYPE_FOR_EVENT:
                 open_fault = OpenFault(
                     fault_uuid=str(uuid.uuid4()),
@@ -1456,17 +1728,20 @@ def run_monitoring(
                     gap_s=verdict.gap_s,
                     last_push_mono=now_mono,
                 )
-                open_fault.push(api_client, "open", now_mono)
+                with prof.section("api"):
+                    open_fault.push(api_client, "open", now_mono)
             elif open_fault is not None:
                 open_fault.gap_s = verdict.gap_s
                 if now_mono - open_fault.last_push_mono >= MONITORING_FAULT_REFRESH_S:
-                    open_fault.push(api_client, "open", now_mono)
-            display_text(frame, f"NO FACE {verdict.gap_s:.1f}s  [{verdict.band}]",
-                         LEVEL_BGR.get(verdict.level, WHITE))
-            draw_banner(frame, banner, banner_color)
-            if debug_pose:
-                draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
-            present(frame)
+                    with prof.section("api"):
+                        open_fault.push(api_client, "open", now_mono)
+            with prof.section("display"):
+                display_text(frame, f"NO FACE {verdict.gap_s:.1f}s  [{verdict.band}]",
+                             LEVEL_BGR.get(verdict.level, WHITE))
+                draw_banner(frame, banner, banner_color)
+                if debug_pose:
+                    draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
+            present(frame)   # times its own heartbeat (api) and imshow (display)
             continue
 
         # First face after a fault resolves it. Done here rather than from
@@ -1477,14 +1752,16 @@ def run_monitoring(
             logger.info("Face re-acquired after %.1fs - %s fault resolved",
                         (resolved - open_fault.started_at).total_seconds(),
                         open_fault.fault_type)
-            open_fault.push(api_client, "resolved", now_mono, resolved, "face_reacquired")
+            with prof.section("api"):
+                open_fault.push(api_client, "resolved", now_mono, resolved, "face_reacquired")
             open_fault = None
 
         # Identify - every IDENTIFY_INTERVAL_S, or every frame until someone
         # has been recognised at all.
         if current_driver_id is None or now_mono - last_identify >= IDENTIFY_INTERVAL_S:
             last_identify = now_mono
-            match = recognizer.identify(frame)
+            with prof.section("recognition"):
+                match = recognizer.identify(frame)
             if match is None:
                 if current_driver_id is None and not defaults_logged:
                     logger.warning("Monitoring: driver not recognised - self-seeding the EAR "
@@ -1507,8 +1784,9 @@ def run_monitoring(
                 # unquantified (a stated limitation). Self-seed only when
                 # there is no calibration, or (a flagged repair) when the
                 # record has no EAR baseline.
-                calibration, _ = load_calibration(api_client, current_driver_id,
-                                                  Phase.MONITORING)
+                with prof.section("api"):   # synchronous GET, once per driver change
+                    calibration, _ = load_calibration(api_client, current_driver_id,
+                                                      Phase.MONITORING)
                 if calibration is None:
                     logger.warning("Monitoring: no usable calibration for driver %s - "
                                    "self-seeding the EAR baseline; re-enrol with "
@@ -1523,8 +1801,9 @@ def run_monitoring(
             else:
                 driver = match
 
-        m = pipeline.process(landmarks, thresholds, now, now_mono,
-                             self_seed=calibration is None or calibration.self_seed_ear)
+        with prof.section("pipeline"):
+            m = pipeline.process(landmarks, thresholds, now, now_mono,
+                                 self_seed=calibration is None or calibration.self_seed_ear)
         last_m = m
         # (A gap that opened a fault was already logged above when it was resolved.)
         if m.gap_ended is not None and m.gap_ended.face_lost and not fault_resolved:
@@ -1558,24 +1837,29 @@ def run_monitoring(
 
         # Physical alerts - LEDs and buzzer only. m.level is DANGER while the
         # head-pose override is active regardless of the (lower) FRS level.
-        alert_manager.set_alert_level(m.level)
+        with prof.section("gpio"):
+            alert_manager.set_alert_level(m.level)
 
         # Operator notification: DANGER to the backend, rate-limited.
         if m.level == "DANGER" and now - last_danger_push >= DANGER_EVENT_INTERVAL:
-            api_client.push_fatigue_event(
-                current_driver_id, m.effective_result(), m.ear, m.perclos,
-                relay_triggered=False, phase=Phase.MONITORING,
-                provenance=(calibration.provenance() if calibration is not None
-                            else SELF_SEEDED_PROVENANCE),
-            )
+            with prof.section("api"):
+                api_client.push_fatigue_event(
+                    current_driver_id, m.effective_result(), m.ear, m.perclos,
+                    relay_triggered=False, phase=Phase.MONITORING,
+                    provenance=(calibration.provenance() if calibration is not None
+                                else SELF_SEEDED_PROVENANCE),
+                )
             last_danger_push = now
 
-        draw_overlay(frame, driver, m, fps)
-        draw_banner(frame, banner, banner_color)
-        if debug_pose:
-            draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
-        present(frame)
+        with prof.section("display"):
+            draw_overlay(frame, driver, m, fps)
+            draw_banner(frame, banner, banner_color)
+            if debug_pose:
+                draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
+        present(frame)   # times its own heartbeat (api) and imshow (display)
 
+    prof.stop()
+    _profiler = None
     if open_fault is not None:
         # Ignition OFF with the driver still unseen: close the record so the
         # portal does not show a fault open forever.
@@ -1606,8 +1890,21 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--force-phase", choices=[p.value for p in Phase], default=None,
-        help="ignore the ignition input and stay in this phase (testing without "
-             "ignition hardware); in predrive, 'r' re-runs the assessment",
+        help="ignore the ignition input and stay in this phase (testing one phase in "
+             "isolation); in predrive a release does NOT continue into monitoring - "
+             "'r' re-runs the assessment",
+    )
+    parser.add_argument(
+        "--sequence", action="store_true",
+        help="full session with no ignition input (bench / touchscreen): pre-drive, then - "
+             "once a pass or an approved override releases the starter - monitoring "
+             "until stopped",
+    )
+    parser.add_argument(
+        "--profile-loop", type=float, nargs="?", const=60.0, default=None, metavar="SECONDS",
+        help="monitoring: time every frame by category (capture, landmarks, recognition, "
+             "pipeline, gpio, api, display) and log a summary every SECONDS (default 60); "
+             "per-frame CSV under logs/",
     )
     parser.add_argument(
         "--debug-pose", action="store_true",
@@ -1627,6 +1924,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.driver_id is not None and not args.enroll:
         parser.error("--driver-id only makes sense with --enroll")
+    if args.sequence and (args.force_phase or args.enroll):
+        parser.error("--sequence cannot be combined with --force-phase or --enroll")
+    if args.profile_loop is not None and args.profile_loop <= 0:
+        parser.error("--profile-loop SECONDS must be positive")
     return args
 
 
@@ -1678,6 +1979,11 @@ def main(argv: Optional[list] = None) -> int:
         # 5. Ignition (selects the phase) - forced, mocked, or real GPIO
         if args.force_phase:
             _ignition = ForcedIgnition(Phase(args.force_phase))
+        elif args.sequence:
+            # Reads as ignition OFF for good: pre-drive first, and monitoring
+            # (entered from a release) never sees an ON -> OFF edge, so it
+            # runs until stopped.
+            _ignition = ForcedIgnition(Phase.PREDRIVE, source="--sequence")
         else:
             _ignition = IgnitionSensor(mock=args.mock_gpio)
         initial_phase = _ignition.phase()
@@ -1704,20 +2010,36 @@ def main(argv: Optional[list] = None) -> int:
                         "(heartbeat every %.0fs, firmware %s)",
                         initial_phase.value, config.HEARTBEAT_INTERVAL_SECONDS,
                         config.FIRMWARE_VERSION)
-            # 8. Phase supervisor: each phase function returns when the
-            #    ignition state changes (or, in pre-drive, on 'r' to re-run).
+            # 8. Phase supervisor. A pre-drive that releases the starter (pass
+            #    or approved override) goes straight into monitoring - no key
+            #    press - except under --force-phase predrive, which tests that
+            #    phase alone. Monitoring returns when the ignition turns OFF,
+            #    and every pre-drive starts by re-inhibiting the starter.
+            continue_to_monitoring = args.force_phase is None
             while True:
                 if _ignition.phase() is Phase.PREDRIVE:
-                    run_predrive_assessment(
+                    released = run_predrive_assessment(
                         api_client, extractor, recognizer, _alert_manager, _head_pose,
                         _ignition, rate, debug_pose=args.debug_pose, diag_ear=args.diag_ear,
                         pose_release_hold=args.pose_release_hold,
+                        continue_to_monitoring=continue_to_monitoring,
+                    )
+                    if not released:
+                        # 'r' (re-run), or ignition ON before a release:
+                        # re-read the phase, starter still inhibited.
+                        continue
+                    run_monitoring(
+                        api_client, extractor, recognizer, _alert_manager, _head_pose,
+                        _ignition, rate, debug_pose=args.debug_pose, diag_ear=args.diag_ear,
+                        pose_release_hold=args.pose_release_hold, from_release=True,
+                        profile_s=args.profile_loop,
                     )
                 else:
                     run_monitoring(
                         api_client, extractor, recognizer, _alert_manager, _head_pose,
                         _ignition, rate, debug_pose=args.debug_pose, diag_ear=args.diag_ear,
                         pose_release_hold=args.pose_release_hold,
+                        profile_s=args.profile_loop,
                     )
 
     except QuitRequested:

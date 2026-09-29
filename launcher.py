@@ -6,10 +6,11 @@ menu appears. Every action shells out to ``main.py`` with the matching CLI
 flags - nothing from ``main`` is imported, so the CLI stays the single
 source of truth for how a session runs::
 
-    Enroll driver          -> main.py --enroll --driver-id N
-    Pre-drive assessment   -> main.py --force-phase predrive
-    Continuous monitoring  -> main.py --force-phase monitoring
-    Follow ignition        -> main.py            (real ignition input)
+    Enroll driver             -> main.py --enroll --driver-id N
+    Pre-drive -> monitoring   -> main.py --sequence   (pass / approved override
+                                 continues into monitoring, no ignition input)
+    Monitoring only (test)    -> main.py --force-phase monitoring
+    Follow ignition           -> main.py            (real ignition input)
 
 While a session runs the launcher collapses to a slim always-on-top strip
 along the bottom of the screen with a STOP button (sends SIGINT, which
@@ -80,9 +81,15 @@ UNKNOWN = "#7f8c8d"
 
 # Menu actions: label -> main.py flags. Enroll is handled separately (needs
 # a driver id from the picker).
+#
+# "Pre-drive" is the whole session: a pass (or an approved override) releases
+# the starter and continues into monitoring by itself. "Monitoring only" is a
+# test entry: it skips the 30 s assessment, and it starts with the starter
+# INHIBITED (nothing in monitoring can release it) - use it to exercise
+# monitoring alone, e.g. with --profile-loop, or for a driver who cannot pass.
 SESSIONS: Dict[str, List[str]] = {
-    "Pre-drive assessment": ["--force-phase", "predrive"],
-    "Continuous monitoring": ["--force-phase", "monitoring"],
+    "Pre-drive assessment": ["--sequence"],
+    "Monitoring only (test)": ["--force-phase", "monitoring"],
     "Follow ignition": [],
 }
 
@@ -395,11 +402,11 @@ class Launcher:
 
         self._button(f, "Enroll driver", self.show_driver_picker, bg=BTN_PRIMARY).grid(
             row=1, column=0, sticky="nsew", padx=pad, pady=pad)
-        self._button(f, "Pre-drive assessment",
+        self._button(f, "Pre-drive assessment\n→ monitoring",
                      lambda: self.start_session("Pre-drive assessment")).grid(
             row=1, column=1, sticky="nsew", padx=pad, pady=pad)
-        self._button(f, "Continuous monitoring",
-                     lambda: self.start_session("Continuous monitoring")).grid(
+        self._button(f, "Monitoring only\n(test)",
+                     lambda: self.start_session("Monitoring only (test)")).grid(
             row=2, column=0, sticky="nsew", padx=pad, pady=pad)
         self._button(f, "Follow ignition\n(real input)",
                      lambda: self.start_session("Follow ignition")).grid(
