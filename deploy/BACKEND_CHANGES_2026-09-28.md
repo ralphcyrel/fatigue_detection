@@ -77,3 +77,28 @@ foreign, repaired or self-seeded baseline.
 Each entry of `samples` on `POST /assessments` gains `ear_norm_frs` (the
 0.5 s rolling median the FRS used). Needed only if the backend validates or
 stores sample keys individually.
+
+## 5. Missing route: `GET /ping` (found 2026-09-29)
+
+The Pi and the touchscreen launcher probe reachability with `GET /api/ping`
+(README, API table). The backend does not define it:
+
+```
+GET http://192.168.1.200/api/ping  ->  404 {"message": "The route api/ping could not be found.", ...}
+```
+
+Add it outside the auth middleware (it is a liveness check, not data):
+
+```php
+// routes/api.php
+Route::get('/ping', fn () => response()->json(['status' => 'ok']));
+```
+
+*Until it ships:* since 2026-09-29 the Pi counts any answer below HTTP 500 as
+reachable and warns once that `/ping` returned 404. Before that change every
+start-up logged "Backend NOT reachable" and the launcher's pill showed
+OFFLINE for a backend that was serving every real endpoint.
+
+The same 404 body carried `exception` and `file` (a server path): the backend
+appears to run with `APP_DEBUG=true`, which exposes stack traces to any
+client. Turn it off outside development.

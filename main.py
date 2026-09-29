@@ -82,12 +82,14 @@ logger = logging.getLogger("fatigue")
 # Tunables local to the main loop
 # ---------------------------------------------------------------------------
 
-# Face recognition is ~10x more expensive than landmark extraction, so in the
-# monitoring phase it is only re-run this often (wall-clock seconds); the last
-# result is cached in between. Was "every 30 frames", meant as 1 s at the
-# camera's 30 fps but 1.5 s at the Pi's real ~20 fps - and slower still when
-# recognition itself dragged the loop down. 1.5 s keeps the measured cadence.
-IDENTIFY_INTERVAL_S: float = 1.5
+# Monitoring, driver not (yet) recognised: recognition is retried on the
+# first face frame at least this long after the previous attempt ENDED.
+# Each attempt blocks the loop for ~1 s on the Pi (dlib holds the GIL, so it
+# cannot be threaded); retrying every frame held an unrecognised driver at
+# ~1 fps, too blind for blink / microsleep detection. At 5 s the loop sees
+# ~5 s of every ~6 s. Nothing is accepted between attempts - the driver
+# simply stays unrecognised (no calibration, self-seeded baseline).
+UNRECOGNISED_RETRY_S: float = 5.0
 
 # While the driver stays in DANGER (monitoring), log at most one event per
 # this many seconds - otherwise a 30 fps loop would POST 30 events per second.
@@ -209,6 +211,8 @@ _alert_manager: Optional[AlertManager] = None
 _head_pose: Optional[HeadPoseEstimator] = None
 _ignition: Any = None
 _heartbeat: Optional["Heartbeat"] = None
+# Preview window on. False under --no-preview, or once cv2.imshow has failed
+# (headless); the draw_* / display_text helpers then skip their work too.
 _display_available: bool = True
 # LoopProfiler under --profile-loop (monitoring only), else a no-op.
 _profiler: Any = None
@@ -654,6 +658,8 @@ def present(frame: np.ndarray) -> int:
 
 def draw_banner(frame: np.ndarray, text: str, color: tuple = WHITE) -> None:
     """Bottom strip with the phase / status text, drawn in place."""
+    if not _display_available:
+        return  # no preview: nobody sees the annotation
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, h - 30), (w, h), (0, 0, 0), -1)
     cv2.putText(frame, text, (10, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
@@ -676,6 +682,8 @@ def draw_overlay(
         m: Pipeline output for this frame.
         fps: Last measured loop rate, or ``None`` before the first sample.
     """
+    if not _display_available:
+        return  # no preview: nobody sees the annotation
     level = m.level
     color = LEVEL_BGR.get(level, WHITE)
     name = driver["name"] if driver else "Unknown"
@@ -758,6 +766,8 @@ def draw_pose_debug(
         fps: Last measured loop rate (shown so the rate is visible on the
             NO FACE / UNKNOWN DRIVER frames, which have no main overlay).
     """
+    if not _display_available:
+        return  # no preview: nobody sees the annotation
     font = cv2.FONT_HERSHEY_SIMPLEX
     y0 = 135
     cv2.rectangle(frame, (0, y0), (frame.shape[1], y0 + 48), (30, 30, 30), -1)
@@ -801,6 +811,8 @@ def display_text(frame: np.ndarray, text: str, color: tuple = (0, 0, 255), dy: i
         color: BGR colour.
         dy: Vertical offset from centre (for a second line).
     """
+    if not _display_available:
+        return  # no preview: nobody sees the annotation
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale, thickness = 1.0, 2
     (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
@@ -1637,6 +1649,16 @@ def run_monitoring(
     microsleep overrides run. The remaining baselines are
     :data:`DEFAULT_THRESHOLDS`.
 
+    Face recognition runs on face frames only until the driver is first
+    recognised, then never again this session (2026-09-29). At ~1 s per call
+    on the Pi (``face_locations`` + ``face_encodings``) the old 1.5 s
+    re-identify cadence held the loop at ~11 fps; it cannot move to a
+    thread because dlib holds the GIL for the whole call. Until a match it
+    is retried every :data:`UNRECOGNISED_RETRY_S` (was: every face frame,
+    ~1 fps). What an unrecognised driver gets is unchanged: no driver, no
+    calibration, self-seeded EAR baseline, ``driver_id`` null on events and
+    faults.
+
     Frames with no face follow ``modules.pipeline.NoFacePolicy``: the level
     is held (never lowered), a DANGER is latched, and ALERT / WARNING turn
     into FAULT after ``NO_FACE_FAULT_S``. Two cases become backend faults
@@ -1671,8 +1693,10 @@ def run_monitoring(
     calibration: Optional[Calibration] = None
     thresholds: Dict[str, float] = dict(DEFAULT_THRESHOLDS)
     defaults_logged = False
+    # Unrecognised-driver retry schedule (UNRECOGNISED_RETRY_S).
+    next_identify = float("-inf")
+    identify_attempts = 0
     last_danger_push = 0.0
-    last_identify = float("-inf")
     # Effective level (FRS band, or DANGER under the head-pose override) as
     # of the previous scored frame, so transitions can be logged once rather
     # than every frame. ``None`` until the first face is processed.
@@ -1756,25 +1780,32 @@ def run_monitoring(
                 open_fault.push(api_client, "resolved", now_mono, resolved, "face_reacquired")
             open_fault = None
 
-        # Identify - every IDENTIFY_INTERVAL_S, or every frame until someone
-        # has been recognised at all.
-        if current_driver_id is None or now_mono - last_identify >= IDENTIFY_INTERVAL_S:
-            last_identify = now_mono
+        # Identify - every face frame until the driver is recognised, then
+        # never again this session (see docstring: ~1 s per call, GIL-bound).
+        if current_driver_id is None and now_mono >= next_identify:
+            identify_attempts += 1
             with prof.section("recognition"):
                 match = recognizer.identify(frame)
+            # Spaced from the END of the ~1 s attempt, so the loop always
+            # gets UNRECOGNISED_RETRY_S of real frames between stalls.
+            next_identify = time.monotonic() + UNRECOGNISED_RETRY_S
             if match is None:
-                if current_driver_id is None and not defaults_logged:
+                if not defaults_logged:
                     logger.warning("Monitoring: driver not recognised - self-seeding the EAR "
                                    "baseline from this driver's own EAR (overrides only for "
-                                   "the first %.0fs of face time)", SELF_SEED_S)
+                                   "the first %.0fs of face time); retrying recognition "
+                                   "every %.0fs", SELF_SEED_S, UNRECOGNISED_RETRY_S)
                     defaults_logged = True
-                # else: a known driver's periodic re-identify failed; keep
-                # the cached driver and calibration.
-            elif int(match["driver_id"]) != current_driver_id:
+                else:
+                    logger.info("Monitoring: recognition attempt %d - no match, driver stays "
+                                "UNRECOGNISED; next attempt in %.0fs",
+                                identify_attempts, UNRECOGNISED_RETRY_S)
+            else:
                 driver = match
                 current_driver_id = int(match["driver_id"])
-                logger.info("Driver identified: %s (id=%s, confidence %.2f)",
-                            match["name"], current_driver_id, match["confidence"])
+                logger.info("Driver identified: %s (id=%s, confidence %.2f, attempt %d) - "
+                            "recognition stops for this session", match["name"],
+                            current_driver_id, match["confidence"], identify_attempts)
                 # A foreign-device calibration IS used here (flagged on every
                 # event), unlike pre-drive where it locks. Decided 2026-09-28:
                 # a real alert-state baseline measured at the wrong camera
@@ -1784,7 +1815,7 @@ def run_monitoring(
                 # unquantified (a stated limitation). Self-seed only when
                 # there is no calibration, or (a flagged repair) when the
                 # record has no EAR baseline.
-                with prof.section("api"):   # synchronous GET, once per driver change
+                with prof.section("api"):   # synchronous GET, once, on recognition
                     calibration, _ = load_calibration(api_client, current_driver_id,
                                                       Phase.MONITORING)
                 if calibration is None:
@@ -1793,13 +1824,10 @@ def run_monitoring(
                                    "`main.py --enroll`", current_driver_id)
                 thresholds = (calibration.thresholds if calibration is not None
                               else dict(DEFAULT_THRESHOLDS))
-                # Fresh per-driver history so the previous driver's blinks
-                # and yawns (and any self-seeded baseline) don't leak into
-                # this driver's metrics.
+                # Fresh history so metrics accumulated before recognition
+                # (on a self-seeded baseline) don't leak into this driver's.
                 pipeline.reset()
                 last_danger_push = 0.0
-            else:
-                driver = match
 
         with prof.section("pipeline"):
             m = pipeline.process(landmarks, thresholds, now, now_mono,
@@ -1907,6 +1935,12 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
              "per-frame CSV under logs/",
     )
     parser.add_argument(
+        "--no-preview", action="store_true",
+        help="no OpenCV preview window and no frame annotation (demos / data collection; "
+             "~11%% of monitoring frame time). Keys q / i / r are then unavailable - stop "
+             "with Ctrl-C or the launcher's STOP",
+    )
+    parser.add_argument(
         "--debug-pose", action="store_true",
         help="overlay the head-pose debounce timers / override state on the preview",
     )
@@ -1942,10 +1976,13 @@ def main(argv: Optional[list] = None) -> int:
     Returns:
         Process exit code.
     """
-    global _camera, _alert_manager, _head_pose, _ignition, _heartbeat
+    global _camera, _alert_manager, _head_pose, _ignition, _heartbeat, _display_available
 
     args = parse_args(argv)
     setup_logging()
+    if args.no_preview:
+        _display_available = False
+        logger.info("Preview window OFF (--no-preview) - stop with Ctrl-C or the launcher")
     logger.info("=== Driver Fatigue Detection System starting ===")
     exit_code = 0
 
@@ -2006,9 +2043,11 @@ def main(argv: Optional[list] = None) -> int:
             # Heartbeat to the portal, ticked from present() in every phase
             # loop. Reads the relay state from _alert_manager at send time.
             _heartbeat = Heartbeat(api_client, _alert_manager)
-            logger.info("Supervisor started in %s - press 'q' in the window or Ctrl-C to stop "
+            logger.info("Supervisor started in %s - %s to stop "
                         "(heartbeat every %.0fs, firmware %s)",
-                        initial_phase.value, config.HEARTBEAT_INTERVAL_SECONDS,
+                        initial_phase.value,
+                        "press 'q' in the window or Ctrl-C" if _display_available else "Ctrl-C",
+                        config.HEARTBEAT_INTERVAL_SECONDS,
                         config.FIRMWARE_VERSION)
             # 8. Phase supervisor. A pre-drive that releases the starter (pass
             #    or approved override) goes straight into monitoring - no key

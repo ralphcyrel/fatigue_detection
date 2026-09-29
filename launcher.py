@@ -87,6 +87,11 @@ UNKNOWN = "#7f8c8d"
 # test entry: it skips the 30 s assessment, and it starts with the starter
 # INHIBITED (nothing in monitoring can release it) - use it to exercise
 # monitoring alone, e.g. with --profile-loop, or for a driver who cannot pass.
+#
+# Every session keeps the preview window on purpose: the FRS overlay, lock
+# reason and assessment result are how an observer sees the system's
+# reasoning. main.py --no-preview is for unattended data collection from the
+# command line, not a launcher default.
 SESSIONS: Dict[str, List[str]] = {
     "Pre-drive assessment": ["--sequence"],
     "Monitoring only (test)": ["--force-phase", "monitoring"],

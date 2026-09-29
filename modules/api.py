@@ -193,6 +193,9 @@ class APIClient:
         self._heartbeat_ok: Optional[bool] = None
         # The legacy-calibration-endpoint fallback is announced once.
         self._legacy_calibration_logged = False
+        # Outcome (and HTTP status, None = no response) of the last ping(),
+        # so the launcher's 10 s poll logs changes, not every result.
+        self._ping_state: Optional[Tuple[bool, Optional[int]]] = None
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -888,15 +891,36 @@ class APIClient:
 
         ``GET /ping``
 
+        Reachable means the server answered below HTTP 500. Until 2026-09-29
+        only a 2xx counted, and the Laravel backend has no ``/ping`` route:
+        it answers 404 ("The route api/ping could not be found") while every
+        real endpoint works, so every start-up - and the launcher every 10 s -
+        logged "NOT reachable" for a backend that was up. A 4xx is still
+        reported (once) because it means the route is missing or refused.
+
+        Only changes are logged, like the heartbeat: the launcher calls this
+        every ``PING_INTERVAL_S``, so a steady state (up or down) logs once.
+
         Returns:
-            ``True`` on any HTTP 2xx, ``False`` on error or non-2xx.
+            ``True`` if the server answered with a status below 500.
         """
-        resp = self._request("GET", "/ping")
-        reachable = resp is not None and resp.ok
-        if reachable:
-            logger.info("Backend reachable at %s", self.base_url)
-        else:
-            logger.warning("Backend NOT reachable at %s", self.base_url)
+        first_or_was_up = self._ping_state is None or self._ping_state[0]
+        resp = self._request("GET", "/ping",
+                             error_level=logging.ERROR if first_or_was_up else logging.DEBUG)
+        status = resp.status_code if resp is not None else None
+        reachable = status is not None and status < 500
+        state = (reachable, status)
+        if state != self._ping_state:
+            if not reachable:
+                logger.warning("Backend NOT reachable at %s (%s)", self.base_url,
+                               "no response" if status is None else f"HTTP {status}")
+            elif resp.ok:
+                logger.info("Backend reachable at %s", self.base_url)
+            else:
+                logger.warning("Backend reachable at %s, but GET /ping answered HTTP %s - "
+                               "add the route (deploy/BACKEND_CHANGES_2026-09-28.md)",
+                               self.base_url, status)
+        self._ping_state = state
         return reachable
 
     # ------------------------------------------------------------------
