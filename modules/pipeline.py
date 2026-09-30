@@ -33,7 +33,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from modules.blink import BlinkDetector, MicrosleepDetector
-from modules.calibration import EAR_THRESHOLD_RATIO, EarSelfSeed
+from modules.calibration import EAR_THRESHOLD_RATIO, EarSelfSeed, finite_or_none
 from modules.ear import EARCalculator, RollingMedian
 from modules.frs import (DANGER_THRESHOLD, EAR_MEDIAN_WINDOW_S, LEVEL_COLORS,
                          MICROSLEEP_COUNT_WINDOW_S, WARNING_THRESHOLD, FRSCalculator)
@@ -92,6 +92,10 @@ NO_FACE_FAULT_S: float = 10.0
 # its own level has been below DANGER for this long continuously. Matches
 # MICROSLEEP_RELEASE_HOLD_S, the other "don't drop DANGER on one good frame".
 NO_FACE_LATCH_RELEASE_S: float = 3.0
+
+# Colour name for the FAULT level in FrameMetrics.effective_result() (the
+# FRS bands' names are in frs.LEVEL_COLORS; FAULT is not an FRS band).
+FAULT_COLOR: str = "magenta"
 
 # TEMPORARY DIAGNOSTIC (``MetricsPipeline(diag_ear=True)``, CLI ``--diag-ear``).
 # With it on, every change of the closed/open decision is logged, plus a
@@ -221,8 +225,9 @@ class NoFaceVerdict:
 
     ``band`` is one of:
 
-    * ``"HOLD"``  - the gap began at ALERT / WARNING and is shorter than
-      :data:`NO_FACE_FAULT_S`; ``level`` is the level the gap began at.
+    * ``"HOLD"``  - the gap began at ALERT / WARNING (or at FAULT from a
+      self-seed that gave up) and is shorter than :data:`NO_FACE_FAULT_S`;
+      ``level`` is the level the gap began at.
       ``face_lost`` turns true past :data:`NO_FACE_HOLD_S`, when it stops
       being a detector dropout and is reported as a lost face.
     * ``"LATCH"`` - the gap began at DANGER; ``level`` is DANGER for as long
@@ -311,7 +316,10 @@ class NoFacePolicy:
         """
         if self._gap_start is None:
             self._gap_start = now_mono
-            entry = last_level if last_level in ("ALERT", "WARNING", "DANGER") else "ALERT"
+            # FAULT: the self-seed gave up (face present, no EAR baseline);
+            # the gap holds it rather than showing ALERT.
+            entry = (last_level if last_level in ("ALERT", "WARNING", "DANGER", "FAULT")
+                     else "ALERT")
             # A gap that begins inside a latch release window re-arms it.
             if self.latch.active:
                 entry = "DANGER"
@@ -403,6 +411,9 @@ class FrameMetrics:
     microsleep_status: Dict[str, Any] = field(default_factory=dict)
     no_face_latch: bool = False                 # DANGER carried over from a no-face gap
     gap_ended: Optional[NoFaceVerdict] = None   # last verdict of a gap that just ended
+    # The EAR self-seed gave up (EarSelfSeed.gave_up): no baseline, level
+    # FAULT unless a DANGER override is active.
+    seed_failed: bool = False
 
     @property
     def frs(self) -> float:
@@ -428,8 +439,14 @@ class FrameMetrics:
 
     @property
     def level(self) -> str:
-        """Effective alert level: ``DANGER`` while any override is active, else the band."""
-        return "DANGER" if self.overridden else self.band
+        """
+        Effective alert level: ``DANGER`` while any override is active, else
+        ``FAULT`` if the EAR self-seed gave up (the eyes cannot be measured -
+        ALERT would claim a driver checked and fine), else the band.
+        """
+        if self.overridden:
+            return "DANGER"
+        return "FAULT" if self.seed_failed else self.band
 
     def last_known(self) -> Dict[str, Any]:
         """
@@ -453,7 +470,8 @@ class FrameMetrics:
 
     def effective_result(self) -> Dict[str, Any]:
         """``frs_result`` with ``level``/``color`` set to the effective level."""
-        return dict(self.frs_result, level=self.level, color=LEVEL_COLORS[self.level])
+        return dict(self.frs_result, level=self.level,
+                    color=LEVEL_COLORS.get(self.level, FAULT_COLOR))
 
 
 class MetricsPipeline:
@@ -592,7 +610,11 @@ class MetricsPipeline:
             thresholds = dict(thresholds, ear_baseline=self.ear_seed.baseline,
                               ear_threshold=self.ear_seed.provisional_threshold(now_mono))
             scored = self.ear_seed.frozen
-        ear_threshold = thresholds["ear_threshold"]
+        # After SELF_SEED_MAX_ATTEMPTS discarded seeds: no baseline, no
+        # threshold (so no microsleep detection either), level FAULT.
+        seed_failed = self_seed and self.ear_seed.gave_up
+        # None while self-seeding without a provisional threshold.
+        ear_threshold = finite_or_none(thresholds.get("ear_threshold"))
 
         # TEMPORARY DIAGNOSTIC. This single comparison gates PERCLOS, blink
         # detection and microsleep detection alike - all three call
@@ -690,7 +712,7 @@ class MetricsPipeline:
 
         # The latch is released on this frame's own level, overrides included.
         own_level = ("DANGER" if self.pose_debounce.active or self.microsleep_debounce.active
-                     else str(frs_result["level"]))
+                     else "FAULT" if seed_failed else str(frs_result["level"]))
         no_face_latch, gap_ended = self.no_face.on_face(own_level, now_mono)
 
         metrics = FrameMetrics(
@@ -710,6 +732,7 @@ class MetricsPipeline:
             ear_norm_frs=ear_norm_frs,
             band=band,
             scored=scored,
+            seed_failed=seed_failed,
         )
         self.last_level = metrics.level
         return metrics
@@ -730,8 +753,12 @@ class MetricsPipeline:
             thresholds: The driver's threshold dict.
             now: ``time.time()`` for the frame.
         """
-        threshold = float(thresholds["ear_threshold"])
-        baseline = float(thresholds.get("ear_baseline", 0.0))
+        # Either may be None while self-seeding (the provisional threshold
+        # exists from 2 s, the baseline only once the seed freezes at 5 s).
+        threshold = finite_or_none(thresholds.get("ear_threshold"))
+        baseline = finite_or_none(thresholds.get("ear_baseline")) or 0.0
+        if threshold is None:
+            return
         closed = ear < threshold
         changed = closed != self._diag_last_closed
         if not changed and self._frames % DIAG_EAR_HEARTBEAT_FRAMES != 0:

@@ -50,6 +50,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from config import config
+from modules.calibration import finite_or_none
 from modules.phase import LockReason, Phase
 
 logger = logging.getLogger(__name__)
@@ -74,9 +75,12 @@ CONFIRMED_STATE_UNKNOWN = "unknown"
 
 # POST /monitoring-faults: fault_type -> severity. danger_latched is critical:
 # the last thing the unit saw was DANGER and it can no longer see the driver.
+# no_ear_baseline: the EAR self-seed gave up (calibration.SELF_SEED_MAX_ATTEMPTS
+# discarded seeds); the face is visible but the eyes cannot be scored.
 MONITORING_FAULT_SEVERITY = {
     "no_face": "warning",
     "danger_latched": "critical",
+    "no_ear_baseline": "warning",
 }
 
 # Statuses the operator portal may return for an override request.
@@ -89,6 +93,9 @@ OVERRIDE_STATUSES = ("pending", "approved", "denied")
 CALIBRATION_FIELD_MAP = (
     # (group, backend key,      pipeline key)
     ("baselines",  "ear",             "ear_baseline"),
+    # EAR with the eyes deliberately shut (enrollment from 2026-09-30); absent
+    # on older records, which main.load_calibration grandfathers.
+    ("baselines",  "ear_closed",      "ear_closed_baseline"),
     ("baselines",  "perclos",         "perclos_baseline"),
     ("baselines",  "blink_duration",  "blink_duration_baseline"),
     ("baselines",  "blink_frequency", "blink_frequency_baseline"),
@@ -428,7 +435,11 @@ class APIClient:
             logger.error("GET %s: expected {\"data\": {...}}, got %r", path, record)
             return None
         record_driver = record.get("driver_id")
-        if record_driver is None or int(record_driver) != int(driver_id):
+        try:
+            same_driver = record_driver is not None and int(record_driver) == int(driver_id)
+        except (TypeError, ValueError):
+            same_driver = False
+        if not same_driver:
             logger.error(
                 "GET %s returned the calibration of driver %s (%s), not of driver %s who is "
                 "in the seat - REJECTED; another driver's baseline is never used",
@@ -437,23 +448,26 @@ class APIClient:
             return None
 
         # Flatten the grouped record into pipeline names, coercing to float -
-        # Laravel may serialise decimals as strings. A missing or null field
-        # is simply absent (main.py fills MAR keys from DEFAULT_THRESHOLDS).
+        # Laravel may serialise decimals as strings. A missing, null,
+        # non-numeric or non-finite field is simply absent, so every value
+        # the rest of the Pi reads is a real number (main.py fills MAR keys
+        # from DEFAULT_THRESHOLDS and judges the rest).
         thresholds: Dict[str, float] = {}
         for group, key, name in CALIBRATION_FIELD_MAP:
             section = record.get(group)
             value = section.get(key) if isinstance(section, dict) else None
             if value is None:
                 continue
-            try:
-                thresholds[name] = float(value)
-            except (TypeError, ValueError):
-                logger.debug("Ignoring non-numeric calibration field %s.%s=%r", group, key, value)
+            number = finite_or_none(value)
+            if number is None:
+                logger.warning("Ignoring unusable calibration field %s.%s=%r", group, key, value)
+                continue
+            thresholds[name] = number
 
         captured_on = record.get("captured_on_device_id")
         source = (CALIBRATION_SOURCE_DEVICE if captured_on == device_id
                   else CALIBRATION_SOURCE_FOREIGN_DEVICE)
-        calibration_id = record.get("calibration_id", record.get("id"))
+        calibration_id = finite_or_none(record.get("calibration_id", record.get("id")))
         calibration = Calibration(
             thresholds=thresholds, driver_id=int(driver_id), source=source,
             calibration_id=int(calibration_id) if calibration_id is not None else None,
@@ -492,7 +506,10 @@ class APIClient:
             face_encoding: 128-d list of floats.
             thresholds: Baselines dict from ``CalibrationManager``. Every
                 key is forwarded, so this includes ``mar_baseline`` and
-                ``yawn_threshold`` when MAR was sampled.
+                ``yawn_threshold`` when MAR was sampled, and
+                ``ear_closed_baseline`` (closed-eye capture). The backend
+                must store that one and return it as ``baselines.ear_closed``
+                (deploy/BACKEND_CHANGES_2026-09-28.md, item 6).
             sample_duration_s: Seconds the calibration observed the driver.
                 Defaults to ``config.CALIBRATION_DURATION``.
             device_id: Device string that captured the calibration. Must be
@@ -630,12 +647,17 @@ class APIClient:
         ``POST /monitoring-faults``
 
         Not a fatigue event: the driver must not be accused of fatigue for
-        something the camera failed to see. Both fault types share one body
+        something the camera failed to see. All fault types share one body
         shape (see :data:`MONITORING_FAULT_SEVERITY`):
 
         * ``no_face`` - a gap from ALERT / WARNING crossed ``NO_FACE_FAULT_S``.
         * ``danger_latched`` - a gap from DANGER passed ``NO_FACE_HOLD_S``;
           the unit is holding DANGER for a driver it can no longer see.
+        * ``no_ear_baseline`` - the EAR self-seed gave up; the face is seen
+          but the eyes cannot be scored. ``gap_s`` is then the seconds since
+          the fault opened, ``last_known`` is ``None`` (nothing was scored)
+          and it resolves with ``"driver_identified"`` (the pipeline starts
+          afresh for the recognised driver) or ``"ignition_off"``.
 
         Every POST for a fault carries the same client-generated
         ``fault_uuid`` and the backend upserts on it: ``"open"`` when the
@@ -649,7 +671,7 @@ class APIClient:
         Args:
             fault_uuid: Identifies the fault across all its POSTs.
             status: ``"open"`` or ``"resolved"``.
-            fault_type: ``"no_face"`` or ``"danger_latched"``.
+            fault_type: A key of :data:`MONITORING_FAULT_SEVERITY`.
             driver_id: Driver being monitored, or ``None`` if unrecognised.
             entry_level: Level the gap began at.
             started_at: When the face was lost (UTC), not when the fault
@@ -658,8 +680,9 @@ class APIClient:
             last_known: :meth:`FrameMetrics.last_known` of the last scored
                 frame before the gap, or ``None`` if there was none.
             resolved_at: When the fault ended (UTC); ``"resolved"`` only.
-            resolution: Why it ended - ``"face_reacquired"`` or
-                ``"ignition_off"``; ``"resolved"`` only.
+            resolution: Why it ended - ``"face_reacquired"``,
+                ``"driver_identified"`` or ``"ignition_off"``;
+                ``"resolved"`` only.
             blocking: If ``True``, send synchronously (tests).
 
         Returns:

@@ -46,12 +46,13 @@ on a development machine (cv2.VideoCapture + mocked GPIO / ignition).
 import argparse
 import logging
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -63,9 +64,9 @@ from modules.api import (CALIBRATION_SOURCE_DEVICE, REPAIR_EAR_PAIR_SELF_SEEDED,
                          SELF_SEEDED_PROVENANCE, APIClient, Calibration, repair_defaulted)
 from modules.assessment import PredriveAssessment
 from modules.blink import BlinkDetector, MicrosleepDetector
-from modules.calibration import (EAR_BASELINE_PLAUSIBLE_MAX, EAR_BASELINE_PLAUSIBLE_MIN,
-                                 EAR_THRESHOLD_RATIO, MIN_PERCLOS_BASELINE, SELF_SEED_S,
-                                 CalibrationManager, ear_baseline_plausible)
+from modules.calibration import (CLOSED_CAPTURE_ATTEMPTS, EAR_THRESHOLD_RATIO,
+                                 MIN_PERCLOS_BASELINE, SELF_SEED_S, CalibrationManager,
+                                 ClosedEyeCapture, ear_calibration_problem, finite_or_none)
 from modules.ear import EARCalculator
 from modules.face_recognition_module import DriverRecognizer
 from modules.head_pose import HeadPoseEstimator
@@ -105,6 +106,8 @@ FAULT_TYPE_FOR_EVENT: Dict[str, str] = {
     "fault_entered": "no_face",
     "latch_lost": "danger_latched",
 }
+# Opened when the EAR self-seed gives up (FrameMetrics.seed_failed).
+FAULT_TYPE_NO_EAR_BASELINE: str = "no_ear_baseline"
 
 
 @dataclass
@@ -130,6 +133,16 @@ class OpenFault:
         )
         self.last_push_mono = now_mono
 
+    def refresh_elapsed(self, api_client: APIClient, now_mono: float) -> None:
+        """
+        Keep a fault that is not a no-face gap (``no_ear_baseline``) live:
+        ``gap_s`` becomes the seconds since it opened, re-POSTed every
+        ``MONITORING_FAULT_REFRESH_S``.
+        """
+        self.gap_s = (datetime.now(timezone.utc) - self.started_at).total_seconds()
+        if now_mono - self.last_push_mono >= MONITORING_FAULT_REFRESH_S:
+            self.push(api_client, "open", now_mono)
+
 # Pre-drive -> monitoring hand-off: after a pass or an approved override the
 # relay is released and a green confirmation is shown on live frames for this
 # long, so the driver sees the verdict, before monitoring starts. Kept under 2 s.
@@ -144,6 +157,17 @@ ENROLL_FRAMES: int = 30
 # as a fast one; SEED_MIN_SAMPLES guards a face that appears late.
 SEED_WINDOW_S: float = 1.0
 SEED_MIN_SAMPLES: int = 5
+
+# Enrollment closed-eye capture (modules.calibration.ClosedEyeCapture): an
+# on-screen countdown this long before each attempt, and this long with the
+# eyes open again before the 60 s window starts, so the reopening (and any
+# eye-rubbing) stays out of the alert-state baselines.
+CLOSED_PROMPT_LEAD_S: float = 3.0
+REOPEN_SETTLE_S: float = 2.0
+
+# run_enrollment exit codes beyond the original 2 / 3 / 5.
+EXIT_NO_EYELID_CONTRAST: int = 6    # closed-eye check failed; nothing POSTed
+EXIT_CLOSED_EAR_DROPPED: int = 7    # POSTed, but the backend did not keep ear_closed_baseline
 
 # Log the measured loop rate every N frames.
 FPS_LOG_INTERVAL: int = 30
@@ -696,7 +720,9 @@ def draw_overlay(
     cv2.putText(frame, f"Driver: {name}", (10, 25), font, 0.6, WHITE, 1, cv2.LINE_AA)
     cv2.putText(frame, f"FPS: {fps:.1f}" if fps is not None else "FPS: --",
                 (w - 150, 25), font, 0.5, WHITE, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"FRS: {m.frs:.3f}" if m.scored else "FRS: -- (learning EAR baseline)",
+    cv2.putText(frame, f"FRS: {m.frs:.3f}" if m.scored
+                else "FRS: -- (NO EAR BASELINE)" if m.seed_failed
+                else "FRS: -- (learning EAR baseline)",
                 (10, 50), font, 0.6, color, 2, cv2.LINE_AA)
     cv2.putText(frame, level, (w - 150, 50), font, 0.9, color, 2, cv2.LINE_AA)
     cv2.putText(frame, f"EAR: {m.ear:.3f}", (10, 75), font, 0.55, WHITE, 1, cv2.LINE_AA)
@@ -863,11 +889,17 @@ def run_enrollment(
     2. Capture ``ENROLL_FRAMES`` frames containing a face and average their
        128-d encodings (averaging is more robust than a single frame).
     3. Settle for ``SEED_WINDOW_S`` to derive a personal closure threshold
-       from the driver's own median EAR, then run ``CalibrationManager``
-       for ``config.CALIBRATION_DURATION`` s, feeding it EAR / blink /
-       PERCLOS / MAR from the live pipeline.
-    4. Write the per-frame series to ``config.CALIBRATIONS_DIR`` and POST
-       encoding + baselines to the backend.
+       from the driver's own median EAR.
+    4. Closed-eye capture (:func:`run_closed_eye_capture`): the driver shuts
+       their eyes on cue, up to ``CLOSED_CAPTURE_ATTEMPTS`` tries, and the
+       drop must show the landmarks follow the eyelid. Done *before* the
+       alert window so the closure cannot contaminate it.
+    5. Run ``CalibrationManager`` for ``config.CALIBRATION_DURATION`` s,
+       feeding it EAR / blink / PERCLOS / MAR from the live pipeline, then
+       re-check the contrast against the final ``ear_baseline``.
+    6. Write the per-frame series to ``config.CALIBRATIONS_DIR``, POST
+       encoding + baselines to the backend, and read the record back to
+       confirm ``ear_closed_baseline`` was stored.
 
     Args:
         api_client: Connected API client.
@@ -875,7 +907,11 @@ def run_enrollment(
         driver_id: Driver's DB id. ``None`` prompts on the terminal.
 
     Returns:
-        Process exit code (0 = success).
+        Process exit code: 0 success; 2 bad driver id; 3 too few face
+        frames; 5 backend rejected the enrollment;
+        ``EXIT_NO_EYELID_CONTRAST`` closed-eye check failed (nothing
+        POSTed); ``EXIT_CLOSED_EAR_DROPPED`` saved, but the backend did not
+        keep ``ear_closed_baseline``.
     """
     import face_recognition  # heavy import; only needed here
 
@@ -947,9 +983,27 @@ def run_enrollment(
         ear_history.append(ear_calc.compute_average_ear(landmarks))
         display_text(frame, "SETTLING - look at the road")
         present(frame)
-    threshold = float(np.median(ear_history)) * EAR_THRESHOLD_RATIO
+    open_reference = float(np.median(ear_history))
+    threshold = open_reference * EAR_THRESHOLD_RATIO
     logger.info("Seed threshold %.4f from %d frames (median EAR %.4f)",
-                threshold, len(ear_history), float(np.median(ear_history)))
+                threshold, len(ear_history), open_reference)
+
+    # Closed-eye capture, before the alert window (see run_closed_eye_capture).
+    closed_capture, closed_attempts = run_closed_eye_capture(extractor, ear_calc, open_reference)
+    if closed_capture is None:
+        logger.error("ENROLLMENT ABORTED for driver %s: the closed-eye check failed %d times - "
+                     "nothing was saved. If the driver did close their eyes, the landmarks are "
+                     "not tracking their eyelids: check lighting and camera position, and run "
+                     "tools/eye_check.py to see where the eye landmarks sit.",
+                     driver_id, len(closed_attempts))
+        return EXIT_NO_EYELID_CONTRAST
+    settle_start = time.time()
+    while time.time() - settle_start < REOPEN_SETTLE_S:
+        frame = capture_frame()
+        if frame is None:
+            continue
+        display_text(frame, "OPEN YOUR EYES - look at the road")
+        present(frame)
 
     logger.info("Starting %d s calibration - stay alert, look at the road and keep "
                 "your mouth relaxed (talking inflates the MAR baseline).",
@@ -997,27 +1051,130 @@ def run_enrollment(
         present(frame)
 
     baselines = calib.compute_baselines()
+    baselines["ear_closed_baseline"] = float(closed_capture.closed_ear)
     logger.info("Calibration baselines: %s", baselines)
     # Pre-floor measurements and counts, so a baseline that landed on a
     # MIN_* floor (modules/calibration.py) can be traced to its cause.
     logger.info("Calibration raw: %s", calib.raw_summary())
+    # The pre-check used the 1 s settle median; the stored contrast is
+    # against the 60 s ear_baseline, and that is what load_calibration judges.
+    problem = ear_calibration_problem(baselines["ear_baseline"],
+                                      baselines["ear_closed_baseline"])
     # Per-frame series + summary on disk, written before the backend call so
     # a rejected enrollment still leaves the evidence behind.
     try:
-        calib.write_files(config.DEVICE_ID, driver_id, baselines)
+        calib.write_files(config.DEVICE_ID, driver_id, baselines, closed_capture={
+            "attempts": closed_attempts,
+            "accepted": closed_capture.summary(baselines["ear_baseline"]),
+            "problem": problem,
+        })
     except OSError as exc:
         logger.error("Could not write calibration data: %s", exc)
+    if problem is not None:
+        logger.error("ENROLLMENT REFUSED for driver %s: %s. Nothing was sent to the backend; "
+                     "re-run the enrollment.", driver_id, problem)
+        return EXIT_NO_EYELID_CONTRAST
+    logger.info("Closed-eye contrast %.2f (closed %.4f / ear_baseline %.4f)",
+                baselines["ear_closed_baseline"] / baselines["ear_baseline"],
+                baselines["ear_closed_baseline"], baselines["ear_baseline"])
 
     # ---- 3. Persist ---------------------------------------------------------
     ok = api_client.save_driver_enrollment(driver_id, face_encoding.tolist(), baselines)
     if not ok:
         logger.error("Backend rejected enrollment for driver %s", driver_id)
         return 5
+    # A Laravel FormRequest drops fields it does not validate, silently: the
+    # record would come back without ear_closed_baseline and be treated as a
+    # pre-2026-09-30 record (no contrast check). Read it back to be sure.
+    stored = api_client.get_driver_calibration(driver_id)
+    if stored is None:
+        logger.warning("Enrollment saved, but the calibration could not be read back to confirm "
+                       "ear_closed_baseline was stored")
+    elif "ear_closed_baseline" not in stored.thresholds:
+        logger.error("Enrollment saved, but the backend DROPPED ear_closed_baseline: this "
+                     "driver's record has no contrast check and will be treated as a legacy "
+                     "record. Deploy the backend change (deploy/BACKEND_CHANGES_2026-09-28.md, "
+                     "item 6) and re-enrol.")
+        return EXIT_CLOSED_EAR_DROPPED
 
     msg = f"Enrollment complete for driver {driver_id}"
     logger.info(msg)
     print(msg)
     return 0
+
+
+def run_closed_eye_capture(
+    extractor: LandmarkExtractor, ear_calc: EARCalculator, open_reference: float
+) -> Tuple[Optional[ClosedEyeCapture], List[Dict[str, Any]]]:
+    """
+    Enrollment step: measure the driver's EAR with the eyes deliberately shut.
+
+    Each attempt shows a ``CLOSED_PROMPT_LEAD_S`` countdown, beeps once
+    (close now), captures for ``CLOSED_CAPTURE_S`` and beeps long (open) -
+    the driver cannot read the screen with their eyes shut, so the operator
+    should also say "open". An attempt passes when closed / open is at most
+    ``EAR_CONTRAST_MAX`` against ``open_reference`` (the settle median); a
+    failure is logged with its reason and retried, up to
+    ``CLOSED_CAPTURE_ATTEMPTS`` in all. A driver who did not close their eyes
+    and landmarks that do not follow the eyelid look the same in the
+    numbers, so the reason names both and the operator decides.
+
+    Returns:
+        ``(capture, attempts)``: the passing :class:`ClosedEyeCapture` (or
+        ``None`` if every attempt failed) and one summary dict per attempt.
+    """
+    attempts: List[Dict[str, Any]] = []
+
+    def beep(pattern: str) -> None:
+        # trigger_buzzer blocks for the beep; keep the capture loop running.
+        if _alert_manager is not None:
+            threading.Thread(target=_alert_manager.trigger_buzzer, args=(pattern,),
+                             daemon=True).start()
+
+    for attempt in range(1, CLOSED_CAPTURE_ATTEMPTS + 1):
+        capture = ClosedEyeCapture()
+        logger.info("Closed-eye capture %d/%d: tell the driver to close their eyes on the beep "
+                    "and keep them shut until the long beep (%.0f s)",
+                    attempt, CLOSED_CAPTURE_ATTEMPTS, capture.duration_s)
+        lead_start = time.time()
+        while time.time() - lead_start < CLOSED_PROMPT_LEAD_S:
+            frame = capture_frame()
+            if frame is None:
+                continue
+            remaining = CLOSED_PROMPT_LEAD_S - (time.time() - lead_start)
+            display_text(frame, f"CLOSE YOUR EYES in {remaining:.0f}s - keep them shut "
+                                f"until the long beep")
+            present(frame)
+
+        capture.start(time.time())
+        beep("short")
+        while not capture.done(time.time()):
+            frame = capture_frame()
+            if frame is None:
+                continue
+            landmarks, _ = extractor.extract(frame)
+            if landmarks is not None:
+                capture.update(ear_calc.compute_average_ear(landmarks), time.time())
+                display_text(frame, "EYES CLOSED - keep them shut")
+            else:
+                display_text(frame, "FACE LOST - keep facing the camera, eyes shut")
+            present(frame)
+        beep("long")
+
+        ok, ratio, reason = capture.evaluate(open_reference)
+        record = dict(capture.summary(open_reference), attempt=attempt, ok=ok,
+                      reason=reason or None)
+        attempts.append(record)
+        if ok:
+            logger.info("Closed-eye capture %d passed: closed EAR %.4f / open %.4f = %.2f "
+                        "(%d frames measured)", attempt, capture.closed_ear, open_reference,
+                        ratio, len(capture.measured))
+            return capture, attempts
+        logger.warning("Closed-eye capture %d/%d FAILED: %s (closed EAR %s, open %.4f)",
+                       attempt, CLOSED_CAPTURE_ATTEMPTS, reason,
+                       "n/a" if capture.closed_ear is None else f"{capture.closed_ear:.4f}",
+                       open_reference)
+    return None, attempts
 
 
 # ---------------------------------------------------------------------------
@@ -1049,7 +1206,7 @@ def load_calibration(
     locks with ``NO_BASELINE``. Monitoring cannot release anything and a
     driver's real alert-state baseline is worth keeping, so there a broken
     record is *repaired* - but only where its EAR baseline is independently
-    credible (``ear_baseline_plausible``):
+    credible (``ear_calibration_problem``):
 
     * threshold missing / inconsistent -> recomputed as
       ``ear_baseline * EAR_THRESHOLD_RATIO``;
@@ -1058,10 +1215,14 @@ def load_calibration(
     * PERCLOS baseline <= 0 -> floored at calibration's MIN_PERCLOS_BASELINE;
     * another core baseline missing -> filled from DEFAULT_THRESHOLDS.
 
-    An EAR baseline *present but implausible* is never repaired in either
+    An EAR baseline *present but not credible* is never repaired in either
     phase: it is the suspect value, and a threshold recomputed from it would
     launder the corruption. The record is discarded (monitoring then
-    self-seeds everything). Every repair is logged at WARNING with original
+    self-seeds everything). Credible means (2026-09-30): with an
+    ``ear_closed_baseline``, closed / open at most ``EAR_CONTRAST_MAX`` and
+    the baseline inside the degenerate-value backstop; without one (records
+    enrolled before the closed-eye capture), grandfathered if the baseline
+    is inside ``EAR_BASELINE_UNCONTRASTED_MIN`` - ``EAR_BASELINE_MAX``. Every repair is logged at WARNING with original
     and new values and listed in ``Calibration.repairs``, which travels as
     ``calibration_repairs`` on every fatigue event. Frequent repairs point at
     a problem in the enrollment path.
@@ -1087,13 +1248,20 @@ def load_calibration(
     monitoring = Phase(phase) is Phase.MONITORING
 
     baseline = thresholds.get("ear_baseline")
-    if baseline is not None and not ear_baseline_plausible(baseline):
-        logger.error("CALIBRATION DISCARDED (%s): ear_baseline %.4f is outside the plausible "
-                     "open-eye range %.2f-%.2f - the baseline itself is suspect, so the record "
-                     "is not repaired%s", source, baseline, EAR_BASELINE_PLAUSIBLE_MIN,
-                     EAR_BASELINE_PLAUSIBLE_MAX,
-                     "; self-seeding instead" if monitoring else "; locking")
-        return None, fetched.provenance()
+    closed = thresholds.get("ear_closed_baseline")
+    if baseline is not None:
+        problem = ear_calibration_problem(baseline, closed)
+        if problem is not None:
+            logger.error("CALIBRATION DISCARDED (%s): %s - the baseline itself is suspect, so "
+                         "the record is not repaired%s", source, problem,
+                         "; self-seeding instead" if monitoring else "; locking")
+            return None, fetched.provenance()
+        if closed is None:
+            logger.info("Calibration (%s) predates the closed-eye capture: no contrast check "
+                        "possible, grandfathered on its ear_baseline %.4f", source, baseline)
+        else:
+            logger.info("Calibration (%s): closed/open EAR %.4f/%.4f = %.2f", source, closed,
+                        baseline, closed / baseline)
 
     # Drivers enrolled before yawn detection have no MAR baseline; say so
     # explicitly because the generic default silently makes yawn detection
@@ -1185,8 +1353,13 @@ def check_threshold_sanity(thresholds: Dict[str, float], source: str) -> bool:
     Returns:
         ``True`` if the record is usable.
     """
-    baseline = float(thresholds.get("ear_baseline", 0.0))
-    threshold = float(thresholds.get("ear_threshold", 0.0))
+    # finite_or_none: a key that is present but None / non-numeric reads as
+    # 0 here (unusable) instead of raising.
+    def num(key: str) -> float:
+        return finite_or_none(thresholds.get(key)) or 0.0
+
+    baseline = num("ear_baseline")
+    threshold = num("ear_threshold")
     if baseline <= 0.0:
         logger.error("THRESHOLD CHECK (%s): ear_baseline is %.4f - EAR normalisation "
                      "and the closure test are both meaningless", source, baseline)
@@ -1198,9 +1371,8 @@ def check_threshold_sanity(thresholds: Dict[str, float], source: str) -> bool:
         "(expected %.2f) | perclos_baseline=%.3f blink_duration_baseline=%.1fms "
         "blink_frequency_baseline=%.2f",
         source, baseline, threshold, ratio, EAR_THRESHOLD_RATIO,
-        float(thresholds.get("perclos_baseline", 0.0)),
-        float(thresholds.get("blink_duration_baseline", 0.0)),
-        float(thresholds.get("blink_frequency_baseline", 0.0)),
+        num("perclos_baseline"), num("blink_duration_baseline"),
+        num("blink_frequency_baseline"),
     )
     if ratio < EAR_THRESHOLD_RATIO - EAR_RATIO_TOLERANCE:
         logger.error(
@@ -1222,7 +1394,7 @@ def check_threshold_sanity(thresholds: Dict[str, float], source: str) -> bool:
             source, ratio * 100, EAR_THRESHOLD_RATIO * 100,
         )
         usable = False
-    if float(thresholds.get("perclos_baseline", 0.0)) <= 0.0:
+    if num("perclos_baseline") <= 0.0:
         logger.error(
             "THRESHOLD CHECK (%s): perclos_baseline is 0 - PERCLOSCalculator.normalize() "
             "returns 0.0 for a zero baseline, so the PERCLOS term is dead regardless of "
@@ -1667,6 +1839,11 @@ def run_monitoring(
     with the last scored frame's metrics, re-POSTed every
     ``MONITORING_FAULT_REFRESH_S`` while open, and resolved when the face
     returns or the ignition turns off.
+
+    A self-seed that gives up (``SELF_SEED_MAX_ATTEMPTS`` discarded seeds)
+    puts the level at FAULT and opens a third fault, ``no_ear_baseline``,
+    independent of any no-face gap; it resolves when a recognised driver
+    restarts the pipeline or the ignition turns off.
     """
     global _profiler
     alert_manager.set_phase(Phase.MONITORING)
@@ -1705,6 +1882,8 @@ def run_monitoring(
     last_m: Optional[FrameMetrics] = None
     # Open monitoring fault (no_face or danger_latched), if any.
     open_fault: Optional[OpenFault] = None
+    # Open no_ear_baseline fault (the self-seed gave up), if any.
+    seed_fault: Optional[OpenFault] = None
     # See from_release: whether this session has seen the ignition ON yet.
     ignition_seen_on = False
 
@@ -1759,6 +1938,9 @@ def run_monitoring(
                 if now_mono - open_fault.last_push_mono >= MONITORING_FAULT_REFRESH_S:
                     with prof.section("api"):
                         open_fault.push(api_client, "open", now_mono)
+            if seed_fault is not None:
+                with prof.section("api"):
+                    seed_fault.refresh_elapsed(api_client, now_mono)
             with prof.section("display"):
                 display_text(frame, f"NO FACE {verdict.gap_s:.1f}s  [{verdict.band}]",
                              LEVEL_BGR.get(verdict.level, WHITE))
@@ -1826,13 +2008,38 @@ def run_monitoring(
                               else dict(DEFAULT_THRESHOLDS))
                 # Fresh history so metrics accumulated before recognition
                 # (on a self-seeded baseline) don't leak into this driver's.
+                # That includes a self-seed that gave up: it starts over.
                 pipeline.reset()
+                if seed_fault is not None:
+                    logger.info("Driver identified - no_ear_baseline fault resolved (%s)",
+                                "calibration loaded" if calibration is not None
+                                else "self-seed restarts")
+                    with prof.section("api"):
+                        seed_fault.push(api_client, "resolved", now_mono,
+                                        datetime.now(timezone.utc), "driver_identified")
+                    seed_fault = None
                 last_danger_push = 0.0
 
         with prof.section("pipeline"):
             m = pipeline.process(landmarks, thresholds, now, now_mono,
                                  self_seed=calibration is None or calibration.self_seed_ear)
         last_m = m
+        if m.seed_failed and seed_fault is None:
+            seed_fault = OpenFault(
+                fault_uuid=str(uuid.uuid4()),
+                fault_type=FAULT_TYPE_NO_EAR_BASELINE,
+                driver_id=current_driver_id,
+                entry_level=last_level or "ALERT",
+                started_at=datetime.now(timezone.utc),
+                last_known=None,     # nothing was ever scored
+                gap_s=0.0,
+                last_push_mono=now_mono,
+            )
+            with prof.section("api"):
+                seed_fault.push(api_client, "open", now_mono)
+        elif seed_fault is not None:
+            with prof.section("api"):
+                seed_fault.refresh_elapsed(api_client, now_mono)
         # (A gap that opened a fault was already logged above when it was resolved.)
         if m.gap_ended is not None and m.gap_ended.face_lost and not fault_resolved:
             logger.info("Face re-acquired after %.1fs (%s from %s)%s",
@@ -1848,6 +2055,7 @@ def run_monitoring(
                 "Level %s -> %s: %s%s%s",
                 last_level or "(none)", m.level,
                 pipeline.frs_calc.format_breakdown(m.frs_result) if m.scored
+                else "not scored (EAR self-seed gave up - no baseline)" if m.seed_failed
                 else "not scored (self-seeding EAR baseline)",
                 f"  [{m.override_reason} override forcing DANGER]" if m.overridden else "",
                 f"  [band {m.band} held; raw {m.frs_result['level']}]"
@@ -1892,6 +2100,9 @@ def run_monitoring(
         # Ignition OFF with the driver still unseen: close the record so the
         # portal does not show a fault open forever.
         open_fault.push(api_client, "resolved", time.monotonic(),
+                        datetime.now(timezone.utc), "ignition_off")
+    if seed_fault is not None:
+        seed_fault.push(api_client, "resolved", time.monotonic(),
                         datetime.now(timezone.utc), "ignition_off")
     logger.info("Monitoring: ignition turned OFF - returning to pre-drive")
 

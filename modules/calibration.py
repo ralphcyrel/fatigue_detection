@@ -18,6 +18,12 @@ deriving personal baselines:
 * ``mar_baseline``             **median** closed-mouth MAR (floored at 0.2)
 * ``yawn_threshold``           ``mar_baseline * 2.0`` → "candidate yawn" cut-off
 
+Enrollment adds ``ear_closed_baseline`` - the EAR with the eyes deliberately
+shut, measured by :class:`ClosedEyeCapture` *before* the 60 s window - and a
+record is valid only if closed / open is at most ``EAR_CONTRAST_MAX`` (see
+``ear_calibration_problem``). It validates the calibration; it does not set
+the threshold, which stays at 75 % of ``ear_baseline``.
+
 The floors exist only to keep a degenerate calibration (no blinks detected
 at all) from producing a zero baseline that the normalised metrics would
 divide by. They sit at the smallest value the pipeline can physically
@@ -98,25 +104,219 @@ MIN_MAR_BASELINE: float = 0.2               # outer-lip MAR; ~0.4-0.6 is typical
 # Blink frequency is expressed per this many seconds regardless of duration.
 BLINK_FREQUENCY_WINDOW_S: float = 60.0
 
-# Range of credible open-eye EAR *baselines*. A baseline outside it is itself
-# the suspect value - a seed taken with the eyes shut, or a corrupt record -
-# so it is discarded, never repaired (recomputing a threshold from it would
-# launder the corruption). From the 13 recordings (2 drivers, 2026-09-21..28):
-#   * lower 0.18 - above the median closed-frame EAR (0.164; closed frames
-#     span 0.116-0.197), so a baseline measured mostly shut falls outside;
-#   * upper 0.35 - just above the highest single frame in any calibration
-#     (0.345; per-frame p99 <= 0.299). 0.46-0.50 appears only in assessment
-#     artefact frames.
-# Recorded baselines are 0.249-0.263, so this is roughly +/-30 % around them.
-# Two drivers cannot establish a population range: the bounds are
-# UNDER-DETERMINED, and a discard is logged so a legitimate outlier shows up.
-EAR_BASELINE_PLAUSIBLE_MIN: float = 0.18
-EAR_BASELINE_PLAUSIBLE_MAX: float = 0.35
+# Validating an EAR baseline (2026-09-30).
+#
+# EAR varies between people, so an absolute window cannot tell a valid
+# driver from a broken measurement. Until 2026-09-30 the check was a fixed
+# 0.18-0.35, sized from 2 drivers; the third enrolled driver (8) measures
+# 0.353-0.368 with blinks that reach 0.30-0.59 of his baseline - deeper than
+# either earlier driver - and was locked out by it. A calibration is now
+# judged by *contrast*: enrollment also captures the driver's EAR with the
+# eyes deliberately shut (:class:`ClosedEyeCapture`), and the record is valid
+# only if the landmarks demonstrably follow the eyelid:
+#
+#     ear_closed_baseline / ear_baseline <= EAR_CONTRAST_MAX
+#
+# 0.60 rather than the 0.75 closure ratio itself: the microsleep detector
+# ends a closure on the first frame at or above the threshold, so a 1 s
+# microsleep at ~20 fps needs ~20 consecutive frames below 0.75 x baseline.
+# With open-eye frame noise of 5-7 % of baseline (sd, drivers 5 and 6) and
+# assuming closed frames are as noisy, a closed level at 0.65 of baseline
+# registers a 1 s closure ~37 % of the time, 0.60 ~88 %, 0.55 ~99 %. No
+# sustained closure had been recorded when this was set, so the cutoff is
+# UNDER-DETERMINED.
+EAR_CONTRAST_MAX: float = 0.60
+# Degenerate-value backstop for a record that passed the contrast check: a
+# lost face, zeroed landmarks or garbage - not an unusual eye.
+EAR_BASELINE_MIN: float = 0.10
+EAR_BASELINE_MAX: float = 0.50
+# Floor when there is no closed-eye evidence (a self-seed, or a record
+# enrolled before the closed capture existed). Closed eyes read 0.116-0.197
+# in the recordings, so without contrast a baseline below 0.18 may have been
+# measured with the eyes shut - and that fails silently (a threshold under
+# the driver's real closures). A too-high baseline fails loudly (false
+# closures), so the ceiling stays at EAR_BASELINE_MAX.
+EAR_BASELINE_UNCONTRASTED_MIN: float = 0.18
 
 
-def ear_baseline_plausible(value: Optional[float]) -> bool:
-    """Whether ``value`` is a credible open-eye EAR baseline."""
-    return value is not None and EAR_BASELINE_PLAUSIBLE_MIN <= value <= EAR_BASELINE_PLAUSIBLE_MAX
+def finite_or_none(value: Any) -> Optional[float]:
+    """``value`` as a finite float, or ``None`` (missing, null, non-numeric, NaN, inf)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def ear_baseline_plausible(value: Optional[float], contrasted: bool = False) -> bool:
+    """
+    Whether ``value`` is a credible open-eye EAR baseline.
+
+    Args:
+        value: The baseline.
+        contrasted: The record also passed the closed-eye contrast check,
+            so only degenerate values are excluded. Without it (self-seed,
+            legacy record) the floor is EAR_BASELINE_UNCONTRASTED_MIN.
+    """
+    low = EAR_BASELINE_MIN if contrasted else EAR_BASELINE_UNCONTRASTED_MIN
+    value = finite_or_none(value)
+    return value is not None and low <= value <= EAR_BASELINE_MAX
+
+
+def ear_contrast(open_ear: Optional[float], closed_ear: Optional[float]) -> Optional[float]:
+    """``closed_ear / open_ear``, or ``None`` when either is unusable."""
+    open_ear, closed_ear = finite_or_none(open_ear), finite_or_none(closed_ear)
+    if open_ear is None or closed_ear is None or open_ear <= 0.0:
+        return None
+    return closed_ear / open_ear
+
+
+def ear_calibration_problem(baseline: Any, closed: Any) -> Optional[str]:
+    """
+    Why an EAR baseline (and its closed-eye value, if any) is not usable.
+
+    Records with ``ear_closed_baseline`` are judged by contrast plus the
+    degenerate-value backstop; records without one (enrolled before
+    2026-09-30) are grandfathered on EAR_BASELINE_UNCONTRASTED_MIN -
+    EAR_BASELINE_MAX.
+
+    Returns:
+        ``None`` if usable, else a sentence for the log.
+    """
+    baseline_f = finite_or_none(baseline)
+    if baseline_f is None:
+        return f"ear_baseline {baseline!r} is not a number"
+    if closed is None:
+        if not ear_baseline_plausible(baseline_f, contrasted=False):
+            return (f"ear_baseline {baseline_f:.4f} is outside {EAR_BASELINE_UNCONTRASTED_MIN:.2f}-"
+                    f"{EAR_BASELINE_MAX:.2f}, the range for a record with no closed-eye capture")
+        return None
+    closed_f = finite_or_none(closed)
+    if closed_f is None or closed_f <= 0.0:
+        return f"ear_closed_baseline {closed!r} is not a positive number"
+    if not ear_baseline_plausible(baseline_f, contrasted=True):
+        return (f"ear_baseline {baseline_f:.4f} is outside the degenerate-value backstop "
+                f"{EAR_BASELINE_MIN:.2f}-{EAR_BASELINE_MAX:.2f}")
+    ratio = closed_f / baseline_f
+    if ratio > EAR_CONTRAST_MAX:
+        return (f"closed/open EAR {closed_f:.4f}/{baseline_f:.4f} = {ratio:.2f} is above "
+                f"{EAR_CONTRAST_MAX:.2f} - the landmarks do not show the eyelid closing")
+    return None
+
+
+# Closed-eye capture at enrollment (see EAR_CONTRAST_MAX). The driver is told
+# to shut their eyes for CLOSED_CAPTURE_S; the first CLOSED_CAPTURE_SETTLE_S
+# (reaction time, lids still moving) is discarded and the closed EAR is the
+# median of the rest. It runs *before* the 60 s alert window, never inside
+# it: a 3 s closure would register as a microsleep, add ~5 points to a
+# PERCLOS baseline that is normally 0.5-2 %, and skew blink frequency.
+CLOSED_CAPTURE_S: float = 4.0
+CLOSED_CAPTURE_SETTLE_S: float = 1.5
+# Face frames needed in the measured part (~0.75 s at 20 fps).
+CLOSED_CAPTURE_MIN_SAMPLES: int = 15
+# Tries before enrollment gives up on the closed capture.
+CLOSED_CAPTURE_ATTEMPTS: int = 3
+# At or above this closed/open ratio nothing moved at all: the driver did not
+# close their eyes - or the landmarks do not track their lids. The numbers
+# cannot tell those apart; the operator can.
+EAR_NO_CLOSURE_RATIO: float = 0.90
+
+
+class ClosedEyeCapture:
+    """
+    Measure a driver's EAR with the eyes deliberately shut.
+
+    Typical usage::
+
+        cap = ClosedEyeCapture()
+        cap.start(now)
+        while not cap.update(ear, now):   # only face frames are fed
+            ...
+        ok, ratio, reason = cap.evaluate(open_ear)
+    """
+
+    def __init__(
+        self,
+        duration_s: float = CLOSED_CAPTURE_S,
+        settle_s: float = CLOSED_CAPTURE_SETTLE_S,
+        min_samples: int = CLOSED_CAPTURE_MIN_SAMPLES,
+    ) -> None:
+        self.duration_s = duration_s
+        self.settle_s = settle_s
+        self.min_samples = min_samples
+        self.start_time: Optional[float] = None
+        # (seconds since start, ear) for every face frame fed.
+        self.samples: List[tuple] = []
+
+    def start(self, now: float) -> None:
+        """Begin a new capture (the prompt to close the eyes is shown now)."""
+        self.start_time = now
+        self.samples = []
+
+    def elapsed(self, now: float) -> float:
+        """Seconds since :meth:`start`."""
+        return 0.0 if self.start_time is None else now - self.start_time
+
+    def update(self, ear: float, now: float) -> bool:
+        """Feed one face frame's EAR; ``True`` once the capture window is over."""
+        if self.start_time is None:
+            self.start(now)
+        self.samples.append((self.elapsed(now), float(ear)))
+        return self.done(now)
+
+    def done(self, now: float) -> bool:
+        """Whether the capture window is over (also call on no-face frames)."""
+        return self.start_time is not None and self.elapsed(now) >= self.duration_s
+
+    @property
+    def measured(self) -> List[float]:
+        """EAR of the frames after the settle period."""
+        return [ear for t, ear in self.samples if t >= self.settle_s]
+
+    @property
+    def closed_ear(self) -> Optional[float]:
+        """Median closed-eye EAR, or ``None`` with too few face frames."""
+        values = self.measured
+        return float(np.median(values)) if len(values) >= self.min_samples else None
+
+    def evaluate(self, open_ear: float) -> tuple:
+        """
+        Judge the capture against an open-eye EAR.
+
+        Returns:
+            ``(ok, ratio, reason)``: ``ratio`` is closed / open (``None``
+            without enough frames); ``reason`` explains a failure, else ``""``.
+        """
+        closed = self.closed_ear
+        if closed is None:
+            return False, None, (f"only {len(self.measured)} face frames while the eyes were "
+                                 f"shut (need {self.min_samples}) - keep the face in view")
+        ratio = ear_contrast(open_ear, closed)
+        if ratio is None:
+            return False, None, f"open-eye EAR {open_ear!r} is unusable"
+        if ratio >= EAR_NO_CLOSURE_RATIO:
+            return False, ratio, ("no eyelid movement - either the eyes were not closed, or "
+                                  "the landmarks are not tracking this driver's eyelids")
+        if ratio > EAR_CONTRAST_MAX:
+            return False, ratio, (f"the EAR dropped only to {ratio:.2f} of open (need "
+                                  f"<= {EAR_CONTRAST_MAX:.2f}) - eyes not fully shut, or "
+                                  f"the landmarks follow the lid only partly")
+        return True, ratio, ""
+
+    def summary(self, open_ear: Optional[float] = None) -> Dict[str, Any]:
+        """Plain-data record of this capture for the calibration JSON."""
+        closed = self.closed_ear
+        return {
+            "closed_ear": None if closed is None else round(closed, 4),
+            "open_ear_reference": None if open_ear is None else round(float(open_ear), 4),
+            "ratio": (None if open_ear is None or closed is None
+                      else round(float(closed / open_ear), 4)),
+            "frames": len(self.samples),
+            "frames_measured": len(self.measured),
+            "settle_s": self.settle_s,
+            "duration_s": self.duration_s,
+            "series": [[round(t, 3), round(ear, 4)] for t, ear in self.samples],
+        }
 
 
 # Monitoring with no usable calibration (driver unrecognised, no record for
@@ -135,9 +335,13 @@ SELF_SEED_S: float = 5.0
 # -6 %..+16 % of the calibrated baseline, keeping the provisional threshold
 # below every recorded driver's open-eye p1 of ~0.88 x baseline).
 SELF_SEED_PROVISIONAL_S: float = 2.0
-# A seed median outside EAR_BASELINE_PLAUSIBLE_MIN/MAX (below: the eyes were
-# shut for most of the seed window) is discarded and the seed restarts.
+# A seed median outside EAR_BASELINE_UNCONTRASTED_MIN - EAR_BASELINE_MAX
+# (below: the eyes were shut for most of the seed window) is discarded and
+# the seed restarts - at most SELF_SEED_MAX_ATTEMPTS times in all, then it
+# gives up (monitoring reports a no_ear_baseline FAULT). Until 2026-09-30 it
+# restarted forever.
 SELF_SEED_MIN_SAMPLES: int = 25
+SELF_SEED_MAX_ATTEMPTS: int = 6
 
 
 class EarSelfSeed:
@@ -167,12 +371,16 @@ class EarSelfSeed:
         seed_s: float = SELF_SEED_S,
         provisional_s: float = SELF_SEED_PROVISIONAL_S,
         min_samples: int = SELF_SEED_MIN_SAMPLES,
+        max_attempts: int = SELF_SEED_MAX_ATTEMPTS,
     ) -> None:
         self.seed_s = seed_s
         self.provisional_s = provisional_s
         self.min_samples = min_samples
+        self.max_attempts = max_attempts
         self.baseline: Optional[float] = None
         self.threshold: Optional[float] = None
+        # Medians of the discarded attempts, in order.
+        self.discarded: List[float] = []
         self._values: List[float] = []
         self._start: Optional[float] = None
 
@@ -180,6 +388,11 @@ class EarSelfSeed:
     def frozen(self) -> bool:
         """Whether the baseline has been fixed."""
         return self.baseline is not None
+
+    @property
+    def gave_up(self) -> bool:
+        """Every attempt was discarded: no baseline until :meth:`reset`."""
+        return len(self.discarded) >= self.max_attempts
 
     def elapsed(self, now: float) -> float:
         """Seconds since the seed started collecting (0 before the first sample)."""
@@ -190,9 +403,10 @@ class EarSelfSeed:
         Feed one face frame's EAR.
 
         Returns:
-            ``True`` on the frame the baseline freezes.
+            ``True`` on the frame the baseline freezes. After
+            :attr:`gave_up` the seed ignores every frame.
         """
-        if self.frozen:
+        if self.frozen or self.gave_up:
             return False
         if self._start is None:
             self._start = now
@@ -200,13 +414,21 @@ class EarSelfSeed:
         if self.elapsed(now) < self.seed_s or len(self._values) < self.min_samples:
             return False
         median = float(np.median(self._values))
-        if not ear_baseline_plausible(median):
-            logger.warning("EAR self-seed discarded: median EAR %.3f over %.1fs is outside the "
-                           "plausible open-eye range %.2f-%.2f%s - restarting", median,
-                           self.elapsed(now), EAR_BASELINE_PLAUSIBLE_MIN,
-                           EAR_BASELINE_PLAUSIBLE_MAX,
+        if not ear_baseline_plausible(median, contrasted=False):
+            self.discarded.append(median)
+            logger.warning("EAR self-seed attempt %d/%d discarded: median EAR %.3f over %.1fs "
+                           "is outside the open-eye range %.2f-%.2f%s%s",
+                           len(self.discarded), self.max_attempts, median, self.elapsed(now),
+                           EAR_BASELINE_UNCONTRASTED_MIN, EAR_BASELINE_MAX,
                            " (eyes shut for most of it)"
-                           if median < EAR_BASELINE_PLAUSIBLE_MIN else "")
+                           if median < EAR_BASELINE_UNCONTRASTED_MIN else "",
+                           "" if self.gave_up else " - restarting")
+            if self.gave_up:
+                logger.error("EAR self-seed GAVE UP after %d discarded attempts (medians %s) - "
+                             "no EAR baseline: no FRS and no microsleep detection for this "
+                             "driver, level FAULT (head-pose override still active)",
+                             len(self.discarded),
+                             ", ".join(f"{m:.3f}" for m in self.discarded))
             self._values, self._start = [], now
             return False
         self.baseline = median
@@ -226,14 +448,16 @@ class EarSelfSeed:
         """
         if self.frozen:
             return self.threshold
-        if self.elapsed(now) < self.provisional_s or not self._values:
+        if self.gave_up or self.elapsed(now) < self.provisional_s or not self._values:
             return None
         median = float(np.median(self._values))
-        return median * EAR_THRESHOLD_RATIO if ear_baseline_plausible(median) else None
+        return (median * EAR_THRESHOLD_RATIO
+                if ear_baseline_plausible(median, contrasted=False) else None)
 
     def reset(self) -> None:
-        """Forget everything (new driver)."""
+        """Forget everything, give-up included (new driver)."""
         self.baseline = self.threshold = None
+        self.discarded = []
         self._values, self._start = [], None
 
 
@@ -588,11 +812,13 @@ class CalibrationManager:
         driver_id: Optional[int],
         baselines: Optional[Dict[str, float]] = None,
         directory: Path = config.CALIBRATIONS_DIR,
+        closed_capture: Optional[Dict[str, Any]] = None,
     ) -> Path:
         """
         Write ``<device>_<driver>_<UTC stamp>.csv`` (one row per frame, columns
         as in ``SAMPLE_FIELDS``) and a ``.json`` summary next to it holding
-        :meth:`raw_summary` plus the ``baselines`` that were persisted.
+        :meth:`raw_summary` plus the ``baselines`` that were persisted, and
+        ``closed_capture`` (the closed-eye attempts, per-frame) when given.
 
         Returns:
             Path of the CSV file.
@@ -614,6 +840,8 @@ class CalibrationManager:
             "raw": self.raw_summary(),
             "baselines": baselines,
         }
+        if closed_capture is not None:
+            summary["closed_capture"] = closed_capture
         (directory / f"{stem}.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         logger.info("Calibration data written: %s (%d frames)", csv_path, len(self.samples))
         return csv_path

@@ -29,9 +29,9 @@ selects the phase:
 
 | Phase | Ignition | What happens | Starter relay |
 |---|---|---|---|
-| **Enrollment** (`--enroll`) | — | Operator-supervised, at hiring: face encoding + 60 s alert-state calibration → backend. | untouched |
+| **Enrollment** (`--enroll`) | — | Operator-supervised, at hiring: face encoding + a 4 s closed-eye capture (the landmarks must show the eyelid closing: closed/open EAR ≤ 0.60) + 60 s alert-state calibration → backend. | untouched |
 | **Pre-drive assessment** | OFF | Recognise the driver (≤ 10 s, 3 consistent matches) → fetch *their* calibration captured on this unit (none → lock `no_baseline`; only another unit's → lock `foreign_device_baseline`; never another driver's, never defaults) → 30 s assessment through the shared pipeline. Verdict = worst 5 s rolling mean of FRS `< 0.40`. | **Only phase that drives it.** Starts inhibited; released on PASS or an approved operator override. |
-| **Continuous monitoring** | ON | Same pipeline; LEDs, buzzer and `POST /fatigue-events` only. Unrecognised driver / no usable calibration → EAR baseline self-seeded from the driver's own EAR over the first 5 s (head-pose and microsleep overrides only until then); other baselines generic. | **Never engaged.** `AlertManager.lock_relay()` refuses with a WARNING in this phase. Entering the phase does not release it either (key-ON precedes cranking). |
+| **Continuous monitoring** | ON | Same pipeline; LEDs, buzzer and `POST /fatigue-events` only. Unrecognised driver / no usable calibration → EAR baseline self-seeded from the driver's own EAR over the first 5 s (head-pose and microsleep overrides only until then); other baselines generic. After 6 discarded seeds the level is FAULT and a `no_ear_baseline` monitoring fault is raised. | **Never engaged.** `AlertManager.lock_relay()` refuses with a WARNING in this phase. Entering the phase does not release it either (key-ON precedes cranking). |
 
 Three lock reasons keep the starter inhibited after pre-drive — `fatigue_detected`,
 `driver_not_recognized`, `no_baseline` — and all three resolve through one operator
@@ -138,6 +138,7 @@ python main.py --mock-gpio --force-phase monitoring   # stay in monitoring
 python main.py --debug-pose                      # overlay head-pose debounce timers
 python main.py --enroll                          # enrol a driver (prompts for the id)
 python main.py --enroll --driver-id 7            # enrol driver 7, no prompt
+python tools/eye_check.py --label driver7        # where the eye landmarks sit + closed/open EAR ratio
 ```
 
 Preview-window keys: `q` quit · `i` toggle mock ignition · `r` re-run the pre-drive
@@ -176,7 +177,7 @@ plus how to disable it again for CLI development).
 | GET | `/drivers` | driver roster for the launcher's picker (`id`, `full_name`, `device_id`, `is_enrolled`) |
 | GET | `/drivers/encodings` | face encodings for recognition |
 | GET | `/drivers/{id}/thresholds` | per-driver baselines (incl. `mar_baseline`, `yawn_threshold`) |
-| POST | `/drivers/{id}/enroll` | encoding + baselines |
+| POST | `/drivers/{id}/enroll` | encoding + baselines (incl. `ear_closed_baseline`, see `deploy/BACKEND_CHANGES_2026-09-28.md` item 6) |
 | POST | `/fatigue-events` | monitoring-phase DANGER notification (`phase`, `ignition_on`, `device_id`) |
 | POST | `/assessments` | pre-drive verdict, aggregates and full per-frame `samples` |
 | POST | `/override-requests` | starter stays inhibited; `reason`, `driver_id` (nullable), `assessment_id` |

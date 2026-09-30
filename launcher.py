@@ -209,24 +209,25 @@ class Session:
         runs ``cleanup()``, releasing the camera and resetting GPIO).
         Called again after ``STOP_GRACE_S`` it terminates, then kills.
         """
-        if not self.running:
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
             return
         now = time.time()
         if self._stop_requested_at is None:
             self._stop_requested_at = now
-            logger.info("Stop requested for %s (pid %s)", self.label, self.proc.pid)
+            logger.info("Stop requested for %s (pid %s)", self.label, proc.pid)
             if sys.platform == "win32":
-                self.proc.terminate()     # no SIGINT on Windows (dev only)
+                proc.terminate()          # no SIGINT on Windows (dev only)
             else:
-                self.proc.send_signal(signal.SIGINT)
+                proc.send_signal(signal.SIGINT)
         elif now - self._stop_requested_at > STOP_GRACE_S:
             logger.warning("%s did not exit after SIGINT - terminating", self.label)
-            self.proc.terminate()
+            proc.terminate()
             self._stop_requested_at = now + STOP_GRACE_S   # next escalation = kill
             try:
-                self.proc.wait(timeout=3)
+                proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                proc.kill()
 
     def close(self) -> Optional[int]:
         """Reap the process (if exited) and close the log; returns the exit code."""
@@ -542,18 +543,19 @@ class Launcher:
         if self.session and self.session.running:
             return
         flags = SESSIONS[label] if flags is None else flags
-        self.session = Session(label, flags)
+        session = Session(label, flags)
         try:
-            self.session.start()
+            session.start()
         except OSError as exc:
             logger.exception("Could not start %s", label)
             self.last_result = f"{label}: failed to start ({exc})"
             self.session = None
             self.show_menu()
             return
-        self._show_running()
+        self.session = session
+        self._show_running(session)
 
-    def _show_running(self) -> None:
+    def _show_running(self, session: Session) -> None:
         """Slim bottom strip: what is running + a STOP button."""
         f = self._clear()
         self._show_strip_window()
@@ -561,7 +563,7 @@ class Launcher:
         f.columnconfigure(1, weight=1, minsize=self.px(120))
         f.rowconfigure(0, weight=1)
         self.running_label = tk.Label(
-            f, text=f"{self.session.label} running…  (preview window is main.py)",
+            f, text=f"{session.label} running…  (preview window is main.py)",
             font=self.font_title, bg=BG, fg=FG, anchor="w", padx=self.px(10))
         self.running_label.grid(row=0, column=0, sticky="nsew")
         self._button(f, "■  STOP", self._stop_session, bg=BTN_STOP).grid(
@@ -586,13 +588,14 @@ class Launcher:
         self.show_menu()
 
     def quit(self) -> None:
-        if self.session and self.session.running:
-            self.session.stop()
+        session = self.session
+        if session and session.proc and session.running:
+            session.stop()
             try:
-                self.session.proc.wait(timeout=STOP_GRACE_S)
+                session.proc.wait(timeout=STOP_GRACE_S)
             except subprocess.TimeoutExpired:
-                self.session.proc.kill()
-            self.session.close()
+                session.proc.kill()
+            session.close()
         self.root.destroy()
 
 
