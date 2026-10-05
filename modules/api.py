@@ -203,6 +203,9 @@ class APIClient:
         # Outcome (and HTTP status, None = no response) of the last ping(),
         # so the launcher's 10 s poll logs changes, not every result.
         self._ping_state: Optional[Tuple[bool, Optional[int]]] = None
+        # Why the last save_driver_enrollment() returned False (for the
+        # operator's result screen); None after a success.
+        self.last_enroll_error: Optional[str] = None
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -527,8 +530,10 @@ class APIClient:
             "captured_at": datetime.now(timezone.utc).isoformat(),
         }
         body.update({k: float(v) for k, v in thresholds.items()})
+        self.last_enroll_error = None
         resp = self._request("POST", f"/drivers/{driver_id}/enroll", json=body)
         if resp is None:
+            self.last_enroll_error = f"backend unreachable at {self.base_url}"
             return False
         if resp.status_code in _ENROLL_OK:
             logger.info("Enrollment saved for driver %s", driver_id)
@@ -537,6 +542,8 @@ class APIClient:
             "Enrollment for driver %s rejected: HTTP %s %s",
             driver_id, resp.status_code, resp.text[:200],
         )
+        # For the launcher's result screen (main.py --result-file).
+        self.last_enroll_error = f"HTTP {resp.status_code}: {resp.text[:160]}"
         return False
 
     def push_fatigue_event(

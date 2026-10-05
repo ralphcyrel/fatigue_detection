@@ -44,7 +44,9 @@ on a development machine (cv2.VideoCapture + mocked GPIO / ignition).
 """
 
 import argparse
+import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -67,6 +69,7 @@ from modules.blink import BlinkDetector, MicrosleepDetector
 from modules.calibration import (CLOSED_CAPTURE_ATTEMPTS, EAR_THRESHOLD_RATIO,
                                  MIN_PERCLOS_BASELINE, SELF_SEED_S, CalibrationManager,
                                  ClosedEyeCapture, ear_calibration_problem, finite_or_none)
+from modules.debug_stream import DebugStream, stream_token
 from modules.ear import EARCalculator
 from modules.face_recognition_module import DriverRecognizer
 from modules.head_pose import HeadPoseEstimator
@@ -76,6 +79,9 @@ from modules.mar import MARCalculator
 from modules.perclos import PERCLOSCalculator
 from modules.phase import LockReason, Phase
 from modules.pipeline import HEAD_POSE_RELEASE_HOLD_S, FrameMetrics, HeadPoseDebounce, MetricsPipeline
+from modules.session_display import (FACE_NONE, FACE_OK, FACE_SEARCHING,
+                                     FACE_UNRECOGNISED, GREEN, RED, EnrollState, ScreenState,
+                                     render as render_data_screen, render_enroll)
 
 logger = logging.getLogger("fatigue")
 
@@ -165,6 +171,26 @@ SEED_MIN_SAMPLES: int = 5
 CLOSED_PROMPT_LEAD_S: float = 3.0
 REOPEN_SETTLE_S: float = 2.0
 
+# Enrollment step 1, positioning (before the face capture, so the operator
+# can fine-tune with the debug stream while the panel shows text guidance).
+# The face box must stay inside these limits for ENROLL_POSITION_HOLD_S.
+# Starting values, not yet measured on the rig: dlib's HOG finds faces down
+# to ~80 px at the 0.5 detection scale, i.e. ~0.25 of a 640 px frame, so the
+# floor sits just above that. Each positioning step logs the face size and
+# centre it accepted, for tuning.
+ENROLL_FACE_MIN_W: float = 0.27     # face box width / frame width
+ENROLL_FACE_MAX_W: float = 0.65
+ENROLL_CENTRE_TOL_X: float = 0.15   # |centre - 0.5| as a fraction of the frame
+ENROLL_CENTRE_TOL_Y: float = 0.18
+ENROLL_POSITION_HOLD_S: float = 3.0
+ENROLL_POSITION_TIMEOUT_S: float = 90.0
+# The panel's outline is drawn as a MIRROR seen by the driver (they move to
+# their left, the box moves left), and "move left / right" is worded for the
+# driver. The camera faces the driver, so the left of an unflipped camera
+# image is the driver's RIGHT. Set True only if the camera is configured to
+# flip the image horizontally (Picamera2 does not by default).
+ENROLL_CAMERA_HFLIP: bool = False
+
 # run_enrollment exit codes beyond the original 2 / 3 / 5.
 EXIT_NO_EYELID_CONTRAST: int = 6    # closed-eye check failed; nothing POSTed
 EXIT_CLOSED_EAR_DROPPED: int = 7    # POSTed, but the backend did not keep ear_closed_baseline
@@ -235,11 +261,35 @@ _alert_manager: Optional[AlertManager] = None
 _head_pose: Optional[HeadPoseEstimator] = None
 _ignition: Any = None
 _heartbeat: Optional["Heartbeat"] = None
-# Preview window on. False under --no-preview, or once cv2.imshow has failed
-# (headless); the draw_* / display_text helpers then skip their work too.
+# Display window on. False under --no-preview, or once cv2.imshow has failed
+# (headless).
 _display_available: bool = True
+# What the window shows. "data": the data screen, no camera image - the
+# default for pre-drive and monitoring (group decision 2026-10-05). "enroll":
+# the enrollment screen (face-box outline, guidance, countdown; no camera
+# image either). "video": the annotated camera preview (--show-video, a
+# diagnostic only). "none": --no-preview.
+_display_mode: str = "data"
+_fullscreen: bool = False
+_window_ready: bool = False
+# Bottom px of the data screen left empty for the launcher's STOP strip.
+_reserve_bottom: int = 0
+_screen = ScreenState()
+_enroll = EnrollState()
+_last_screen_draw: float = float("-inf")
+_rate: Optional["LoopRate"] = None
+# Diagnostic MJPEG stream (--debug-stream), else None.
+_stream: Optional[DebugStream] = None
+# Latched per frame in capture_frame(): whether this frame's draw_* calls
+# annotate the camera image (video mode, or the stream wants this frame) and
+# whether present() hands it to the stream. Otherwise the helpers only fill
+# _screen and the frame is never drawn on.
+_annotate_frame: bool = False
+_stream_frame: bool = False
 # LoopProfiler under --profile-loop (monitoring only), else a no-op.
 _profiler: Any = None
+# Outcome of run_enrollment for --result-file (the launcher's result screen).
+_enroll_report: Dict[str, Any] = {}
 
 
 class QuitRequested(Exception):
@@ -347,10 +397,21 @@ class Camera:
 
 
 def capture_frame() -> Optional[np.ndarray]:
-    """Grab one frame from the global camera (Picamera2 or cv2)."""
+    """
+    Grab one frame from the global camera (Picamera2 or cv2).
+
+    Every loop takes its frame through here, so this is also where a new
+    frame's display state starts: the data screen's per-frame fields are
+    cleared and the annotate / stream decision is latched for the frame.
+    """
+    global _annotate_frame, _stream_frame
     if _camera is None:
         return None
-    return _camera.read()
+    frame = _camera.read()
+    _screen.begin_frame()
+    _stream_frame = _stream is not None and _stream.wants_frame()
+    _annotate_frame = _stream_frame or (_display_mode == "video" and _display_available)
+    return frame
 
 
 def next_frame() -> np.ndarray:
@@ -621,10 +682,18 @@ def show_frame(frame: np.ndarray) -> int:
         The key code pressed (``cv2.waitKey`` & 0xFF), or ``-1`` if none /
         headless.
     """
-    global _display_available
+    global _display_available, _window_ready
     if not _display_available:
         return -1
     try:
+        if not _window_ready:
+            # Fullscreen (launcher on the 800x480 panel) needs a resizable
+            # window; otherwise imshow's default autosized window, as before.
+            if _fullscreen:
+                cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+                                      cv2.WINDOW_FULLSCREEN)
+            _window_ready = True
         cv2.imshow(WINDOW_NAME, frame)
         key = cv2.waitKey(1)
         return key & 0xFF if key >= 0 else -1
@@ -635,7 +704,8 @@ def show_frame(frame: np.ndarray) -> int:
             "PREVIEW WINDOW DISABLED for the rest of this run - cv2.imshow failed: %s. "
             "Detection continues headless. If you expected a window: 'not implemented' "
             "means the installed OpenCV has no GUI backend (opencv-python-headless) - "
-            "run `pip uninstall -y opencv-python-headless && pip install opencv-python`; "
+            "run `pip uninstall -y opencv-python-headless && pip install \"opencv-python<4.12\"` "
+            "(see requirements.txt); "
             "otherwise check DISPLAY / that you are on the Pi's desktop, not SSH.",
             detail,
         )
@@ -643,7 +713,8 @@ def show_frame(frame: np.ndarray) -> int:
             "\n" + "=" * 72 + "\n"
             "  !! NO PREVIEW WINDOW - running headless for the rest of this run !!\n"
             f"  cv2.imshow failed: {detail}\n"
-            "  Fix (GUI-less OpenCV):  pip uninstall -y opencv-python-headless && pip install opencv-python\n"
+            "  Fix (GUI-less OpenCV):  pip uninstall -y opencv-python-headless && "
+            "pip install \"opencv-python<4.12\"\n"
             "  Fix (no display):       run from the Pi desktop terminal, or set DISPLAY=:0\n"
             + "=" * 72 + "\n",
             flush=True,
@@ -667,7 +738,7 @@ def present(frame: np.ndarray) -> int:
         with prof.section("api"):
             _heartbeat.tick()
     with prof.section("display"):
-        key = show_frame(frame)
+        key = _display(frame)
     if key == KEY_QUIT:
         raise QuitRequested()
     if key == KEY_IGNITION and _ignition is not None:
@@ -680,10 +751,48 @@ def present(frame: np.ndarray) -> int:
     return key
 
 
+def _display(frame: np.ndarray) -> int:
+    """
+    One frame's worth of display work; returns the key pressed (or -1).
+
+    The (annotated) camera frame goes to the debug stream if it wanted this
+    frame, and to the window only in video mode. In data mode the window
+    gets the data screen instead, redrawn at most ``config.DATA_SCREEN_HZ``;
+    frames in between skip imshow / waitKey entirely.
+    """
+    global _last_screen_draw
+    if _stream_frame and _stream is not None:
+        _stream.offer(frame)
+    if _display_mode == "video":
+        return show_frame(frame)
+    if _display_mode not in ("data", "enroll") or not _display_available:
+        return -1
+    now = time.monotonic()
+    if now - _last_screen_draw < 1.0 / config.DATA_SCREEN_HZ:
+        return -1
+    _last_screen_draw = now
+    if _display_mode == "enroll":
+        canvas = render_enroll(_enroll, config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT,
+                               _reserve_bottom)
+    else:
+        _screen.fps = _rate.fps if _rate is not None else None
+        canvas = render_data_screen(_screen, config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT,
+                                    _reserve_bottom)
+    return show_frame(canvas)
+
+
+def draw_landmarks(frame: np.ndarray, landmarks: np.ndarray) -> None:
+    """The 68 landmark points, in place (eyes yellow) - annotated view only."""
+    for idx, (x, y) in enumerate(landmarks):
+        color = (0, 255, 255) if 36 <= idx < 48 else (255, 255, 255)
+        cv2.circle(frame, (int(x), int(y)), 1, color, -1)
+
+
 def draw_banner(frame: np.ndarray, text: str, color: tuple = WHITE) -> None:
     """Bottom strip with the phase / status text, drawn in place."""
-    if not _display_available:
-        return  # no preview: nobody sees the annotation
+    _screen.phase, _screen.phase_color = text, color
+    if not _annotate_frame:
+        return  # nobody sees the camera image this frame
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, h - 30), (w, h), (0, 0, 0), -1)
     cv2.putText(frame, text, (10, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
@@ -694,20 +803,37 @@ def draw_overlay(
     driver: Optional[Dict[str, Any]],
     m: FrameMetrics,
     fps: Optional[float] = None,
+    pipeline: Optional[MetricsPipeline] = None,
+    thresholds: Optional[Dict[str, float]] = None,
+    landmarks: Optional[np.ndarray] = None,
+    calibrated: bool = True,
 ) -> None:
     """
     Annotate ``frame`` in place with driver name, FRS, level, EAR, PERCLOS,
     MAR / yawn state, relay state, measured loop rate and head pose, plus a
-    MICROSLEEP banner while that override is active.
+    MICROSLEEP banner while that override is active - and fill the data
+    screen with the same numbers next to the driver's baselines.
+
+    Call it after every other use of ``frame`` (recognition must never see
+    the drawn landmarks).
 
     Args:
         frame: BGR frame to draw on.
         driver: Dict from ``DriverRecognizer.identify()`` (may be ``None``).
         m: Pipeline output for this frame.
         fps: Last measured loop rate, or ``None`` before the first sample.
+        pipeline: The pipeline that produced ``m`` (data screen: blink
+            window, self-seeded EAR baseline).
+        thresholds: The baselines ``m`` was scored against (data screen).
+        landmarks: Drawn on the annotated view when given.
+        calibrated: ``thresholds`` are the driver's own calibration (else
+            population defaults / a self-seeded EAR baseline).
     """
-    if not _display_available:
-        return  # no preview: nobody sees the annotation
+    _fill_screen(driver, m, pipeline, thresholds, calibrated)
+    if not _annotate_frame:
+        return  # nobody sees the camera image this frame
+    if landmarks is not None:
+        draw_landmarks(frame, landmarks)
     level = m.level
     color = LEVEL_BGR.get(level, WHITE)
     name = driver["name"] if driver else "Unknown"
@@ -774,6 +900,43 @@ def draw_overlay(
                     (12, banner_y), font, 0.95, (0, 0, 255), 2, cv2.LINE_AA)
 
 
+def _fill_screen(
+    driver: Optional[Dict[str, Any]],
+    m: FrameMetrics,
+    pipeline: Optional[MetricsPipeline],
+    thresholds: Optional[Dict[str, float]],
+    calibrated: bool,
+) -> None:
+    """Copy one scored frame onto the data screen. Reads only; changes nothing."""
+    s = _screen
+    s.baseline_label = "baseline" if calibrated else "defaults"
+    s.level = m.level
+    s.frs = m.frs if m.scored else None
+    s.frs_note = ("no EAR baseline" if m.seed_failed
+                  else "learning EAR baseline" if not m.scored else "")
+    s.ear, s.mar, s.perclos = m.ear, m.mar, m.perclos
+    if m.pose is not None:
+        s.yaw, s.pitch = float(m.pose["yaw"]), float(m.pose["pitch"])
+    if driver:
+        s.driver_name = str(driver["name"])
+    s.face = FACE_OK if driver else FACE_UNRECOGNISED
+    if m.microsleep_override:
+        closed_s = float(m.microsleep_status.get("closed_s", 0.0))
+        s.alert_banner = f"MICROSLEEP {closed_s:.1f}s" if closed_s > 0 else "MICROSLEEP"
+    elif m.overridden:
+        s.alert_banner = m.override_reason.upper()
+    if pipeline is not None:
+        # Display units only: the blink count is over the pipeline's window
+        # (30 s in pre-drive); the calibrated baseline is per 60 s.
+        s.blink_per_min = m.blink_freq * 60.0 / pipeline.blink_window_s
+    if thresholds is not None:
+        s.ear_base = (finite_or_none(thresholds.get("ear_baseline"))
+                      or (pipeline.ear_seed.baseline if pipeline is not None else None))
+        s.mar_base = finite_or_none(thresholds.get("mar_baseline"))
+        s.perclos_base = finite_or_none(thresholds.get("perclos_baseline"))
+        s.blink_base_per_min = finite_or_none(thresholds.get("blink_frequency_baseline"))
+
+
 def draw_pose_debug(
     frame: np.ndarray,
     debounce: HeadPoseDebounce,
@@ -792,8 +955,8 @@ def draw_pose_debug(
         fps: Last measured loop rate (shown so the rate is visible on the
             NO FACE / UNKNOWN DRIVER frames, which have no main overlay).
     """
-    if not _display_available:
-        return  # no preview: nobody sees the annotation
+    if not _annotate_frame:
+        return  # nobody sees the camera image this frame
     font = cv2.FONT_HERSHEY_SIMPLEX
     y0 = 135
     cv2.rectangle(frame, (0, y0), (frame.shape[1], y0 + 48), (30, 30, 30), -1)
@@ -837,8 +1000,9 @@ def display_text(frame: np.ndarray, text: str, color: tuple = (0, 0, 255), dy: i
         color: BGR colour.
         dy: Vertical offset from centre (for a second line).
     """
-    if not _display_available:
-        return  # no preview: nobody sees the annotation
+    _screen.status.append((text, color))   # data screen: in call order
+    if not _annotate_frame:
+        return  # nobody sees the camera image this frame
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale, thickness = 1.0, 2
     (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
@@ -866,6 +1030,8 @@ def cleanup() -> None:
         _alert_manager.cleanup()
     if _ignition is not None:
         _ignition.cleanup()
+    if _stream is not None:
+        _stream.close()
     try:
         cv2.destroyAllWindows()
     except cv2.error:
@@ -877,6 +1043,216 @@ def cleanup() -> None:
 # Enrollment mode
 # ---------------------------------------------------------------------------
 
+def _enroll_result(code: int, outcome: str, message: str, **detail: Any) -> int:
+    """
+    Record how the enrollment ended (for ``--result-file``) and return ``code``.
+
+    ``outcome`` is what the launcher's result screen keys on: ``saved``,
+    ``saved_unverified``, ``dropped`` (saved without ear_closed_baseline),
+    ``refused`` (nothing sent: closed-eye check / contrast / too few face
+    frames), ``rejected`` (backend refused or unreachable), ``bad_driver``.
+    """
+    name = _enroll_report.get("driver_name")
+    _enroll_report.clear()
+    _enroll_report.update(exit_code=code, outcome=outcome, message=message, **detail)
+    if name and "driver_name" not in detail:
+        _enroll_report["driver_name"] = name
+    return code
+
+
+def write_enroll_result(path: str, driver_id: Optional[int], exit_code: int,
+                        interrupted: bool) -> None:
+    """Write the enrollment outcome as JSON (atomically) for the launcher."""
+    report = dict(_enroll_report)
+    if "outcome" not in report:
+        report.update(
+            exit_code=exit_code,
+            outcome="stopped" if interrupted else "error",
+            message=("Enrollment stopped before it finished - nothing was saved."
+                     if interrupted else
+                     "Enrollment crashed - see logs/session.log. Nothing was saved."),
+        )
+    report.setdefault("driver_id", driver_id)
+    report["device_id"] = config.DEVICE_ID
+    report["api_base_url"] = config.API_BASE_URL
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.error("Could not write enrollment result to %s: %s", path, exc)
+
+Box = Tuple[int, int, int, int]       # (left, top, right, bottom), frame pixels
+
+
+def rect_box(rect: Any) -> Optional[Box]:
+    """A dlib rectangle as a ``Box`` (``None`` stays ``None``)."""
+    if rect is None:
+        return None
+    return int(rect.left()), int(rect.top()), int(rect.right()), int(rect.bottom())
+
+
+def guide_zone() -> Tuple[float, float, float, float]:
+    """Where the face centre may sit, normalised (symmetric, so mirroring is moot)."""
+    return (0.5 - ENROLL_CENTRE_TOL_X, 0.5 - ENROLL_CENTRE_TOL_Y,
+            0.5 + ENROLL_CENTRE_TOL_X, 0.5 + ENROLL_CENTRE_TOL_Y)
+
+
+def mirror_x(x: float) -> float:
+    """Normalised camera-image x -> x in the driver's mirror view."""
+    return x if ENROLL_CAMERA_HFLIP else 1.0 - x
+
+
+def position_guidance(box: Optional[Box], frame_w: int, frame_h: int) -> Tuple[bool, str]:
+    """
+    Whether the face box is in position, and what to tell the driver if not.
+
+    Size first (distance is the coarse adjustment), then left / right, then
+    up / down. Left / right are the driver's own (see ``ENROLL_CAMERA_HFLIP``).
+    """
+    if box is None:
+        return False, "Face the camera"
+    left, top, right, bottom = box
+    width = (right - left) / frame_w
+    cx = (left + right) / 2 / frame_w
+    cy = (top + bottom) / 2 / frame_h
+    if width < ENROLL_FACE_MIN_W:
+        return False, "Move closer to the camera"
+    if width > ENROLL_FACE_MAX_W:
+        return False, "Move back from the camera"
+    # In the mirror view, a box left of centre is a driver sitting too far
+    # to their own left.
+    mx = mirror_x(cx)
+    if mx < 0.5 - ENROLL_CENTRE_TOL_X:
+        return False, "Move to your right"
+    if mx > 0.5 + ENROLL_CENTRE_TOL_X:
+        return False, "Move to your left"
+    if cy < 0.5 - ENROLL_CENTRE_TOL_Y:
+        return False, "Move down (sit lower or tilt the camera up)"
+    if cy > 0.5 + ENROLL_CENTRE_TOL_Y:
+        return False, "Move up (sit higher or tilt the camera down)"
+    return True, "Good - hold still"
+
+
+def enroll_view(
+    frame: np.ndarray,
+    step: str,
+    instruction: str,
+    *,
+    color: tuple = (255, 255, 255),
+    detail: str = "",
+    note: str = "",
+    box: Optional[Box] = None,
+    face: Optional[bool] = None,
+    box_ok: bool = False,
+    outline: bool = True,
+    progress: Optional[float] = None,
+    progress_label: str = "",
+    countdown: Optional[float] = None,
+    countdown_label: str = "",
+    landmarks: Optional[np.ndarray] = None,
+) -> None:
+    """
+    One enrollment frame: fill the panel's enrollment screen, and - only when
+    the debug stream wants this frame (or under --show-video) - annotate the
+    camera frame with the same guidance, the face box and the landmarks.
+
+    ``face``: True face found, False no face, None not looked for this step.
+    Call after every other use of ``frame``.
+    """
+    global _enroll
+    if _rate is not None:
+        _rate.tick()
+    h, w = frame.shape[:2]
+    norm = None
+    if box is not None:
+        x0, x1 = sorted((mirror_x(box[0] / w), mirror_x(box[2] / w)))
+        norm = (x0, box[1] / h, x1, box[3] / h)
+    if face is None:
+        face_text, face_color = "CAMERA: not checked in this step", (150, 150, 150)
+    elif face:
+        face_text, face_color = "FACE DETECTED", GREEN
+    else:
+        face_text, face_color = "NO FACE - operator: check camera aim on the video stream", RED
+    _enroll = EnrollState(
+        driver_name=_enroll_report.get("driver_name"), step=step, instruction=instruction,
+        instruction_color=color, detail=detail, note=note, face_text=face_text,
+        face_color=face_color, box=norm, box_ok=box_ok,
+        guide=guide_zone() if outline else None, progress=progress,
+        progress_label=progress_label, countdown=countdown, countdown_label=countdown_label,
+        fps=_rate.fps if _rate is not None else None,
+    )
+    if not _annotate_frame:
+        return  # nobody sees the camera image this frame
+    if outline:
+        gx0, gy0, gx1, gy1 = guide_zone()
+        cv2.rectangle(frame, (int(gx0 * w), int(gy0 * h)), (int(gx1 * w), int(gy1 * h)),
+                      (120, 120, 120), 1)
+    if box is not None:
+        cv2.rectangle(frame, box[:2], box[2:], (0, 200, 0) if box_ok else (0, 200, 255), 2)
+    if landmarks is not None:
+        draw_landmarks(frame, landmarks)
+    display_text(frame, instruction, color)
+    if countdown is not None:
+        display_text(frame, f"{countdown:.1f}s", color, dy=40)
+    elif progress is not None:
+        display_text(frame, f"{progress_label}", (200, 200, 200), dy=40)
+    draw_banner(frame, step, (0, 200, 255))
+
+
+def run_positioning(extractor: LandmarkExtractor) -> Optional[Box]:
+    """
+    Enrollment step 1: guide the driver until the face box has been in
+    position for ``ENROLL_POSITION_HOLD_S`` (returns the last box), or give
+    up after ``ENROLL_POSITION_TIMEOUT_S`` (returns ``None``).
+
+    Uses the landmark extractor's face detection (~30 ms a frame on the Pi),
+    not face_recognition (~1 s a frame), so the debug stream stays fluid
+    while the operator fine-tunes the camera and seat.
+    """
+    step = "Step 1 of 4 - Position"
+    start = time.monotonic()
+    held_since: Optional[float] = None
+    last_text = ""
+    while True:
+        now = time.monotonic()
+        if now - start > ENROLL_POSITION_TIMEOUT_S:
+            logger.error("Positioning: face not held in position within %.0f s",
+                         ENROLL_POSITION_TIMEOUT_S)
+            return None
+        frame = capture_frame()
+        if frame is None:
+            continue
+        h, w = frame.shape[:2]
+        _landmarks, rect = extractor.extract(frame)
+        box = rect_box(rect)
+        ok, text = position_guidance(box, w, h)
+        if text != last_text:
+            if box is not None:
+                logger.info("Positioning: %s (face width %.2f of frame, centre %.2f / %.2f)",
+                            text, (box[2] - box[0]) / w, (box[0] + box[2]) / 2 / w,
+                            (box[1] + box[3]) / 2 / h)
+            else:
+                logger.info("Positioning: no face")
+            last_text = text
+        held_since = (held_since or now) if ok else None
+        held = now - held_since if held_since is not None else 0.0
+        if held >= ENROLL_POSITION_HOLD_S:
+            logger.info("Positioning: accepted after %.1f s (face width %.2f of frame)",
+                        now - start, (box[2] - box[0]) / w)
+            return box
+        enroll_view(
+            frame, step, text, color=GREEN if ok else (0, 200, 255),
+            detail="Sit as you will drive and look straight at the camera. "
+                   "Operator: fine-tune on the video stream.",
+            box=box, face=box is not None, box_ok=ok,
+            progress=held / ENROLL_POSITION_HOLD_S,
+            progress_label=f"Holding position {held:.1f} / {ENROLL_POSITION_HOLD_S:.0f} s",
+        )
+        present(frame)
+
+
 def run_enrollment(
     api_client: APIClient, extractor: LandmarkExtractor, driver_id: Optional[int] = None
 ) -> int:
@@ -886,6 +1262,8 @@ def run_enrollment(
     Steps:
     1. Ask for the driver's DB id on the terminal (skipped when ``driver_id``
        is supplied, e.g. via ``--driver-id`` from the touchscreen launcher).
+    1b. Positioning (:func:`run_positioning`): text guidance and a face-box
+       outline on the panel until the face holds in position.
     2. Capture ``ENROLL_FRAMES`` frames containing a face and average their
        128-d encodings (averaging is more robust than a single frame).
     3. Settle for ``SEED_WINDOW_S`` to derive a personal closure threshold
@@ -921,11 +1299,44 @@ def run_enrollment(
             driver_id = int(raw)
         except ValueError:
             logger.error("Invalid driver_id %r - must be an integer", raw)
-            return 2
-    logger.info("Enrolling driver %s", driver_id)
+            return _enroll_result(2, "bad_driver", f"Invalid driver id {raw!r}.")
 
-    # ---- 1. Face encoding ------------------------------------------------
+    # The driver must exist on the backend, and the backend must answer -
+    # checked before the driver sits through ~90 s of capture that could
+    # only end in a failed POST. Also logs whose record this will write.
+    token_state = "set" if api_client.token else "NOT SET"
+    roster = api_client.get_drivers()
+    if roster is None:
+        logger.error("ENROLLMENT NOT STARTED: cannot read GET /drivers from %s - backend "
+                     "unreachable or refusing this unit (API token %s)",
+                     api_client.base_url, token_state)
+        return _enroll_result(
+            5, "rejected",
+            f"Backend not reachable at {api_client.base_url} (API token {token_state}). "
+            "Nothing was captured.")
+    record = next((d for d in roster if str(d.get("id")) == str(driver_id)), None)
+    if record is None:
+        logger.error("ENROLLMENT NOT STARTED: no driver with id %s on %s (%d drivers listed)",
+                     driver_id, api_client.base_url, len(roster))
+        return _enroll_result(2, "bad_driver",
+                              f"No driver with id {driver_id} on {api_client.base_url}.")
+    driver_name = str(record.get("full_name") or f"Driver {driver_id}")
+    _enroll_report["driver_name"] = driver_name
+    logger.info("Enrolling driver %s (%s) on %s, API token %s",
+                driver_id, driver_name, api_client.base_url, token_state)
+
+    # ---- 1. Positioning ---------------------------------------------------
+    logger.info("Positioning: guiding the driver into frame (hold %.0f s, timeout %.0f s)",
+                ENROLL_POSITION_HOLD_S, ENROLL_POSITION_TIMEOUT_S)
+    if run_positioning(extractor) is None:
+        return _enroll_result(
+            3, "refused", f"The face did not stay in position for {ENROLL_POSITION_HOLD_S:.0f} s "
+            f"within {ENROLL_POSITION_TIMEOUT_S:.0f} s - check camera aim and seat position "
+            "(video stream). Nothing was captured.")
+
+    # ---- 2. Face encoding ------------------------------------------------
     logger.info("Look at the camera. Capturing %d frames for the face encoding...", ENROLL_FRAMES)
+    step = "Step 2 of 4 - Face capture"
     encodings = []
     attempts = 0
     while len(encodings) < ENROLL_FRAMES and attempts < ENROLL_FRAMES * 10:
@@ -935,8 +1346,12 @@ def run_enrollment(
             continue
         rgb = np.ascontiguousarray(frame[:, :, ::-1])
         locations = face_recognition.face_locations(rgb, model="hog")
+        progress = len(encodings) / ENROLL_FRAMES
+        label = f"Face capture {len(encodings)} / {ENROLL_FRAMES}"
         if not locations:
-            display_text(frame, "NO FACE DETECTED")
+            enroll_view(frame, step, "Face the camera", color=(0, 200, 255),
+                        detail="The face was lost - look straight at the camera.",
+                        face=False, progress=progress, progress_label=label)
             present(frame)
             continue
         # Use only the largest face in case someone is visible in the background.
@@ -944,16 +1359,23 @@ def run_enrollment(
         enc = face_recognition.face_encodings(rgb, [largest])
         if enc:
             encodings.append(enc[0])
-        display_text(frame, f"ENCODING {len(encodings)}/{ENROLL_FRAMES}")
+        top, right, bottom, left = largest
+        enroll_view(frame, step, "Look at the camera and hold still",
+                    detail="Capturing the face for recognition.",
+                    box=(left, top, right, bottom), face=True, box_ok=True,
+                    progress=len(encodings) / ENROLL_FRAMES,
+                    progress_label=f"Face capture {len(encodings)} / {ENROLL_FRAMES}")
         present(frame)
 
     if len(encodings) < ENROLL_FRAMES // 2:
         logger.error("Only %d usable face frames captured - aborting enrollment", len(encodings))
-        return 3
+        return _enroll_result(
+            3, "refused", f"Only {len(encodings)} of {ENROLL_FRAMES} face frames captured - "
+            "check camera aim and lighting. Nothing was saved.")
     face_encoding = np.mean(np.stack(encodings), axis=0)
     logger.info("Face encoding computed from %d frames", len(encodings))
 
-    # ---- 2. Calibration ---------------------------------------------------
+    # ---- 3. Calibration ---------------------------------------------------
     ear_calc = EARCalculator()
     mar_calc = MARCalculator()
     blink_detector = BlinkDetector(frequency_window=60)
@@ -975,13 +1397,16 @@ def run_enrollment(
         frame = capture_frame()
         if frame is None:
             continue
-        landmarks, _ = extractor.extract(frame)
+        landmarks, rect = extractor.extract(frame)
         if landmarks is None:
-            display_text(frame, "FACE LOST - please look at the camera")
+            enroll_view(frame, "Step 3 of 4 - Closed eyes", "Face the camera",
+                        color=(0, 200, 255), face=False)
             present(frame)
             continue
         ear_history.append(ear_calc.compute_average_ear(landmarks))
-        display_text(frame, "SETTLING - look at the road")
+        enroll_view(frame, "Step 3 of 4 - Closed eyes", "Look at the road, eyes open",
+                    detail="Measuring your open eyes first.", box=rect_box(rect), face=True,
+                    box_ok=True, landmarks=landmarks)
         present(frame)
     open_reference = float(np.median(ear_history))
     threshold = open_reference * EAR_THRESHOLD_RATIO
@@ -996,26 +1421,40 @@ def run_enrollment(
                      "not tracking their eyelids: check lighting and camera position, and run "
                      "tools/eye_check.py to see where the eye landmarks sit.",
                      driver_id, len(closed_attempts))
-        return EXIT_NO_EYELID_CONTRAST
+        reasons = "; ".join(f"#{a['attempt']}: {a['reason']}" for a in closed_attempts)
+        return _enroll_result(
+            EXIT_NO_EYELID_CONTRAST, "refused",
+            f"Closed-eye check failed {len(closed_attempts)} times - nothing was saved. "
+            "Either the eyes were not shut, or the landmarks do not follow the eyelids "
+            "(check lighting / camera; tools/eye_check.py).", reasons=reasons)
     settle_start = time.time()
     while time.time() - settle_start < REOPEN_SETTLE_S:
         frame = capture_frame()
         if frame is None:
             continue
-        display_text(frame, "OPEN YOUR EYES - look at the road")
+        enroll_view(frame, "Step 3 of 4 - Closed eyes", "OPEN YOUR EYES", color=GREEN,
+                    detail="Closed-eye check passed. Look at the road.", outline=False,
+                    countdown=REOPEN_SETTLE_S - (time.time() - settle_start),
+                    countdown_label="calibration starts in")
         present(frame)
 
     logger.info("Starting %d s calibration - stay alert, look at the road and keep "
                 "your mouth relaxed (talking inflates the MAR baseline).",
                 config.CALIBRATION_DURATION)
     calib.start()
+    step = "Step 4 of 4 - Calibration"
+    calib_detail = ("Stay alert, look at the road as when driving, keep your mouth relaxed "
+                    "and do not talk.")
+    status = {"progress": 0.0, "seconds_remaining": config.CALIBRATION_DURATION}
     while calib.is_calibrating:
         frame = capture_frame()
         if frame is None:
             continue
-        landmarks, _ = extractor.extract(frame)
+        landmarks, rect = extractor.extract(frame)
         if landmarks is None:
-            display_text(frame, "FACE LOST - please look at the camera")
+            enroll_view(frame, step, "Face the camera", color=(0, 200, 255), detail=calib_detail,
+                        face=False, progress=status["progress"],
+                        progress_label=f"Calibration - {status['seconds_remaining']} s left")
             present(frame)
             continue
 
@@ -1046,8 +1485,9 @@ def run_enrollment(
             microsleep_ms=ms_event["duration_ms"] if ms_event else None,
         )
 
-        display_text(frame, f"CALIBRATING {status['progress'] * 100:.0f}%  "
-                            f"({status['seconds_remaining']}s left)")
+        enroll_view(frame, step, "Look at the road", detail=calib_detail, box=rect_box(rect),
+                    face=True, box_ok=True, landmarks=landmarks, progress=status["progress"],
+                    progress_label=f"Calibration - {status['seconds_remaining']} s left")
         present(frame)
 
     baselines = calib.compute_baselines()
@@ -1073,34 +1513,48 @@ def run_enrollment(
     if problem is not None:
         logger.error("ENROLLMENT REFUSED for driver %s: %s. Nothing was sent to the backend; "
                      "re-run the enrollment.", driver_id, problem)
-        return EXIT_NO_EYELID_CONTRAST
+        return _enroll_result(EXIT_NO_EYELID_CONTRAST, "refused",
+                              "Calibration refused - nothing was sent to the backend. "
+                              "Re-run the enrollment.", reasons=str(problem))
     logger.info("Closed-eye contrast %.2f (closed %.4f / ear_baseline %.4f)",
                 baselines["ear_closed_baseline"] / baselines["ear_baseline"],
                 baselines["ear_closed_baseline"], baselines["ear_baseline"])
 
-    # ---- 3. Persist ---------------------------------------------------------
+    # ---- 4. Persist ---------------------------------------------------------
     ok = api_client.save_driver_enrollment(driver_id, face_encoding.tolist(), baselines)
     if not ok:
         logger.error("Backend rejected enrollment for driver %s", driver_id)
-        return 5
+        return _enroll_result(5, "rejected", "The backend did not save the enrollment.",
+                              reasons=api_client.last_enroll_error or "")
     # A Laravel FormRequest drops fields it does not validate, silently: the
     # record would come back without ear_closed_baseline and be treated as a
     # pre-2026-09-30 record (no contrast check). Read it back to be sure.
     stored = api_client.get_driver_calibration(driver_id)
+    contrast = round(baselines["ear_closed_baseline"] / baselines["ear_baseline"], 2)
+    numbers = {k: round(float(baselines[k]), 4) for k in
+               ("ear_baseline", "ear_closed_baseline", "mar_baseline") if k in baselines}
     if stored is None:
         logger.warning("Enrollment saved, but the calibration could not be read back to confirm "
                        "ear_closed_baseline was stored")
-    elif "ear_closed_baseline" not in stored.thresholds:
+        return _enroll_result(
+            0, "saved_unverified", "Saved, but the record could not be read back to confirm "
+            "the closed-eye baseline was stored.", contrast=contrast, baselines=numbers)
+    if "ear_closed_baseline" not in stored.thresholds:
         logger.error("Enrollment saved, but the backend DROPPED ear_closed_baseline: this "
                      "driver's record has no contrast check and will be treated as a legacy "
                      "record. Deploy the backend change (deploy/BACKEND_CHANGES_2026-09-28.md, "
                      "item 6) and re-enrol.")
-        return EXIT_CLOSED_EAR_DROPPED
+        return _enroll_result(
+            EXIT_CLOSED_EAR_DROPPED, "dropped",
+            "Saved, but the backend DROPPED the closed-eye baseline: this record has no "
+            "contrast check. Deploy backend item 6 (deploy/BACKEND_CHANGES_2026-09-28.md) "
+            "and re-enrol.", baselines=numbers)
 
     msg = f"Enrollment complete for driver {driver_id}"
     logger.info(msg)
     print(msg)
-    return 0
+    return _enroll_result(0, "saved", f"Enrollment saved for {driver_name}.",
+                          contrast=contrast, baselines=numbers)
 
 
 def run_closed_eye_capture(
@@ -1131,6 +1585,8 @@ def run_closed_eye_capture(
             threading.Thread(target=_alert_manager.trigger_buzzer, args=(pattern,),
                              daemon=True).start()
 
+    step = "Step 3 of 4 - Closed eyes"
+    note = ""
     for attempt in range(1, CLOSED_CAPTURE_ATTEMPTS + 1):
         capture = ClosedEyeCapture()
         logger.info("Closed-eye capture %d/%d: tell the driver to close their eyes on the beep "
@@ -1142,8 +1598,13 @@ def run_closed_eye_capture(
             if frame is None:
                 continue
             remaining = CLOSED_PROMPT_LEAD_S - (time.time() - lead_start)
-            display_text(frame, f"CLOSE YOUR EYES in {remaining:.0f}s - keep them shut "
-                                f"until the long beep")
+            enroll_view(frame, f"{step} (attempt {attempt} of {CLOSED_CAPTURE_ATTEMPTS})",
+                        "CLOSE YOUR EYES on the beep", color=(0, 200, 255),
+                        detail=f"Keep them shut until the long beep (about "
+                               f"{capture.duration_s:.0f} s). Operator: say \"open\" "
+                               "at the long beep.",
+                        note=note, outline=False, countdown=remaining,
+                        countdown_label="beep in")
             present(frame)
 
         capture.start(time.time())
@@ -1152,12 +1613,17 @@ def run_closed_eye_capture(
             frame = capture_frame()
             if frame is None:
                 continue
-            landmarks, _ = extractor.extract(frame)
+            landmarks, rect = extractor.extract(frame)
             if landmarks is not None:
                 capture.update(ear_calc.compute_average_ear(landmarks), time.time())
-                display_text(frame, "EYES CLOSED - keep them shut")
-            else:
-                display_text(frame, "FACE LOST - keep facing the camera, eyes shut")
+            enroll_view(frame, f"{step} (attempt {attempt} of {CLOSED_CAPTURE_ATTEMPTS})",
+                        "EYES CLOSED - keep them shut", color=(0, 0, 255),
+                        detail="" if landmarks is not None else
+                        "Face lost - keep facing the camera, eyes shut.",
+                        face=landmarks is not None, outline=False,
+                        countdown=max(0.0, capture.duration_s - capture.elapsed(time.time())),
+                        countdown_label="until the long beep", box=rect_box(rect),
+                        landmarks=landmarks)
             present(frame)
         beep("long")
 
@@ -1174,6 +1640,7 @@ def run_closed_eye_capture(
                        attempt, CLOSED_CAPTURE_ATTEMPTS, reason,
                        "n/a" if capture.closed_ear is None else f"{capture.closed_ear:.4f}",
                        open_reference)
+        note = f"Attempt {attempt} did not pass: {reason}. Close the eyes fully this time."
     return None, attempts
 
 
@@ -1442,6 +1909,13 @@ def identify_driver_bounded(
                             match["name"], did, match["confidence"], counts[did])
                 return match
         seen = counts.get(int(best["driver_id"]), 0) if best else 0
+        faces = recognizer.last_face_count
+        if faces is not None:
+            _screen.face = FACE_NONE if faces == 0 else FACE_SEARCHING
+            _screen.face_detail = "" if faces == 0 else (
+                f"{counts[int(match['driver_id'])]}/{matches_required}" if match
+                else "- no match yet")
+        _screen.countdown = max(0.0, deadline - time.monotonic())
         display_text(frame, f"IDENTIFYING {seen}/{matches_required}", WHITE)
         display_text(frame, f"{max(0.0, deadline - time.monotonic()):.0f}s left", GREY, dy=40)
         draw_banner(frame, "PRE-DRIVE  |  starter LOCKED  |  identifying driver", (0, 220, 255))
@@ -1616,6 +2090,7 @@ def run_predrive_assessment(
     # with 'r' after a pass (set_phase is a no-op when already in PREDRIVE).
     alert_manager.lock_relay()
     alert_manager.set_alert_level("ALERT")
+    _screen.reset_session()
     logger.info("=== PRE-DRIVE phase (ignition OFF) - starter %s ===",
                 alert_manager.get_relay_state())
 
@@ -1634,6 +2109,7 @@ def run_predrive_assessment(
             lock_reason = LockReason.DRIVER_NOT_RECOGNIZED
         else:
             driver_id = int(driver["driver_id"])
+            _screen.driver_name = str(driver["name"])
             # 3. Calibration - this driver's own, captured on this unit, or
             # lock. One captured on another unit is never allowed to release
             # the starter (fail-secure: a baseline that reads low passes a
@@ -1691,6 +2167,8 @@ def run_predrive_assessment(
                     verdict = pipeline.note_no_face(now, now_mono)
                     assessment.add_no_face(now)
                     alert_manager.set_alert_level(verdict.level)
+                    _screen.face, _screen.level, _screen.countdown = (FACE_NONE, verdict.level,
+                                                                      remaining)
                     display_text(frame, "NO FACE")
                     draw_banner(frame, banner, (0, 220, 255))
                     if debug_pose:
@@ -1703,7 +2181,8 @@ def run_predrive_assessment(
                 # LEDs / buzzer give the driver feedback; the relay is decided
                 # once, below, on the aggregate - never per frame.
                 alert_manager.set_alert_level(m.level)
-                draw_overlay(frame, driver, m, fps)
+                _screen.countdown = remaining
+                draw_overlay(frame, driver, m, fps, pipeline, thresholds, landmarks)
                 draw_banner(frame, banner, (0, 220, 255))
                 if debug_pose:
                     draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
@@ -1848,6 +2327,7 @@ def run_monitoring(
     global _profiler
     alert_manager.set_phase(Phase.MONITORING)
     alert_manager.set_alert_level("ALERT")
+    _screen.reset_session()
     logger.info("=== MONITORING phase (%s) - starter %s, lock refused ===",
                 "entered from pre-drive release" if from_release else "ignition ON",
                 alert_manager.get_relay_state())
@@ -1942,6 +2422,10 @@ def run_monitoring(
                 with prof.section("api"):
                     seed_fault.refresh_elapsed(api_client, now_mono)
             with prof.section("display"):
+                _screen.face, _screen.face_detail = FACE_NONE, f"{verdict.gap_s:.1f}s"
+                _screen.level = verdict.level
+                if driver:
+                    _screen.driver_name = str(driver["name"])
                 display_text(frame, f"NO FACE {verdict.gap_s:.1f}s  [{verdict.band}]",
                              LEVEL_BGR.get(verdict.level, WHITE))
                 draw_banner(frame, banner, banner_color)
@@ -2088,7 +2572,8 @@ def run_monitoring(
             last_danger_push = now
 
         with prof.section("display"):
-            draw_overlay(frame, driver, m, fps)
+            draw_overlay(frame, driver, m, fps, pipeline, thresholds, landmarks,
+                         calibrated=calibration is not None)
             draw_banner(frame, banner, banner_color)
             if debug_pose:
                 draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
@@ -2147,9 +2632,34 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-preview", action="store_true",
-        help="no OpenCV preview window and no frame annotation (demos / data collection; "
-             "~11%% of monitoring frame time). Keys q / i / r are then unavailable - stop "
-             "with Ctrl-C or the launcher's STOP",
+        help="no window at all - neither the data screen nor video (unattended data "
+             "collection). Keys q / i / r are then unavailable - stop with Ctrl-C or the "
+             "launcher's STOP",
+    )
+    parser.add_argument(
+        "--show-video", action="store_true",
+        help="DIAGNOSTIC: show the annotated camera image in the window instead of the data "
+             "screen (camera aim / landmark problems). Off by default: the in-vehicle "
+             "display does not show the driver's face",
+    )
+    parser.add_argument(
+        "--debug-stream", type=int, nargs="?", const=config.DEBUG_STREAM_PORT, default=None,
+        metavar="PORT",
+        help="DIAGNOSTIC: serve the annotated camera view as MJPEG on the LAN "
+             f"(default port {config.DEBUG_STREAM_PORT}); open the logged URL in a browser. "
+             "Never recorded",
+    )
+    parser.add_argument(
+        "--fullscreen", action="store_true",
+        help="fullscreen window (the touchscreen launcher passes this)",
+    )
+    parser.add_argument(
+        "--reserve-bottom", type=int, default=0, metavar="PX",
+        help="leave PX at the bottom of the data screen empty (the launcher's STOP strip)",
+    )
+    parser.add_argument(
+        "--result-file", default=None, metavar="PATH",
+        help="with --enroll: write the outcome as JSON to PATH (used by launcher.py)",
     )
     parser.add_argument(
         "--debug-pose", action="store_true",
@@ -2169,6 +2679,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.driver_id is not None and not args.enroll:
         parser.error("--driver-id only makes sense with --enroll")
+    if args.result_file is not None and not args.enroll:
+        parser.error("--result-file only makes sense with --enroll")
+    if args.show_video and args.no_preview:
+        parser.error("--show-video and --no-preview contradict each other")
     if args.sequence and (args.force_phase or args.enroll):
         parser.error("--sequence cannot be combined with --force-phase or --enroll")
     if args.profile_loop is not None and args.profile_loop <= 0:
@@ -2188,14 +2702,42 @@ def main(argv: Optional[list] = None) -> int:
         Process exit code.
     """
     global _camera, _alert_manager, _head_pose, _ignition, _heartbeat, _display_available
+    global _display_mode, _fullscreen, _reserve_bottom, _stream, _rate
 
     args = parse_args(argv)
     setup_logging()
+    _fullscreen, _reserve_bottom = args.fullscreen, max(0, args.reserve_bottom)
     if args.no_preview:
         _display_available = False
-        logger.info("Preview window OFF (--no-preview) - stop with Ctrl-C or the launcher")
+        _display_mode = "none"
+        logger.info("Display window OFF (--no-preview) - stop with Ctrl-C or the launcher")
+    elif args.show_video:
+        _display_mode = "video"
+        logger.warning("--show-video: the window shows the CAMERA IMAGE (diagnostic). "
+                       "The in-vehicle default shows no face.")
+    elif args.enroll:
+        _display_mode = "enroll"
+        logger.info("Display: enrollment screen %dx%d%s (no camera image; position the driver "
+                    "with --debug-stream)", config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT,
+                    ", fullscreen" if _fullscreen else "")
+    else:
+        logger.info("Display: data screen %dx%d%s (no camera image; --show-video to diagnose)",
+                    config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT,
+                    ", fullscreen" if _fullscreen else "")
     logger.info("=== Driver Fatigue Detection System starting ===")
     exit_code = 0
+    interrupted = False
+    if args.debug_stream is not None:
+        try:
+            _stream = DebugStream(args.debug_stream, config.DEBUG_STREAM_FPS,
+                                  stream_token(os.environ.get("FATIGUE_STREAM_TOKEN")))
+            banner = (f"DIAGNOSTIC VIDEO STREAM ON - open {_stream.url} in a browser on the "
+                      f"same network ({config.DEBUG_STREAM_FPS:.0f} fps max, LAN only, "
+                      f"nothing recorded)")
+            logger.warning(banner)
+        except OSError as exc:
+            logger.error("Debug stream NOT started on port %d: %s - continuing without it",
+                         args.debug_stream, exc)
 
     try:
         # 1. Config is imported at module load; log the key values.
@@ -2214,7 +2756,9 @@ def main(argv: Optional[list] = None) -> int:
         # 3. Landmarks
         if not config.LANDMARK_MODEL.exists():
             logger.error("Landmark model not found at %s (see README.md)", config.LANDMARK_MODEL)
-            return 1
+            exit_code = _enroll_result(1, "error", f"Landmark model not found at "
+                                                   f"{config.LANDMARK_MODEL}. Nothing was captured.")
+            return exit_code
         extractor = LandmarkExtractor(str(config.LANDMARK_MODEL), config.SCALE_FACTOR)
 
         # 4. Driver recognition
@@ -2248,9 +2792,10 @@ def main(argv: Optional[list] = None) -> int:
         _camera = Camera()
 
         if args.enroll:
+            _rate = LoopRate()
             exit_code = run_enrollment(api_client, extractor, driver_id=args.driver_id)
         else:
-            rate = LoopRate()
+            rate = _rate = LoopRate()
             # Heartbeat to the portal, ticked from present() in every phase
             # loop. Reads the relay state from _alert_manager at send time.
             _heartbeat = Heartbeat(api_client, _alert_manager)
@@ -2294,13 +2839,17 @@ def main(argv: Optional[list] = None) -> int:
 
     except QuitRequested:
         logger.info("Quit requested from the preview window")
+        interrupted = True
     except KeyboardInterrupt:
         logger.info("Interrupted by user (Ctrl-C)")
+        interrupted = True
     except Exception:
         logger.exception("Fatal error in main loop")
         exit_code = 1
     finally:
         cleanup()
+        if args.enroll and args.result_file:
+            write_enroll_result(args.result_file, args.driver_id, exit_code, interrupted)
 
     return exit_code
 

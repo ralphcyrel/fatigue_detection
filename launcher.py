@@ -14,21 +14,37 @@ source of truth for how a session runs::
 
 While a session runs the launcher collapses to a slim always-on-top strip
 along the bottom of the screen with a STOP button (sends SIGINT, which
-``main.py`` already handles as Ctrl-C and cleans up after). When the child
-exits for any reason the full menu comes back with a one-line result.
+``main.py`` already handles as Ctrl-C and cleans up after). Above it,
+``main.py`` shows its fullscreen data screen - no camera image (group
+decision, 2026-10-05). When the child exits the menu comes back with the
+result; an enrollment gets a full result screen (saved / refused and why /
+backend dropped the closed-eye baseline / backend rejected).
+
+"Video stream" toggles ``main.py --debug-stream`` for the next sessions: a
+LAN-only MJPEG view of the camera for a laptop or phone (enrollment
+positioning, the defense projector). The strip shows the URL to open.
 
 Layout is proportional (grid weights + fonts scaled from the screen
-height), so it fills the 480x320 panel and a larger HDMI display alike.
+height), sized for the 800x480 HDMI touchscreen; touch targets stay well
+above the ~10 px error of a resistive panel.
 
     python launcher.py               # fullscreen (kiosk)
-    python launcher.py --windowed    # 480x320 window, for development
+    python launcher.py --windowed    # 800x480 window, for development
+
+The child runs with this launcher's environment (FATIGUE_API_BASE_URL,
+FATIGUE_API_TOKEN, FATIGUE_DEVICE_ID) and with the project venv's Python
+when the launcher itself was started outside it; the header turns red when
+the API settings are missing, which is what a desktop icon that sources
+``~/.bashrc`` non-interactively produces (see deploy/start_launcher.sh).
 
 Tkinter only - ships with Python (``python3-tk`` on Raspberry Pi OS).
 See ``deploy/fatigue-launcher.service`` to start it on boot.
 """
 
 import argparse
+import json
 import logging
+import os
 import queue
 import signal
 import subprocess
@@ -43,19 +59,24 @@ from urllib.parse import urlparse
 
 from config import config
 from modules.api import APIClient
+from modules.debug_stream import lan_address, stream_token
 
 logger = logging.getLogger("launcher")
 
 # Reference screen height the sizes below are designed for. Anything larger
 # scales up (capped so a 1080p panel doesn't end up with comically big text).
+# On the 800x480 panel the scale is 1.5.
 REFERENCE_HEIGHT = 320
 MAX_SCALE = 2.5
 
-# Sizes at REFERENCE_HEIGHT, in px / pt. Buttons are finger-sized: the
-# minimum row height is well above the ~44 px touch-target guideline.
+# Sizes at REFERENCE_HEIGHT, in px / pt. Buttons are finger-sized: on the
+# 800x480 panel a menu row is ~95 px and the strip 66 px - far above the
+# ~10 px error of the resistive touchscreen.
 ROW_MIN_PX = 64
 HEADER_PX = 40
-STRIP_PX = 64
+# Kept slimmer than a menu row: main.py's data screen reserves exactly this
+# much (``--reserve-bottom``) so the strip never covers a reading.
+STRIP_PX = 44
 FONT_TITLE_PT = 12
 FONT_BUTTON_PT = 15
 FONT_SMALL_PT = 9
@@ -65,6 +86,7 @@ RESULT_POLL_MS = 100         # how often the Tk thread drains worker results
 CHILD_POLL_MS = 500          # how often the running screen checks the child
 STOP_GRACE_S = 10.0          # SIGINT -> terminate() escalation
 SESSION_LOG = config.LOGS_DIR / "session.log"   # child stdout/stderr
+ENROLL_RESULT = config.LOGS_DIR / "enroll_result.json"   # main.py --result-file
 
 # Colours (plain tk, works without ttk themes on the Pi).
 BG = "#1e1e1e"
@@ -78,6 +100,10 @@ BTN_ASSIGNED = "#2b7a4b"     # driver assigned to this unit
 ONLINE = "#2e9e5b"
 OFFLINE = "#c0392b"
 UNKNOWN = "#7f8c8d"
+WARN_BG = "#8a1f1f"          # header when the API settings are missing
+RESULT_OK = "#2e9e5b"
+RESULT_WARN = "#b7791f"
+RESULT_BAD = "#c0392b"
 
 # Menu actions: label -> main.py flags. Enroll is handled separately (needs
 # a driver id from the picker).
@@ -88,15 +114,56 @@ UNKNOWN = "#7f8c8d"
 # INHIBITED (nothing in monitoring can release it) - use it to exercise
 # monitoring alone, e.g. with --profile-loop, or for a driver who cannot pass.
 #
-# Every session keeps the preview window on purpose: the FRS overlay, lock
-# reason and assessment result are how an observer sees the system's
-# reasoning. main.py --no-preview is for unattended data collection from the
-# command line, not a launcher default.
+# Every session keeps main.py's window on purpose: the data screen's level,
+# lock reason and assessment result are how an observer sees the system's
+# reasoning. It shows no camera image; the camera view, when needed, is the
+# LAN video stream. main.py --no-preview is for unattended data collection
+# from the command line, not a launcher default.
 SESSIONS: Dict[str, List[str]] = {
     "Pre-drive assessment": ["--sequence"],
     "Monitoring only (test)": ["--force-phase", "monitoring"],
     "Follow ignition": [],
 }
+
+
+# What main.py's exit codes mean, for sessions without a result file (and as
+# the fallback when an enrollment did not write one).
+EXIT_TEXT: Dict[int, str] = {
+    0: "finished OK",
+    1: "crashed - see logs/session.log",
+    2: "bad driver id - nothing saved",
+    3: "too few face frames - nothing saved",
+    5: "backend rejected or unreachable - nothing saved",
+    6: "REFUSED: no eyelid contrast - nothing saved",
+    7: "saved, but the backend DROPPED the closed-eye baseline",
+}
+
+
+def child_python() -> str:
+    """
+    Interpreter for main.py: this one, unless the launcher was started
+    outside the project venv while one exists. A desktop icon running
+    ``python3 launcher.py`` would otherwise start main.py on the system
+    Python, without face_recognition / dlib, and it would die on import.
+    """
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    venv = config.BASE_DIR / "venv" / ("Scripts/python.exe" if sys.platform == "win32"
+                                       else "bin/python")
+    if not in_venv and venv.exists():
+        logger.warning("Launcher runs on %s (not the project venv) - starting main.py with %s",
+                       sys.executable, venv)
+        return str(venv)
+    return sys.executable
+
+
+def api_settings_problem() -> Optional[str]:
+    """Why the backend settings look missing (None when they look set)."""
+    missing = [name for name in ("FATIGUE_API_BASE_URL", "FATIGUE_API_TOKEN")
+               if not os.environ.get(name)]
+    if not missing:
+        return None
+    return (f"{' and '.join(missing)} not set - enrollment cannot reach the backend. "
+            "Start the launcher with deploy/start_launcher.sh.")
 
 
 def setup_logging() -> None:
@@ -173,27 +240,44 @@ class Backend:
 class Session:
     """One ``main.py`` subprocess and the means to stop it."""
 
-    def __init__(self, label: str, flags: List[str]) -> None:
+    def __init__(self, label: str, flags: List[str], enroll: bool = False,
+                 extra_env: Optional[Dict[str, str]] = None) -> None:
         self.label = label
         self.flags = flags
+        self.enroll = enroll
+        self.extra_env = extra_env or {}
         self.proc: Optional[subprocess.Popen] = None
         self._log_file = None
+        self._log_offset = 0
         self._stop_requested_at: Optional[float] = None
 
     def start(self) -> None:
-        cmd = [sys.executable, str(config.BASE_DIR / "main.py"), *self.flags]
+        cmd = [child_python(), str(config.BASE_DIR / "main.py"), *self.flags]
+        if self.enroll:
+            cmd += ["--result-file", str(ENROLL_RESULT)]
+            try:
+                ENROLL_RESULT.unlink()      # never show a previous run's result
+            except FileNotFoundError:
+                pass
+        # The child gets this process's environment, explicitly: the API
+        # settings must reach main.py exactly as the launcher sees them.
+        env = dict(os.environ, PYTHONUNBUFFERED="1", **self.extra_env)
         config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
         self._log_file = open(SESSION_LOG, "a", encoding="utf-8")
+        self._log_offset = self._log_file.tell()
         self._log_file.write(
             f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} launcher: {self.label} "
-            f"-> {' '.join(cmd[1:])}\n"
+            f"-> {' '.join(cmd)}\n"
+            f"      env: FATIGUE_API_BASE_URL={env.get('FATIGUE_API_BASE_URL', '(NOT SET)')} "
+            f"FATIGUE_API_TOKEN={'(set)' if env.get('FATIGUE_API_TOKEN') else '(NOT SET)'} "
+            f"FATIGUE_DEVICE_ID={env.get('FATIGUE_DEVICE_ID', '(NOT SET)')}\n"
         )
         self._log_file.flush()
         logger.info("Starting %s: %s", self.label, " ".join(cmd))
         # stdin is /dev/null so a stray input() fails fast instead of hanging
         # a keyboard-less unit forever.
         self.proc = subprocess.Popen(
-            cmd, cwd=str(config.BASE_DIR),
+            cmd, cwd=str(config.BASE_DIR), env=env,
             stdin=subprocess.DEVNULL, stdout=self._log_file, stderr=subprocess.STDOUT,
         )
 
@@ -237,13 +321,48 @@ class Session:
             self._log_file = None
         return code
 
+    @property
+    def stopped_by_user(self) -> bool:
+        code = None if self.proc is None else self.proc.poll()
+        return self._stop_requested_at is not None or (code is not None and code < 0)
+
     def result_text(self) -> str:
         code = self.close()
-        if self._stop_requested_at is not None or (code is not None and code < 0):
+        if self.stopped_by_user:
             return f"{self.label}: stopped"
-        if code == 0:
-            return f"{self.label}: finished OK"
-        return f"{self.label}: exited with code {code} - see logs/session.log"
+        text = EXIT_TEXT.get(code, f"exited with code {code} - see logs/session.log")
+        return f"{self.label}: {text}"
+
+    def enroll_result(self) -> Dict[str, Any]:
+        """
+        The enrollment's outcome: main.py's result file, or - if it wrote
+        none (killed, crashed on import) - one built from the exit code and
+        the last lines of this session's log.
+        """
+        code = self.close()
+        try:
+            with open(ENROLL_RESULT, encoding="utf-8") as fh:
+                result = json.load(fh)
+            if isinstance(result, dict) and "outcome" in result:
+                return result
+        except (OSError, ValueError):
+            pass
+        if self.stopped_by_user:
+            return {"outcome": "stopped", "exit_code": code,
+                    "message": "Enrollment stopped - nothing was saved."}
+        return {"outcome": "error", "exit_code": code,
+                "message": EXIT_TEXT.get(code, f"main.py exited with code {code}."),
+                "reasons": self.log_tail()}
+
+    def log_tail(self, lines: int = 4) -> str:
+        """Last lines this session wrote to session.log (e.g. an import traceback)."""
+        try:
+            with open(SESSION_LOG, encoding="utf-8", errors="replace") as fh:
+                fh.seek(self._log_offset)
+                tail = [ln.rstrip() for ln in fh.read().splitlines() if ln.strip()]
+        except OSError:
+            return ""
+        return "\n".join(tail[-lines:])
 
 
 # ---------------------------------------------------------------------------
@@ -262,12 +381,21 @@ class Launcher:
         self.last_result = ""
         self._drivers: List[Dict[str, Any]] = []
         self._page = 0
+        # "Video stream" toggle: adds main.py --debug-stream to new sessions.
+        self.stream_on = False
+        # One token for every session this launcher starts, so the URL typed
+        # into the laptop keeps working; FATIGUE_STREAM_TOKEN makes it permanent.
+        self.stream_token = stream_token(os.environ.get("FATIGUE_STREAM_TOKEN"))
+        self._enroll_driver: Optional[Dict[str, Any]] = None
+        self.api_problem = api_settings_problem()
+        if self.api_problem:
+            logger.error("API SETTINGS: %s", self.api_problem)
 
         self.screen_w = root.winfo_screenwidth()
         self.screen_h = root.winfo_screenheight()
         # Under --windowed the "screen" is the window, so scale to that.
         if windowed:
-            self.screen_w, self.screen_h = 480, 320
+            self.screen_w, self.screen_h = config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT
         self.scale = max(1.0, min(self.screen_h / REFERENCE_HEIGHT, MAX_SCALE))
         logger.info("Display %dx%d, scale %.2f", self.screen_w, self.screen_h, self.scale)
 
@@ -303,7 +431,7 @@ class Launcher:
                 pass
 
     def _show_full_window(self) -> None:
-        """Fullscreen kiosk, or a fixed 480x320 window for development."""
+        """Fullscreen kiosk, or a fixed panel-sized window for development."""
         self.root.withdraw()
         self.root.attributes("-topmost", False)
         self._set_x11_type("normal")
@@ -383,8 +511,15 @@ class Launcher:
         tk.Label(bar, text=title, font=self.font_title, bg=BG, fg=FG, anchor="w").grid(
             row=0, column=0, sticky="nsw", padx=self.px(8))
         host = urlparse(config.API_BASE_URL).netloc or config.API_BASE_URL
-        tk.Label(bar, text=f"Device {config.DEVICE_ID}  ·  {host}", font=self.font_small,
-                 bg=BG, fg="#bbbbbb").grid(row=0, column=1, sticky="nse", padx=self.px(6))
+        if self.api_problem:
+            # Loud on purpose: without these the backend is localhost and
+            # every enrollment fails.
+            tk.Label(bar, text=f"NO API SETTINGS ({host})",
+                     font=self.font_small, bg=WARN_BG, fg=FG, padx=self.px(6)).grid(
+                row=0, column=1, sticky="nse", padx=self.px(6), pady=self.px(4))
+        else:
+            tk.Label(bar, text=f"Device {config.DEVICE_ID}  ·  {host}", font=self.font_small,
+                     bg=BG, fg="#bbbbbb").grid(row=0, column=1, sticky="nse", padx=self.px(6))
         self.status_pill = tk.Label(bar, font=self.font_small, fg=FG, bg=UNKNOWN,
                                     padx=self.px(8), pady=self.px(3))
         self.status_pill.grid(row=0, column=2, sticky="nse", padx=self.px(8))
@@ -401,6 +536,7 @@ class Launcher:
         f.rowconfigure(0, weight=0)
         for r in (1, 2, 3):
             f.rowconfigure(r, weight=1, minsize=self.px(ROW_MIN_PX))
+        f.rowconfigure(4, weight=0)
         pad = self.px(4)
 
         self._header(f, "Driver Fatigue Detection").grid(
@@ -418,11 +554,35 @@ class Launcher:
                      lambda: self.start_session("Follow ignition")).grid(
             row=2, column=1, sticky="nsew", padx=pad, pady=pad)
 
-        tk.Label(f, text=self.last_result, font=self.font_small, bg=BG, fg="#dddddd",
-                 anchor="w", justify="left", wraplength=self.px(230)).grid(
-            row=3, column=0, sticky="nsew", padx=self.px(8), pady=pad)
+        self._button(f, self._stream_label(), self._toggle_stream,
+                     bg=BTN_ASSIGNED if self.stream_on else BTN).grid(
+            row=3, column=0, sticky="nsew", padx=pad, pady=pad)
         self._button(f, "Quit", self.quit, bg=BTN_QUIT).grid(
             row=3, column=1, sticky="nsew", padx=pad, pady=pad)
+
+        note, color = self.last_result, "#dddddd"
+        if self.api_problem and not note:
+            note, color = self.api_problem, "#ff8a80"
+        tk.Label(f, text=note, font=self.font_small, bg=BG, fg=color, anchor="w",
+                 justify="left", wraplength=self.screen_w - self.px(16)).grid(
+            row=4, column=0, columnspan=2, sticky="nsew", padx=self.px(8), pady=(0, pad))
+        if self.stream_on:
+            # Large enough to read off the panel and type into a laptop.
+            tk.Label(f, text=f"Video: {self._stream_url()}", font=self.font_title, bg=BG,
+                     fg="#9ae6b4", anchor="w").grid(
+                row=5, column=0, columnspan=2, sticky="nsew", padx=self.px(8), pady=(0, pad))
+
+    def _stream_label(self) -> str:
+        return ("Video stream: ON\n(laptop / phone view)" if self.stream_on
+                else "Video stream: OFF\n(laptop / phone view)")
+
+    def _toggle_stream(self) -> None:
+        self.stream_on = not self.stream_on
+        logger.info("Debug video stream %s for new sessions", "ON" if self.stream_on else "OFF")
+        self.show_menu()
+
+    def _stream_url(self) -> str:
+        return f"http://{lan_address()}:{config.DEBUG_STREAM_PORT}/{self.stream_token}/"
 
     def show_driver_picker(self) -> None:
         """Fetch the roster, then render it as pages of large buttons."""
@@ -524,26 +684,59 @@ class Launcher:
         body.rowconfigure(0, weight=1)
         body.rowconfigure(1, weight=0, minsize=self.px(ROW_MIN_PX))
         name = driver.get("full_name") or f"Driver {driver.get('id')}"
-        note = ("Already enrolled - this will replace their calibration."
-                if driver.get("is_enrolled") else "Face capture + 60 s calibration.")
-        tk.Label(body, text=f"Enrol {name} (id {driver.get('id')})?\n{note}",
-                 font=self.font_title, bg=BG, fg=FG, wraplength=self.px(440)).grid(
+        steps = ("Positioning (text guidance on this screen), face capture, closed-eye check "
+                 "(eyes shut on the beep, open on the long beep), then 60 s calibration - "
+                 "about 2-3 minutes.")
+        note = (f"Already enrolled - this will replace their calibration.\n{steps}"
+                if driver.get("is_enrolled") else steps)
+        if self.api_problem:
+            note += f"\n\n{self.api_problem}"
+        if self.stream_on:
+            note += f"\n\nPosition the driver with the video stream:\n{self._stream_url()}"
+        else:
+            note += ("\n\nThe panel shows no camera image. For fine positioning, go back "
+                     "and turn the Video stream ON (laptop / phone view).")
+        tk.Label(body, text=f"Enrol {name} (id {driver.get('id')})?\n\n{note}",
+                 font=self.font_small, bg=BG, fg=FG, justify="left",
+                 wraplength=self.screen_w - self.px(24)).grid(
             row=0, column=0, columnspan=2, sticky="nsew")
         pad = self.px(4)
         self._button(body, "◀  Back", self._render_driver_page, bg=BTN_QUIT).grid(
             row=1, column=0, sticky="nsew", padx=pad, pady=pad)
         self._button(body, "Start enrollment", bg=BTN_PRIMARY,
-                     command=lambda: self.start_session(
-                         f"Enroll {name}", ["--enroll", "--driver-id", str(driver["id"])])).grid(
+                     command=lambda: self.start_enrollment(driver)).grid(
             row=1, column=1, sticky="nsew", padx=pad, pady=pad)
 
     # ---- sessions ----------------------------------------------------------
 
-    def start_session(self, label: str, flags: Optional[List[str]] = None) -> None:
+    def start_enrollment(self, driver: Dict[str, Any]) -> None:
+        """Enrol ``driver`` - the id sent is exactly the roster's ``id``."""
+        name = driver.get("full_name") or f"Driver {driver.get('id')}"
+        try:
+            driver_id = int(driver["id"])
+        except (KeyError, TypeError, ValueError):
+            logger.error("Roster entry has no usable id: %r", driver)
+            self.last_result = f"Enroll {name}: roster entry has no usable id {driver.get('id')!r}"
+            self.show_menu()
+            return
+        logger.info("Enrollment requested for driver id %s (%s)", driver_id, name)
+        self._enroll_driver = driver
+        self.start_session(f"Enroll {name}", ["--enroll", "--driver-id", str(driver_id)],
+                           enroll=True)
+
+    def start_session(self, label: str, flags: Optional[List[str]] = None,
+                      enroll: bool = False) -> None:
         if self.session and self.session.running:
             return
-        flags = SESSIONS[label] if flags is None else flags
-        session = Session(label, flags)
+        flags = list(SESSIONS[label] if flags is None else flags)
+        # The data / enrollment screen fills the panel above the STOP strip.
+        flags += ["--fullscreen", "--reserve-bottom", str(self.px(STRIP_PX))]
+        extra_env = {}
+        if self.stream_on:
+            flags += ["--debug-stream", str(config.DEBUG_STREAM_PORT)]
+            extra_env["FATIGUE_STREAM_TOKEN"] = self.stream_token
+            logger.info("Video stream for this session: %s", self._stream_url())
+        session = Session(label, flags, enroll=enroll, extra_env=extra_env)
         try:
             session.start()
         except OSError as exc:
@@ -562,9 +755,12 @@ class Launcher:
         f.columnconfigure(0, weight=3)
         f.columnconfigure(1, weight=1, minsize=self.px(120))
         f.rowconfigure(0, weight=1)
+        text = f"{session.label} running…"
+        if self.stream_on:
+            text = f"{self._stream_url()}\n{session.label} running…"
         self.running_label = tk.Label(
-            f, text=f"{session.label} running…  (preview window is main.py)",
-            font=self.font_title, bg=BG, fg=FG, anchor="w", padx=self.px(10))
+            f, text=text, font=self.font_title, bg=BG, fg=FG, anchor="w", justify="left",
+            padx=self.px(10))
         self.running_label.grid(row=0, column=0, sticky="nsew")
         self._button(f, "■  STOP", self._stop_session, bg=BTN_STOP).grid(
             row=0, column=1, sticky="nsew", padx=self.px(4), pady=self.px(4))
@@ -582,10 +778,79 @@ class Launcher:
             self.root.lift()            # stay above the cv2 preview
             self.root.after(CHILD_POLL_MS, self._poll_session)
             return
-        self.last_result = self.session.result_text()
+        session, self.session = self.session, None
+        if session.enroll:
+            self.show_enroll_result(session.enroll_result())
+            return
+        self.last_result = session.result_text()
         logger.info(self.last_result)
-        self.session = None
         self.show_menu()
+
+    # Outcome -> (headline, colour) for the enrollment result screen.
+    ENROLL_HEADLINES: Dict[str, tuple] = {
+        "saved": ("SAVED", RESULT_OK),
+        "saved_unverified": ("SAVED - not verified", RESULT_WARN),
+        "dropped": ("SAVED - backend DROPPED the closed-eye baseline", RESULT_WARN),
+        "refused": ("REFUSED - nothing saved", RESULT_BAD),
+        "rejected": ("BACKEND REJECTED - nothing saved", RESULT_BAD),
+        "bad_driver": ("WRONG DRIVER - nothing saved", RESULT_BAD),
+        "stopped": ("STOPPED - nothing saved", UNKNOWN),
+        "error": ("FAILED - nothing saved", RESULT_BAD),
+    }
+
+    def show_enroll_result(self, result: Dict[str, Any]) -> None:
+        """Full-screen outcome of an enrollment, every case spelled out."""
+        driver = self._enroll_driver or {}
+        name = result.get("driver_name") or driver.get("full_name") or \
+            f"Driver {result.get('driver_id', driver.get('id'))}"
+        headline, color = self.ENROLL_HEADLINES.get(
+            str(result.get("outcome")), (f"UNKNOWN OUTCOME {result.get('outcome')!r}", RESULT_BAD))
+        logger.info("Enrollment result for %s: %s - %s %s", name, result.get("outcome"),
+                    result.get("message"), result.get("reasons", ""))
+        self.last_result = f"Enroll {name}: {headline}"
+
+        details = [str(result.get("message") or "")]
+        if result.get("reasons"):
+            details.append(f"Reason: {result['reasons']}")
+        numbers = result.get("baselines") or {}
+        if numbers:
+            parts = [f"{k.replace('_baseline', '').replace('_', ' ')} {v:.3f}"
+                     for k, v in numbers.items()]
+            if result.get("contrast") is not None:
+                parts.append(f"closed/open {result['contrast']:.2f}")
+            details.append("  ·  ".join(parts))
+        details.append(f"driver id {result.get('driver_id', driver.get('id'))} on "
+                       f"{result.get('api_base_url', config.API_BASE_URL)}  ·  "
+                       f"exit code {result.get('exit_code')}")
+
+        f = self._clear()
+        self._show_full_window()
+        f.columnconfigure((0, 1), weight=1, uniform="col")
+        f.rowconfigure(2, weight=1)
+        f.rowconfigure(3, weight=0, minsize=self.px(ROW_MIN_PX))
+        pad = self.px(4)
+        self._header(f, f"Enrollment: {name}").grid(row=0, column=0, columnspan=2, sticky="nsew")
+        tk.Label(f, text=headline, font=self.font_button, bg=color, fg=FG,
+                 wraplength=self.screen_w - self.px(24), pady=self.px(8)).grid(
+            row=1, column=0, columnspan=2, sticky="nsew", padx=pad, pady=pad)
+        tk.Label(f, text="\n\n".join(d for d in details if d), font=self.font_small, bg=BG,
+                 fg=FG, justify="left", anchor="nw",
+                 wraplength=self.screen_w - self.px(24)).grid(
+            row=2, column=0, columnspan=2, sticky="nsew", padx=self.px(10), pady=pad)
+        self._button(f, "◀  Menu", self.show_menu, bg=BTN_QUIT).grid(
+            row=3, column=0, sticky="nsew", padx=pad, pady=pad)
+        if result.get("outcome") != "saved" and self._enroll_driver is not None:
+            again = self._enroll_driver
+            self._button(f, "Enroll again", lambda: self._confirm_enroll_screen(again),
+                         bg=BTN_PRIMARY).grid(row=3, column=1, sticky="nsew", padx=pad, pady=pad)
+
+    def _confirm_enroll_screen(self, driver: Dict[str, Any]) -> None:
+        """The confirm screen again (it lives inside the picker's frame)."""
+        f = self._clear()
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(1, weight=1)
+        self._header(f, "Enroll: confirm").grid(row=0, column=0, sticky="nsew")
+        self._confirm_enroll(driver)
 
     def quit(self) -> None:
         session = self.session
@@ -602,7 +867,8 @@ class Launcher:
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Touchscreen launcher for main.py")
     parser.add_argument("--windowed", action="store_true",
-                        help="run in a 480x320 window instead of fullscreen (development)")
+                        help="run in a panel-sized (800x480) window instead of fullscreen "
+                             "(development)")
     return parser.parse_args(argv)
 
 

@@ -1,0 +1,2 @@
+# Test-only dependency (python -m pytest; see README "Tests").
+pytest

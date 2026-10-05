@@ -58,6 +58,24 @@ CAMERA_HEIGHT: Final[int] = 480
 CAMERA_FPS: Final[int] = 30
 
 # ---------------------------------------------------------------------------
+# In-vehicle display
+# ---------------------------------------------------------------------------
+
+# The 5" HDMI touchscreen. During pre-drive and monitoring it shows the data
+# screen (modules/session_display.py) - never the camera image.
+DISPLAY_WIDTH: Final[int] = 800
+DISPLAY_HEIGHT: Final[int] = 480
+
+# The data screen is redrawn at most this often; between redraws the loop
+# skips imshow / waitKey entirely. Keys (q / i / r) are read on redraws.
+DATA_SCREEN_HZ: Final[float] = 10.0
+
+# Diagnostic MJPEG stream (main.py --debug-stream; modules/debug_stream.py).
+# LAN only, never recorded. Frames are sent at most this often.
+DEBUG_STREAM_PORT: Final[int] = 8080
+DEBUG_STREAM_FPS: Final[float] = 10.0
+
+# ---------------------------------------------------------------------------
 # Landmark detection
 # ---------------------------------------------------------------------------
 

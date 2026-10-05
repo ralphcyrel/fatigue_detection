@@ -9,11 +9,23 @@
 # (sudo apt install python3-picamera2). If using a venv, create it with
 # --system-site-packages so the apt-installed libcamera bindings are visible.
 
-opencv-python-headless
+# OpenCV WITH a GUI backend: main.py shows the data / enrollment screen with
+# cv2.imshow in a fullscreen window on the HDMI touchscreen. The -headless
+# build has no highgui, so imshow fails and main.py runs with no screen at all.
+# Never install both: opencv-python and opencv-python-headless (and the
+# -contrib variants) all provide the same cv2 module, and whichever was
+# installed last wins. If the headless one is present:
+#   pip uninstall -y opencv-python-headless && pip install "opencv-python<4.12"
+#
+# Kept below 4.12 because 4.12+ wheels require numpy>=2 on Python 3.9+ (4.13
+# declares numpy>=2 outright), and numpy 2 breaks dlib 19.24.1 ("Unsupported
+# image type"). Hence the numpy pin below too.
+opencv-python<4.12
 dlib
 face-recognition
 imutils
-numpy
+# dlib 19.24.1 fails on numpy 2 (see the OpenCV note above).
+numpy<2
 scipy
 requests
 picamera2

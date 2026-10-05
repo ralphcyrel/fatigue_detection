@@ -7,3 +7,4 @@ models/*.dat
 .env
 frames/
 snap_*.jpg
+.pytest_cache/

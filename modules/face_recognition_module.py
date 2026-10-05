@@ -81,6 +81,10 @@ class DriverRecognizer:
         self._known_ids: List[int] = []
         self._known_encodings: List[np.ndarray] = []
 
+        # Faces found by the last identify() call; None if it did not look
+        # (no encodings loaded). Read by the data screen only.
+        self.last_face_count: Optional[int] = None
+
     # ------------------------------------------------------------------
     # Encoding management
     # ------------------------------------------------------------------
@@ -164,6 +168,7 @@ class DriverRecognizer:
             no encodings are loaded, or no face is within tolerance.
         """
         if frame is None or frame.size == 0 or not self._known_encodings:
+            self.last_face_count = None
             return None
 
         # OpenCV/Picamera2 give BGR; face_recognition (dlib) wants RGB.
@@ -171,6 +176,9 @@ class DriverRecognizer:
 
         # HOG detector — same trade-off as Module 1: fast enough on the Pi.
         locations = face_recognition.face_locations(rgb, model="hog")
+        # Display only (the data screen's face indicator): tells "no face"
+        # apart from "face, not recognised", which both return None.
+        self.last_face_count = len(locations)
         if not locations:
             return None
 

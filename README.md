@@ -160,15 +160,27 @@ single source of truth:
 The header shows the device id and whether the backend answers `/ping`. While a
 session runs the launcher shrinks to a bottom strip with a **STOP** button
 (sends SIGINT = Ctrl-C); when `main.py` exits the menu returns with the result.
-Layout scales with the screen, from the 480×320 panel up to an HDMI monitor.
+Layout is sized for the 800×480 HDMI touchscreen and scales up to a monitor.
 
 ```bash
 python launcher.py               # fullscreen
-python launcher.py --windowed    # development: 480x320 window
+python launcher.py --windowed    # development: 800x480 window
 ```
 
-To start it on boot see [`deploy/README.md`](deploy/README.md) (systemd unit,
-plus how to disable it again for CLI development).
+To start it on boot or from a desktop icon see [`deploy/README.md`](deploy/README.md)
+(systemd unit, `deploy/start_launcher.sh`, and how to go back to the CLI).
+
+## Tests
+
+`tests/` runs the phase loops, the enrollment flow, the display and the debug
+stream against fakes - no camera, GPIO (forced to mock even on a Pi), backend
+or `logs/` writes. The slow tests run the real-time loops (~2.5 min in all).
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest                    # everything
+python -m pytest -m "not slow"      # quick checks only (~10 s)
+```
 
 ## Backend endpoints used
 

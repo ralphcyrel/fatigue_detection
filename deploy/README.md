@@ -20,6 +20,8 @@ folder holds the systemd unit that starts it on boot.
   FATIGUE_API_BASE_URL=http://<server>/api
   FATIGUE_API_TOKEN=<bearer token>
   FATIGUE_DEVICE_ID=pi-01
+  # optional - a fixed debug-stream URL token (else a random one per launcher run)
+  # FATIGUE_STREAM_TOKEN=pick-8-to-64-chars
   ```
 
   `sudo chmod 640 /etc/fatigue-detection.env && sudo chown root:pi /etc/fatigue-detection.env`
@@ -60,16 +62,40 @@ camera - `systemctl status fatigue-launcher` tells you which state it's in.
 ```bash
 source venv/bin/activate
 python launcher.py               # fullscreen on the touchscreen
-python launcher.py --windowed    # 480x320 window (Escape leaves fullscreen)
+python launcher.py --windowed    # 800x480 window (Escape leaves fullscreen)
 ```
+
+## Starting from a desktop icon
+
+Use `deploy/start_launcher.sh` as the icon's `Exec=` (the script's header
+has a sample `.desktop` file). Do **not** `source ~/.bashrc` in a launcher
+script: Raspberry Pi OS's `~/.bashrc` returns immediately in a
+non-interactive shell, so the `FATIGUE_*` exports never run and every
+enrollment goes to `http://localhost:8000/api`. The script reads
+`/etc/fatigue-detection.env` (same file as the service), then
+`~/.config/fatigue-detection.env`, then the `export FATIGUE_...` lines of
+`~/.bashrc`, and logs what it found to `logs/start_launcher.log`.
+
+The launcher's header turns red ("NO API SETTINGS") when it was started
+without them. Each session's first lines in `logs/session.log` show the
+exact command, interpreter and API settings the child received.
 
 ## Notes
 
 - While a session runs the launcher collapses to a strip along the bottom
-  of the screen with a **STOP** button; the cv2 preview appears above it.
-  STOP sends SIGINT, the same as Ctrl-C, so `main.py` cleans up normally.
-- If the strip ends up hidden behind the preview on a Wayland desktop,
-  switch the session to X11 (`raspi-config` → *Advanced Options* →
+  of the screen with a **STOP** button; `main.py`'s fullscreen data screen
+  sits above it. STOP sends SIGINT, the same as Ctrl-C, so `main.py` cleans
+  up normally.
+- The in-vehicle display never shows the camera image during pre-drive or
+  monitoring (group decision, 2026-10-05). For camera aim / landmark
+  problems: `main.py --show-video` (local window), or the **Video stream**
+  button, which starts sessions with `--debug-stream`: an MJPEG view at
+  `http://<pi-ip>:8080/<token>/` for a laptop or phone on the same network.
+  Every other path is a 404. It is LAN-only, never recorded; the full URL
+  is shown on the menu, the confirm screen and the strip, and logged.
+- Enrollment shows no camera image either: a face-box outline with text
+  guidance (step 1 positions the driver before the face capture), progress
+  bars and the closed-eye countdown. Fine positioning is done on the stream.
+- If the strip ends up hidden behind the session window on a Wayland
+  desktop, switch the session to X11 (`raspi-config` → *Advanced Options* →
   *Wayland* → *X11*); dock/topmost hints are honoured reliably there.
-- The preview is drawn at the camera frame size. On a 480×320 panel a
-  640×480 frame is clipped, which is fine for a demo but worth knowing.
