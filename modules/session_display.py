@@ -1,11 +1,17 @@
 """
-Data screen for the in-vehicle display (800x480 HDMI touchscreen).
+Data screen and enrollment screen for the in-vehicle display (800x480 HDMI
+touchscreen).
 
 Group decision (2026-10-05): during pre-drive and monitoring the in-vehicle
-display shows NO camera image. This module draws what replaces it - the
+display shows NO camera image. :func:`render` draws what replaces it - the
 fatigue level, the live numbers next to the driver's baselines, the phase /
 status text that used to be drawn on the video, and a plain-text face
-indicator so a mis-aimed camera is still obvious without a picture.
+indicator so a mis-aimed camera is still obvious without a picture. It
+takes no image at all.
+
+Enrollment is the one exception (2026-10-07): :func:`render_enroll` shows
+the live camera as a mirror view, so the driver being enrolled can position
+themselves, next to the step's guidance.
 
 Display only. Nothing here feeds back into a metric, a threshold, the FRS,
 the relay or the backend: :class:`ScreenState` is written by the main loop's
@@ -274,8 +280,12 @@ class EnrollState:
 
     ``box`` and ``guide`` are normalised (0..1) rectangles ``(x0, y0, x1,
     y1)`` in display orientation (already mirrored if guidance is mirrored):
-    the face box the detector found and the zone it should sit in. Only these
-    outlines are drawn - never camera pixels.
+    the face box the detector found and the zone it should sit in.
+
+    ``image`` is the current camera frame (BGR, camera orientation; held by
+    reference, not copied - :func:`render_enroll` only reads it, and only
+    when the screen is redrawn). ``mirror`` flips it into display
+    orientation so it matches ``box`` and ``guide``.
     """
 
     driver_name: Optional[str] = None
@@ -294,6 +304,8 @@ class EnrollState:
     countdown: Optional[float] = None                # seconds, drawn huge
     countdown_label: str = ""
     fps: Optional[float] = None
+    image: Optional[np.ndarray] = None
+    mirror: bool = True
 
 
 def _wrap(text: str, scale: float, thick: int, max_w: int, font: int = FONT) -> List[str]:
@@ -312,13 +324,23 @@ def _wrap(text: str, scale: float, thick: int, max_w: int, font: int = FONT) -> 
     return lines
 
 
-def _outline(img: np.ndarray, s: EnrollState, x0: int, y0: int, x1: int, y1: int) -> None:
-    """The camera frame as an empty 4:3 outline, the target zone and the face box."""
+def _camera_view(img: np.ndarray, s: EnrollState, x0: int, y0: int, x1: int, y1: int) -> None:
+    """
+    The camera frame in a 4:3 box - the live mirror view when ``s.image``
+    is set, else an empty outline - with the target zone and the face box.
+    """
     w, h = x1 - x0, y1 - y0
     fw = min(w, int(h * 4 / 3))
     fh = int(fw * 3 / 4)
     fx, fy = x0 + (w - fw) // 2, y0 + (h - fh) // 2
-    cv2.rectangle(img, (fx, fy), (fx + fw, fy + fh), (30, 30, 30), -1)
+    if s.image is not None and s.image.size:
+        # Shrink first, then flip the small copy: ~1/4 of the pixels.
+        view = cv2.resize(s.image, (fw, fh), interpolation=cv2.INTER_LINEAR)
+        if view.ndim == 2:
+            view = cv2.cvtColor(view, cv2.COLOR_GRAY2BGR)
+        img[fy:fy + fh, fx:fx + fw] = cv2.flip(view, 1) if s.mirror else view
+    else:
+        cv2.rectangle(img, (fx, fy), (fx + fw, fy + fh), (30, 30, 30), -1)
     cv2.rectangle(img, (fx, fy), (fx + fw, fy + fh), GREY, 1)
 
     def px(r: Tuple[float, float, float, float]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
@@ -339,16 +361,53 @@ def _outline(img: np.ndarray, s: EnrollState, x0: int, y0: int, x1: int, y1: int
         cv2.rectangle(img, (bx0, by0), (bx1, by1), color, 3)
         # The face centre: this dot, not the whole box, belongs in the zone.
         cv2.circle(img, ((bx0 + bx1) // 2, (by0 + by1) // 2), 7, color, -1)
-    caption = ("outline only, no image - face dot inside the dashed box"
-               if s.guide is not None else "camera view - outline only, no image")
+    if s.image is not None:
+        caption = ("live camera, mirror view - face dot inside the dashed box"
+                   if s.guide is not None else "live camera, mirror view")
+    else:
+        caption = ("outline only, no image - face dot inside the dashed box"
+                   if s.guide is not None else "camera view - outline only, no image")
     _text(img, caption, fx + fw // 2, fy + fh + 18, 0.45, DIM, 1, "center", max_w=fw)
+
+
+# Instruction / detail / note in the enrollment screen's right column:
+# (scale, thickness, font, baseline-to-baseline px, extra px before the block).
+_ENROLL_BLOCKS = ((1.1, 2, FONT_BOLD, 42, 0), (0.65, 1, FONT, 27, 6), (0.55, 1, FONT, 23, 4))
+
+
+def enroll_text_layout(s: EnrollState, x0: int, y0: int, max_w: int, max_y: int
+                       ) -> List[Tuple[str, int, float, int, int, int]]:
+    """
+    Every line of the instruction, detail and note as
+    ``(line, baseline_y, scale, thickness, font, block)``.
+
+    All of it, always: if it does not fit between ``y0`` (first baseline)
+    and ``max_y`` (last baseline) the three blocks shrink together, down
+    to half size - lines are never dropped.
+    """
+    texts = (s.instruction, s.detail, s.note)
+    for k in np.arange(1.0, 0.45, -0.05):
+        out: List[Tuple[str, int, float, int, int, int]] = []
+        y = y0
+        for block, (text, (scale, thick, font, line_h, gap)) in enumerate(
+                zip(texts, _ENROLL_BLOCKS)):
+            if not text:
+                continue
+            if out:
+                y += int(gap * k)
+            for line in _wrap(text, scale * k, thick, max_w, font):
+                out.append((line, y, scale * k, thick, font, block))
+                y += int(line_h * k)
+        if not out or out[-1][1] <= max_y:
+            return out
+    return out
 
 
 def render_enroll(s: EnrollState, width: int, height: int, reserve_bottom: int = 0) -> np.ndarray:
     """
-    Draw the enrollment screen: step, a camera-frame outline with the face
-    box (or a huge countdown), the instruction, a progress bar and the face
-    indicator. No camera image.
+    Draw the enrollment screen: step, the live mirror view with the target
+    zone and face box (or a huge countdown), the instruction, a progress
+    bar and the face indicator.
     """
     img = _background(width, height).copy()
     h = height - reserve_bottom
@@ -379,27 +438,19 @@ def render_enroll(s: EnrollState, width: int, height: int, reserve_bottom: int =
         if s.countdown_label:
             _text(img, s.countdown_label, cx, bottom - 16, 0.7, GREY, 1, "center",
                   max_w=tile_w - 20)
-    elif s.guide is not None or s.box is not None:
-        _outline(img, s, pad + 8, top + 8, pad + tile_w - 8, bottom - 22)
+    elif s.image is not None or s.guide is not None or s.box is not None:
+        _camera_view(img, s, pad + 8, top + 8, pad + tile_w - 8, bottom - 22)
 
     # Right: instruction, detail, note, progress.
     x0 = pad + tile_w + 2 * pad
     max_w = width - x0 - pad
-    y = top + 34
-    for line in _wrap(s.instruction, 1.1, 2, max_w, FONT_BOLD)[:3]:
-        _text(img, line, x0, y, 1.1, s.instruction_color, 2, font=FONT_BOLD, max_w=max_w)
-        y += 42
-    y += 6
-    for line in _wrap(s.detail, 0.65, 1, max_w)[:4]:
-        _text(img, line, x0, y, 0.65, WHITE, 1, max_w=max_w)
-        y += 27
-    if s.note:
-        y += 4
-        for line in _wrap(s.note, 0.55, 1, max_w)[:3]:
-            _text(img, line, x0, y, 0.55, AMBER, 1, max_w=max_w)
-            y += 23
+    by = bottom - 26                                 # progress bar top
+    text_bottom = (by - 34) if s.progress is not None else bottom - 6
+    colors = (s.instruction_color, WHITE, AMBER)
+    for line, y, scale, thick, font, block in enroll_text_layout(s, x0, top + 34, max_w,
+                                                                 text_bottom):
+        _text(img, line, x0, y, scale, colors[block], thick, font=font, max_w=max_w)
     if s.progress is not None:
-        by = bottom - 26
         cv2.rectangle(img, (x0, by), (width - pad, by + 22), PANEL, -1)
         fill = int((width - pad - x0) * min(max(s.progress, 0.0), 1.0))
         if fill > 0:

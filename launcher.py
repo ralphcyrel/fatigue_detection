@@ -12,13 +12,25 @@ source of truth for how a session runs::
     Monitoring only (test)    -> main.py --force-phase monitoring
     Follow ignition           -> main.py            (real ignition input)
 
-While a session runs the launcher collapses to a slim always-on-top strip
-along the bottom of the screen with a STOP button (sends SIGINT, which
-``main.py`` already handles as Ctrl-C and cleans up after). Above it,
-``main.py`` shows its fullscreen data screen - no camera image (group
-decision, 2026-10-05). When the child exits the menu comes back with the
-result; an enrollment gets a full result screen (saved / refused and why /
-backend dropped the closed-eye baseline / backend rejected).
+While a session runs, a slim always-on-top strip along the bottom of the
+screen carries a STOP button (sends SIGINT, which ``main.py`` already
+handles as Ctrl-C and cleans up after). Above it, ``main.py`` shows its
+fullscreen screen: the data screen - no camera image (group decision,
+2026-10-05) - during pre-drive and monitoring, and during enrollment the
+enrollment screen with a live mirror view so the driver can position
+themselves. When the child exits the menu comes back with the result; an
+enrollment gets a full result screen (saved / refused and why / backend
+dropped the closed-eye baseline / backend rejected).
+
+The strip is a window of its own, created per session. The full window is
+mapped once at startup and never unmapped, re-typed or resized into the
+strip: window managers (labwc / Xwayland on the Pi) do not reliably
+re-apply position, type and fullscreen state to a window that was unmapped
+and mapped again, which left the menu drawn into the strip's place at the
+bottom of the screen. After a child exits the full window is re-asserted
+to its startup geometry, raised and focused, and checked again a few times
+(``REASSERT_CHECKS_MS``); every step is logged with requested and actual
+geometry.
 
 "Video stream" toggles ``main.py --debug-stream`` for the next sessions: a
 LAN-only MJPEG view of the camera for a laptop or phone (enrollment
@@ -28,9 +40,9 @@ Layout is proportional (grid weights + pixel fonts scaled from the size of
 the window), sized for the 800x480 HDMI touchscreen; touch targets stay
 well above the ~10 px error of a resistive panel. The size is that of the
 monitor the window is on (xrandr), not the whole X screen - which spans
-every monitor and, over VNC, can be far larger than the panel - and it is
-re-taken every time the menu comes back from a session; after that the
-layout follows whatever size the window manager actually gives the window.
+every monitor and, over VNC, can be far larger than the panel; whatever
+the window manager makes of it at startup is the geometry every later
+re-fit returns to, and the layout follows the window's actual size.
 Button text is fitted so the longest menu label stays whole.
 
     python launcher.py                        # fullscreen (kiosk)
@@ -120,6 +132,11 @@ PILL_TEXT: Dict[Optional[bool], str] = {
 }
 
 REFIT_DELAY_MS = 100         # let a window-manager resize settle before re-laying out
+# Geometry checks after startup and after every child exit: each one logs
+# requested vs actual geometry and, after a child exit, re-asserts the
+# startup geometry if the window manager has not restored it.
+REASSERT_CHECKS_MS = (150, 600, 1500)
+MAX_REASSERTS = 3            # per child exit; after that, lay out for what the WM gives
 
 PING_INTERVAL_S = 10.0       # backend reachability refresh
 RESULT_POLL_MS = 100         # how often the Tk thread drains worker results
@@ -532,14 +549,19 @@ class Launcher:
         if self.api_problem:
             logger.error("API SETTINGS: %s", self.api_problem)
 
-        # The window the current layout is for. Set by _apply_size, never
-        # read back from the display mid-screen.
-        self.win_x = self.win_y = 0
+        # The size the current layout is for (set by _apply_size).
         self.win_w = self.win_h = 0
         self.scale = 1.0
-        self._mode: Optional[str] = None            # "full" or "strip"
+        # (x, y, w, h) of the full window as it settled at startup: what
+        # every re-fit after a session returns to.
+        self._home: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self._redraw: Callable[[], None] = lambda: None   # current full screen
         self._refit_job: Optional[str] = None
+        self._check_jobs: List[str] = []
+        # No re-asserts until the startup checks have recorded _home.
+        self._reasserts = MAX_REASSERTS
+        self._keep_fullscreen = True                # False after Escape (development)
+        self.strip: Optional[tk.Toplevel] = None    # the STOP strip while a session runs
 
         # Sizes are set by _apply_size. The other fonts are re-fitted
         # wherever they are used, so shrinking one never shrinks text
@@ -556,12 +578,13 @@ class Launcher:
         root.title("Fatigue Detection Launcher")
         root.configure(bg=BG)
         root.protocol("WM_DELETE_WINDOW", self.quit)
-        root.bind("<Escape>", lambda _e: root.attributes("-fullscreen", False))
+        root.bind("<Escape>", self._leave_fullscreen)
         root.bind("<Configure>", self._on_configure)
 
         self.container: Optional[tk.Frame] = None
         self.picker_body: Optional[tk.Frame] = None
         self._picker_title = ""
+        self._place_full_window()
         self.show_menu()
         self._schedule_ping()
 
@@ -605,9 +628,143 @@ class Launcher:
         logger.info("Display %dx%d (%s), scale %.2f, button font %d px",
                     w, h, source, self.scale, button_px)
 
+    @property
+    def _kiosk(self) -> bool:
+        """Fullscreen on the detected monitor (neither --windowed nor --screen-size)."""
+        return not (self.windowed or self.forced_size)
+
+    @staticmethod
+    def _set_x11_type(window: tk.Wm, wm_type: str) -> None:
+        """_NET_WM_WINDOW_TYPE hint (X11 only; WMs read it when the window first maps)."""
+        if sys.platform.startswith("linux"):
+            try:
+                window.attributes("-type", wm_type)
+            except tk.TclError:
+                pass
+
+    def _place_full_window(self) -> None:
+        """
+        Startup: size and place the full window before its first map, which
+        is when the window manager reads geometry and fullscreen state. This
+        is the only time the full window is unmapped or re-configured from
+        scratch; afterwards it stays mapped (see _reassert_full_window).
+        """
+        x, y, w, h, source = self._target_geometry()
+        self._home = (x, y, w, h)
+        self._apply_size(w, h, source)
+        self.root.withdraw()
+        # A forced size outside --windowed is borderless: no title bar eats
+        # into it and no window manager resizes it.
+        self.root.overrideredirect(bool(self.forced_size) and not self.windowed)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.root.attributes("-fullscreen", self._kiosk)
+        self.root.deiconify()
+        self._log_geometry("startup")
+        self._schedule_checks("startup")
+
+    def _actual_geometry(self) -> Tuple[int, int, int, int]:
+        """(x, y, w, h) of the full window as the display has it now."""
+        self.root.update_idletasks()
+        return (self.root.winfo_rootx(), self.root.winfo_rooty(),
+                self.root.winfo_width(), self.root.winfo_height())
+
+    def _at_home(self, geometry: Tuple[int, int, int, int]) -> bool:
+        """Whether ``geometry`` is the startup one (size only under --windowed: decorations)."""
+        if self.windowed:
+            return geometry[2:] == self._home[2:]
+        return geometry == self._home
+
+    def _log_geometry(self, stage: str, note: str = "") -> None:
+        x, y, w, h = self._home
+        ax, ay, aw, ah = self._actual_geometry()
+        try:
+            fullscreen = bool(int(self.root.attributes("-fullscreen")))
+        except (tk.TclError, ValueError):
+            fullscreen = False
+        logger.info("Window [%s]: requested %dx%d+%d+%d, actual %dx%d+%d+%d (%s, %s, "
+                    "fullscreen %s), layout %dx%d%s",
+                    stage, w, h, x, y, aw, ah, ax, ay, self.root.state(),
+                    "mapped" if self.root.winfo_ismapped() else "NOT MAPPED",
+                    "on" if fullscreen else "off", self.win_w, self.win_h,
+                    f" - {note}" if note else "")
+
+    def _reassert_full_window(self, force: bool) -> None:
+        """
+        Put the full window back at its startup geometry, raised and focused,
+        without unmapping it. ``force`` removes and re-adds fullscreen so the
+        window manager applies it afresh; plain re-adding is a no-op for a
+        window that is still fullscreen.
+        """
+        x, y, w, h = self._home
+        if self.root.state() != "normal":
+            self.root.deiconify()
+        if self._kiosk and self._keep_fullscreen:
+            if force:
+                self.root.attributes("-fullscreen", False)
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+            self.root.attributes("-fullscreen", True)
+        else:
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.root.lift()
+        self.root.focus_force()
+
+    def _restore_full_window(self, stage: str) -> None:
+        """
+        After a child exits: back to exactly the startup state - geometry,
+        fullscreen, layout - then raised and focused, and checked again at
+        REASSERT_CHECKS_MS in case the window manager is still busy.
+        """
+        self._reasserts = 0
+        self._keep_fullscreen = True
+        self._reassert_full_window(force=False)
+        self._apply_size(self._home[2], self._home[3], "startup geometry")
+        self._schedule_checks(stage)
+
+    def _schedule_checks(self, stage: str) -> None:
+        for job in self._check_jobs:
+            self.root.after_cancel(job)
+        self._check_jobs = [self.root.after(ms, lambda ms=ms: self._check_full_window(stage, ms))
+                            for ms in REASSERT_CHECKS_MS]
+
+    def _check_full_window(self, stage: str, after_ms: int) -> None:
+        """
+        One scheduled check: log requested vs actual geometry; re-assert the
+        startup geometry if the window manager has not restored it; lay out
+        for the actual size. At startup the settled geometry *becomes* the
+        startup geometry (the window manager's fullscreen is the screen).
+        """
+        geometry = self._actual_geometry()
+        label = f"{stage}, +{after_ms} ms"
+        if not self.root.winfo_ismapped() or geometry[2] < 2:
+            self._log_geometry(label, "not mapped yet")
+            return
+        note = "re-fit complete"
+        if stage == "startup":
+            self._home = (*self._home[:2], *geometry[2:]) if self.windowed else geometry
+            note = "startup geometry recorded"
+            if after_ms == REASSERT_CHECKS_MS[-1]:
+                self._reasserts = 0                 # settled: re-asserts allowed from now on
+        elif not self._at_home(geometry):
+            if self._reasserts < MAX_REASSERTS:
+                self._reasserts += 1
+                self._log_geometry(label, f"NOT the startup geometry - re-asserting "
+                                          f"({self._reasserts}/{MAX_REASSERTS})")
+                self._reassert_full_window(force=True)
+                self._schedule_checks(stage)        # verify it (bounded by MAX_REASSERTS)
+                return
+            note = "window manager keeps another geometry - laid out for it"
+        self._fit_layout(geometry[2], geometry[3])
+        self._log_geometry(label, note)
+
+    def _fit_layout(self, w: int, h: int) -> None:
+        """Re-lay out the current screen for a ``w`` x ``h`` window, if that is new."""
+        if (w, h) != (self.win_w, self.win_h):
+            self._apply_size(w, h, "window as sized by the window manager")
+            self._redraw()
+
     def _on_configure(self, event: tk.Event) -> None:
-        """The window manager resized the full window: re-lay out to its real size."""
-        if (event.widget is not self.root or self._mode != "full" or self.forced_size
+        """The full window changed size: re-fit once it settles."""
+        if (event.widget is not self.root or self.forced_size
                 or (event.width, event.height) == (self.win_w, self.win_h)):
             return
         if self._refit_job is not None:
@@ -615,61 +772,30 @@ class Launcher:
         self._refit_job = self.root.after(REFIT_DELAY_MS, self._refit)
 
     def _refit(self) -> None:
+        """
+        A size that differs from the layout's: in kiosk mode re-assert the
+        startup geometry (within the re-assert budget), otherwise - or once
+        the budget is spent - lay out for the size the window has.
+        """
         self._refit_job = None
-        w, h = self.root.winfo_width(), self.root.winfo_height()
-        if self._mode != "full" or w < 2 or (w, h) == (self.win_w, self.win_h):
+        geometry = self._actual_geometry()
+        if geometry[2] < 2:
             return
-        if not self.windowed:
-            self.win_x, self.win_y = self.root.winfo_x(), self.root.winfo_y()
-        self._apply_size(w, h, "window as sized by the window manager")
-        self._redraw()
+        if (self._kiosk and self._keep_fullscreen and not self._at_home(geometry)
+                and self._reasserts < MAX_REASSERTS):
+            self._reasserts += 1
+            self._log_geometry("resized by the window manager",
+                               f"NOT the startup geometry - re-asserting "
+                               f"({self._reasserts}/{MAX_REASSERTS})")
+            self._reassert_full_window(force=True)
+            self._schedule_checks("after re-assert")
+            return
+        self._fit_layout(geometry[2], geometry[3])
 
-    def _set_x11_type(self, wm_type: str) -> None:
-        """_NET_WM_WINDOW_TYPE hint (X11 only; WMs read it when the window maps)."""
-        if sys.platform.startswith("linux"):
-            try:
-                self.root.attributes("-type", wm_type)
-            except tk.TclError:
-                pass
-
-    def _show_full_window(self) -> None:
-        """
-        Fullscreen kiosk on the monitor the launcher is on, or a fixed-size
-        window (--windowed / --screen-size), with the layout sized to it.
-        Runs on every return from the strip, so no size from an earlier
-        screen survives; _on_configure then follows the size the window
-        manager really gives (e.g. when it fullscreens to another monitor).
-        """
-        x, y, w, h, source = self._target_geometry()
-        self._mode = "full"
-        self.win_x, self.win_y = x, y
-        self._apply_size(w, h, source)
-        self.root.withdraw()
-        self.root.attributes("-topmost", False)
-        self._set_x11_type("normal")
-        # A forced size outside --windowed is borderless: no title bar eats
-        # into it and no window manager resizes it.
-        self.root.overrideredirect(bool(self.forced_size) and not self.windowed)
-        if self.windowed or self.forced_size:
-            self.root.attributes("-fullscreen", False)
-            self.root.geometry(f"{w}x{h}+{x}+{y}")
-        else:
-            self.root.geometry(f"{w}x{h}+{x}+{y}")
-            self.root.attributes("-fullscreen", True)
-        self.root.deiconify()
-
-    def _show_strip_window(self) -> None:
-        """Collapse to a bar along the bottom edge that stays above the preview."""
-        h = self.px(STRIP_PX)
-        self._mode = "strip"
-        self.root.withdraw()
+    def _leave_fullscreen(self, _event: Optional[tk.Event] = None) -> None:
+        """Escape (development): leave fullscreen, and stop re-asserting it until a session ends."""
+        self._keep_fullscreen = False
         self.root.attributes("-fullscreen", False)
-        # Window managers keep dock-type windows above normal ones; topmost
-        # covers WMs that ignore the type, and the poll loop re-lifts too.
-        self._set_x11_type("dock")
-        self.root.attributes("-topmost", True)
-        self.root.geometry(f"{self.win_w}x{h}+{self.win_x}+{self.win_y + self.win_h - h}")
-        self.root.deiconify()
 
     def _clear(self) -> tk.Frame:
         """Replace the screen container so grid weights never leak between screens."""
@@ -770,12 +896,7 @@ class Launcher:
     # ---- screens ---------------------------------------------------------
 
     def _show(self, draw: Callable[[], None]) -> None:
-        """
-        Draw a full-window screen, re-fitting the window first when coming
-        back from the strip; a later resize redraws it with ``draw`` too.
-        """
-        if self._mode != "full":
-            self._show_full_window()
+        """Draw a full-window screen; a later re-fit redraws it with ``draw`` too."""
         self._redraw = draw
         draw()
 
@@ -971,18 +1092,15 @@ class Launcher:
         body.rowconfigure(0, weight=1)
         body.rowconfigure(1, weight=0, minsize=self.px(ROW_MIN_PX))
         name = driver.get("full_name") or f"Driver {driver.get('id')}"
-        steps = ("Positioning (text guidance on this screen), face capture, closed-eye check "
-                 "(eyes shut on the beep, open on the long beep), then 60 s calibration - "
-                 "about 2-3 minutes.")
+        steps = ("Positioning (live mirror view and guidance on this screen), face capture, "
+                 "closed-eye check (eyes shut on the beep, open on the long beep), then 60 s "
+                 "calibration - about 2-3 minutes.")
         note = (f"Already enrolled - this will replace their calibration.\n{steps}"
                 if driver.get("is_enrolled") else steps)
         if self.api_problem:
             note += f"\n\n{self.api_problem}"
         if self.stream_on:
-            note += f"\n\nPosition the driver with the video stream:\n{self._stream_url()}"
-        else:
-            note += ("\n\nThe panel shows no camera image. For fine positioning, go back "
-                     "and turn the Video stream ON (laptop / phone view).")
+            note += f"\n\nOperator view of the camera (video stream):\n{self._stream_url()}"
         pad = self.px(4)
         text = tk.Label(body, text=f"Enrol {name} (id {driver.get('id')})?\n\n{note}",
                         font=self.font_detail, bg=BG, fg=FG, justify="left",
@@ -1038,9 +1156,52 @@ class Launcher:
         self._show_running(session)
 
     def _show_running(self, session: Session) -> None:
-        """Slim bottom strip: what is running + a STOP button."""
+        """
+        A session started: the full window shows a "running" screen and goes
+        below main.py's window (it stays mapped, fullscreen, where it is);
+        the STOP strip opens as a window of its own.
+        """
+        self._show(lambda: self._draw_session_screen(session))
+        self.root.lower()
+        self._open_strip(session)
+        self.root.after(CHILD_POLL_MS, self._poll_session)
+
+    def _draw_session_screen(self, session: Session) -> None:
+        """Behind main.py's window - seen only while it starts, or if it shows none."""
         f = self._clear()
-        self._show_strip_window()
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(1, weight=1)
+        f.rowconfigure(2, minsize=self.px(STRIP_PX))   # under the STOP strip: kept empty
+        self._header(f, "Session running").grid(row=0, column=0, sticky="nsew")
+        text = tk.Label(f, text=f"{session.label} is running.\n\nIts screen opens on top of "
+                                "this one. Stop it with STOP at the bottom of the screen.",
+                        font=self.font_detail, bg=BG, fg=FG, justify="center",
+                        wraplength=self.win_w - self.px(24))
+        text.grid(row=1, column=0, sticky="nsew")
+        self._shrink_to_height([text], self.font_detail, self.win_h - self.px(HEADER_PX)
+                               - self.px(STRIP_PX), self.px(FONT_TITLE_PX))
+
+    def _open_strip(self, session: Session) -> None:
+        """
+        The STOP strip: a new toplevel per session whose type (dock) and
+        stacking (topmost) are set before its first map - when window
+        managers read them - so nothing about the full window has to change.
+        """
+        self._close_strip()
+        x, y = self._home[:2]
+        h = self.px(STRIP_PX)
+        strip = tk.Toplevel(self.root, bg=BG)
+        strip.withdraw()
+        strip.title("Fatigue Detection - STOP")
+        strip.protocol("WM_DELETE_WINDOW", self._stop_session)
+        strip.overrideredirect(bool(self.forced_size) and not self.windowed)
+        self._set_x11_type(strip, "dock")
+        strip.attributes("-topmost", True)
+        strip.geometry(f"{self.win_w}x{h}+{x}+{y + self.win_h - h}")
+        self.strip = strip
+
+        f = tk.Frame(strip, bg=BG)
+        f.pack(fill="both", expand=True)
         pad = self.px(4)
         stop = self._button(f, "■  STOP", self._stop_session, bg=BTN_STOP, font=self.font_stop)
         self._shrink_to_height([stop], self.font_stop, self.px(STRIP_PX) - 2 * pad,
@@ -1062,7 +1223,12 @@ class Launcher:
             f, text=text, font=self.font_strip, bg=BG, fg=FG, anchor="w", justify="left",
             padx=self.px(10), pady=0, bd=0)
         self.running_label.grid(row=0, column=0, sticky="nsew")
-        self.root.after(CHILD_POLL_MS, self._poll_session)
+        strip.deiconify()
+
+    def _close_strip(self) -> None:
+        if self.strip is not None:
+            self.strip.destroy()
+            self.strip = None
 
     def _stop_session(self) -> None:
         if self.session:
@@ -1073,10 +1239,15 @@ class Launcher:
         if self.session is None:
             return
         if self.session.running:
-            self.root.lift()            # stay above the cv2 preview
+            if self.strip is not None:
+                self.strip.lift()       # stay above main.py's fullscreen window
             self.root.after(CHILD_POLL_MS, self._poll_session)
             return
         session, self.session = self.session, None
+        code = session.proc.poll() if session.proc is not None else None
+        self._log_geometry(f"child exited: {session.label}, exit code {code}")
+        self._close_strip()
+        self._restore_full_window(f"after {session.label}")
         if session.enroll:
             self.show_enroll_result(session.enroll_result())
             return

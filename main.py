@@ -268,9 +268,10 @@ _heartbeat: Optional["Heartbeat"] = None
 _display_available: bool = True
 # What the window shows. "data": the data screen, no camera image - the
 # default for pre-drive and monitoring (group decision 2026-10-05). "enroll":
-# the enrollment screen (face-box outline, guidance, countdown; no camera
-# image either). "video": the annotated camera preview (--show-video, a
-# diagnostic only). "none": --no-preview.
+# the enrollment screen (live mirror view so the driver can position
+# themselves, face box, guidance, countdown - 2026-10-07: the one phase the
+# panel shows the camera). "video": the annotated camera preview
+# (--show-video, a diagnostic only). "none": --no-preview.
 _display_mode: str = "data"
 _fullscreen: bool = False
 _window_ready: bool = False
@@ -1173,9 +1174,10 @@ def enroll_view(
     landmarks: Optional[np.ndarray] = None,
 ) -> None:
     """
-    One enrollment frame: fill the panel's enrollment screen, and - only when
-    the debug stream wants this frame (or under --show-video) - annotate the
-    camera frame with the same guidance, the face box and the landmarks.
+    One enrollment frame: fill the panel's enrollment screen (``frame`` is
+    its live mirror view), and - only when the debug stream wants this frame
+    (or under --show-video) - annotate the camera frame with the same
+    guidance, the face box and the landmarks.
 
     ``face``: True face found, False no face, None not looked for this step.
     Call after every other use of ``frame``.
@@ -1193,7 +1195,7 @@ def enroll_view(
     elif face:
         face_text, face_color = "FACE DETECTED", GREEN
     else:
-        face_text, face_color = "NO FACE - operator: check camera aim on the video stream", RED
+        face_text, face_color = "NO FACE - face the camera (operator: check its aim)", RED
     _enroll = EnrollState(
         driver_name=_enroll_report.get("driver_name"), step=step, instruction=instruction,
         instruction_color=color, detail=detail, note=note, face_text=face_text,
@@ -1201,6 +1203,10 @@ def enroll_view(
         guide=guide_zone() if outline else None, progress=progress,
         progress_label=progress_label, countdown=countdown, countdown_label=countdown_label,
         fps=_rate.fps if _rate is not None else None,
+        # The live view, by reference: render_enroll reads it only on a
+        # redraw (DATA_SCREEN_HZ), so the capture loop does no extra work.
+        # Copied only when the stream is about to draw on this frame below.
+        image=frame.copy() if _annotate_frame else frame, mirror=not ENROLL_CAMERA_HFLIP,
     )
     if not _annotate_frame:
         return  # nobody sees the camera image this frame
@@ -1263,8 +1269,8 @@ def run_positioning(extractor: LandmarkExtractor) -> Optional[Box]:
             return box
         enroll_view(
             frame, step, text, color=GREEN if ok else (0, 200, 255),
-            detail="Sit as you will drive and look straight at the camera. "
-                   "Operator: fine-tune on the video stream.",
+            detail="Sit as you will drive and look straight at the camera - "
+                   "bring the dot on your face into the dashed box.",
             box=box, face=box is not None, box_ok=ok,
             progress=held / ENROLL_POSITION_HOLD_S,
             progress_label=f"Holding position {held:.1f} / {ENROLL_POSITION_HOLD_S:.0f} s",

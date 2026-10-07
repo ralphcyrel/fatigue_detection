@@ -155,15 +155,18 @@ def widgets(parent):
 
 
 def cut_off(app):
-    """Every label / button that needs more room than it got, or sticks out of the window."""
-    root = app.root
-    root.update()
-    rw, rh = root.winfo_width(), root.winfo_height()
+    """
+    Every label / button that needs more room than it got, or sticks out of
+    its window (the full window, or the STOP strip while a session runs).
+    """
+    app.root.update()
     bad = []
-    for w in widgets(root):
+    for w in widgets(app.root):
         if not isinstance(w, (tk.Label, tk.Button)) or not w.winfo_ismapped():
             continue
-        x, y = w.winfo_rootx() - root.winfo_rootx(), w.winfo_rooty() - root.winfo_rooty()
+        top = w.winfo_toplevel()
+        rw, rh = top.winfo_width(), top.winfo_height()
+        x, y = w.winfo_rootx() - top.winfo_rootx(), w.winfo_rooty() - top.winfo_rooty()
         width, height = w.winfo_width(), w.winfo_height()
         if (w.winfo_reqwidth() > width or w.winfo_reqheight() > height
                 or x < 0 or y < 0 or x + width > rw or y + height > rh):
@@ -254,14 +257,18 @@ def test_enroll_result_fits(make_app, size, result):
 
 @pytest.mark.parametrize("size", SIZES)
 def test_running_strip_fits(make_app, size):
+    """The strip is its own window along the bottom; the full window stays as it was."""
     app = make_app(size)
     app.stream_on = True
     app._show_running(SimpleNamespace(label=f"Enroll {LONG_NAME}"))
     app.root.update()
-    strip_h = app.px(launcher.STRIP_PX)
-    assert (app.root.winfo_width(), app.root.winfo_height()) == (size[0], strip_h)
-    assert app.root.winfo_y() == size[1] - strip_h
-    assert cut_off(app) == []
+    strip, strip_h = app.strip, app.px(launcher.STRIP_PX)
+    assert strip is not None and strip is not app.root and strip.winfo_ismapped()
+    assert (strip.winfo_width(), strip.winfo_height()) == (size[0], strip_h)
+    assert strip.winfo_rooty() == size[1] - strip_h
+    assert app.root.winfo_ismapped()
+    assert (app.root.winfo_width(), app.root.winfo_height()) == size
+    assert cut_off(app) == []                   # strip, and the screen behind main.py's
 
 
 def wait_for(app, condition, timeout=3.0):
@@ -272,6 +279,136 @@ def wait_for(app, condition, timeout=3.0):
     return condition()
 
 
+def settled(app):
+    """Wait out the startup geometry checks (re-asserts are allowed after them)."""
+    assert wait_for(app, lambda: app._reasserts == 0)
+
+
+def sleeper(seconds):
+    return subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({seconds})"])
+
+
+def run_session(app, seconds=0.6, label="Pre-drive assessment"):
+    """A real child that exits by itself, driven through the launcher's own poll loop."""
+    session = launcher.Session(label, [])
+    session.proc = sleeper(seconds)
+    app.session = session
+    app._show_running(session)
+    assert wait_for(app, lambda: app.session is None, timeout=10)
+    return session
+
+
+def test_session_never_unmaps_or_reconfigures_the_full_window(make_app, monkeypatch):
+    """
+    The cause of the Pi bug: the full window was unmapped, re-typed as a dock
+    and resized into the strip, then mapped again - and the window manager did
+    not put it back. Now nothing touches it until the child has exited.
+    """
+    app = make_app((800, 480))
+    settled(app)
+    calls = []
+    for name in ("withdraw", "iconify", "overrideredirect", "geometry", "attributes"):
+        real = getattr(app.root, name)
+        monkeypatch.setattr(app.root, name,
+                            lambda *a, _n=name, _r=real: (calls.append((_n, a)), _r(*a))[1])
+    typed = []
+    real_type = launcher.Launcher._set_x11_type
+    monkeypatch.setattr(launcher.Launcher, "_set_x11_type", staticmethod(
+        lambda w, t: (typed.append((w, t, bool(w.winfo_ismapped()))), real_type(w, t))[1]))
+
+    session = launcher.Session("Pre-drive assessment", [])
+    session.proc = sleeper(30)
+    app.session = session
+    app._show_running(session)
+    app.root.update()
+    try:
+        assert calls == [], "the full window must not be re-configured for a session"
+        assert typed == [(app.strip, "dock", False)], "strip typed before its first map"
+        assert int(app.strip.attributes("-topmost")) == 1
+        assert app.root.winfo_ismapped()
+        assert app._actual_geometry() == app._home
+    finally:
+        session.proc.kill()
+        session.proc.wait()
+    assert wait_for(app, lambda: app.session is None)
+    assert app.strip is None
+    assert not any(n in ("withdraw", "iconify") for n, _ in calls), \
+        "the restore must not unmap the window either"
+
+
+def misplace_after_restore(app, monkeypatch, wrong):
+    """Make the 'window manager' put the window somewhere else right after the restore."""
+    real = app._restore_full_window
+
+    def restore(stage):
+        real(stage)
+        wrong()
+    monkeypatch.setattr(app, "_restore_full_window", restore)
+
+
+def test_full_window_restored_after_the_window_manager_misplaces_it(make_app, monkeypatch,
+                                                                    caplog):
+    """The Pi symptom - window left in the strip's place - is detected, re-asserted, logged."""
+    caplog.set_level("INFO", logger="launcher")
+    app = make_app((800, 480))
+    settled(app)
+    home = app._home
+    assert home == (0, 0, 800, 480)
+    menu_layout = (app.win_w, app.win_h, app.scale)
+    misplace_after_restore(app, monkeypatch, lambda: app.root.geometry("800x66+0+414"))
+
+    run_session(app)
+    assert wait_for(app, lambda: app._actual_geometry() == home
+                    and "re-fit complete" in caplog.text)
+    assert (app.win_w, app.win_h, app.scale) == menu_layout
+    assert app.last_result.endswith("finished OK")
+    assert cut_off(app) == []
+    log = caplog.text
+    assert "Window [startup]" in log
+    assert "Window [child exited: Pre-drive assessment, exit code 0]" in log
+    assert "actual 800x66+0+414" in log and "re-asserting (1/3)" in log
+    assert "Window [after Pre-drive assessment" in log and "re-fit complete" in log
+
+
+def test_kiosk_fullscreen_restored_after_a_session(make_app, monkeypatch, caplog):
+    """Kiosk mode: fullscreen is re-asserted (removed and re-added) when the WM drops it."""
+    caplog.set_level("INFO", logger="launcher")
+    monkeypatch.setattr(launcher, "detect_monitors", lambda: [])
+    app = make_app(None)
+    settled(app)
+    home = app._home
+    assert int(app.root.attributes("-fullscreen")) == 1
+    x, y, w, h = home
+
+    def wm_drops_fullscreen():
+        app.root.attributes("-fullscreen", False)
+        app.root.geometry(f"{w}x66+{x}+{y + h - 66}")
+    misplace_after_restore(app, monkeypatch, wm_drops_fullscreen)
+
+    run_session(app, label="Monitoring only (test)")
+    assert wait_for(app, lambda: app._actual_geometry() == home
+                    and int(app.root.attributes("-fullscreen")) == 1
+                    and "re-fit complete" in caplog.text)
+    assert (app.win_w, app.win_h) == (w, h)
+    assert "re-asserting" in caplog.text
+
+
+def test_child_exit_logs_geometry_three_times(make_app, caplog):
+    """Startup, immediately after the child exits, and after the re-fit - with both sizes."""
+    caplog.set_level("INFO", logger="launcher")
+    app = make_app((800, 480))
+    settled(app)
+    run_session(app)
+    assert wait_for(app, lambda: "Window [after Pre-drive assessment, +1500 ms]" in caplog.text)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Window [")]
+    stages = [line.split("]")[0] for line in lines]
+    assert stages[0] == "Window [startup"
+    exited = stages.index("Window [child exited: Pre-drive assessment, exit code 0")
+    assert "Window [after Pre-drive assessment, +150 ms" in stages[exited + 1:]
+    for line in lines:
+        assert "requested 800x480+0+0" in line and "actual " in line
+
+
 def test_layout_follows_the_window_and_refits_after_a_session(make_app):
     """
     The window manager's size wins over the one asked for, and coming back
@@ -280,6 +417,7 @@ def test_layout_follows_the_window_and_refits_after_a_session(make_app):
     app = make_app(None, windowed=True)
     panel = (launcher.config.DISPLAY_WIDTH, launcher.config.DISPLAY_HEIGHT)
     assert (app.win_w, app.win_h) == panel
+    settled(app)                                # the startup size is recorded first
     app.root.geometry("1100x700")
     assert wait_for(app, lambda: (app.win_w, app.win_h) == (1100, 700))
     assert app.scale == launcher.layout_scale(1100, 700)

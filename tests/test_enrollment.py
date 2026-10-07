@@ -1,6 +1,7 @@
 """
 Enrollment: positioning guidance, early refusals, the result file the
-launcher reads, and a full run on the enrollment screen (no camera image).
+launcher reads, the enrollment screen's live mirror view, and a full run on
+the enrollment screen.
 """
 
 import json
@@ -11,10 +12,12 @@ import types
 import numpy as np
 import pytest
 
-from fakes import FakeAPI, FakeRect, ScriptedIgnition, close_eyes, synthetic_landmarks
+from fakes import (FakeAPI, FakeRect, MarkedCam, ScriptedIgnition, close_eyes, shows_camera,
+                   synthetic_landmarks)
 from modules.api import CALIBRATION_SOURCE_DEVICE, Calibration
 from modules.calibration import CalibrationManager, ClosedEyeCapture
 from modules.phase import Phase
+from modules.session_display import BG, EnrollState, enroll_text_layout, render_enroll
 
 W, H = 640, 480
 
@@ -62,6 +65,95 @@ def test_result_file_when_stopped(m, tmp_path):
     m.write_enroll_result(str(out), 3, 0, interrupted=True)
     result = json.loads(out.read_text())
     assert result["outcome"] == "stopped" and result["driver_id"] == 3
+
+
+LEFT, RIGHT = (200, 30, 30), (30, 30, 200)         # BGR halves of a test frame
+
+
+def two_halves():
+    frame = np.empty((H, W, 3), np.uint8)
+    frame[:, :W // 2], frame[:, W // 2:] = LEFT, RIGHT
+    return frame
+
+
+def view_colours(img):
+    """Colour at the left and right of the enrollment screen's camera view (row 200)."""
+    row = img[200, 18:346]
+    cols = [i for i in range(len(row)) if tuple(row[i]) in (LEFT, RIGHT)]
+    return tuple(row[cols[5]]), tuple(row[cols[-5]])
+
+
+@pytest.mark.parametrize("mirror, expected", [(True, (RIGHT, LEFT)), (False, (LEFT, RIGHT))])
+def test_enroll_screen_shows_the_camera_as_a_mirror_view(mirror, expected):
+    s = EnrollState(step="Step 1 of 4 - Position", instruction="Move to your left",
+                    guide=(0.35, 0.32, 0.65, 0.68), image=two_halves(), mirror=mirror)
+    img = render_enroll(s, 800, 480, reserve_bottom=66)
+    assert img.shape == (480, 800, 3)
+    assert view_colours(img) == expected
+    assert (img[-66:] == np.array(BG, np.uint8)).all(), "launcher strip area left empty"
+    assert not (img[:, 360:] == np.array(LEFT, np.uint8)).all(axis=2).any(), \
+        "camera pixels stay inside the view, clear of the guidance column"
+
+
+def test_enroll_screen_countdown_replaces_the_view():
+    """Eyes-shut countdown: the number, not the face (the driver cannot see it anyway)."""
+    s = EnrollState(instruction="CLOSE YOUR EYES", countdown=2.0, image=two_halves())
+    img = render_enroll(s, 800, 480, reserve_bottom=66)
+    assert not (img == np.array(LEFT, np.uint8)).all(axis=2).any()
+
+
+@pytest.mark.parametrize("instruction, detail, note", [
+    ("Move up (sit higher or tilt the camera down)",
+     "Sit as you will drive and look straight at the camera - bring the dot on your face "
+     "into the dashed box.", ""),
+    ("Look at the road", "Stay alert, look at the road as when driving, keep your mouth "
+     "relaxed and do not talk.", ""),
+    ("CLOSE YOUR EYES on the beep",
+     'Keep them shut until the long beep (about 3 s). Operator: say "open" at the long beep.',
+     "Attempt 2 did not pass: closed / open 0.81 is above 0.60 - the eyes did not close, or "
+     "the landmarks do not follow the eyelids. Close the eyes fully this time."),
+])
+def test_enroll_text_is_never_dropped(instruction, detail, note):
+    """Long guidance shrinks to fit the 800x480 screen above the progress bar - no line lost."""
+    s = EnrollState(instruction=instruction, detail=detail, note=note, progress=0.5)
+    # render_enroll at 800x480 with the launcher's 66 px strip: right column
+    # from x 366 (424 px wide), first baseline 90, last above the progress bar.
+    x0, max_w, y0, max_y = 366, 424, 90, 310
+    lines = enroll_text_layout(s, x0, y0, max_w, max_y)
+    for block, text in enumerate((instruction, detail, note)):
+        drawn = " ".join(line for line, *_rest, b in lines if b == block)
+        assert drawn.split() == text.split(), f"block {block} lost words"
+    assert lines[-1][1] <= max_y
+    import cv2
+    for line, _y, scale, thick, font, _b in lines:
+        assert cv2.getTextSize(line, font, scale, thick)[0][0] <= max_w
+
+
+def test_positioning_shows_the_live_camera(m, monkeypatch):
+    """Enrollment mode: the panel's canvases carry the camera image (and stay 800x480)."""
+    shown = []
+    monkeypatch.setattr(m, "show_frame", lambda img: (shown.append(img), -1)[1])
+    monkeypatch.setattr(m, "ENROLL_POSITION_HOLD_S", 0.4)
+    m._camera = MarkedCam()
+    m._display_mode, m._display_available, m._reserve_bottom = "enroll", True, 66
+
+    class InPosition:
+        def extract(self, frame):
+            return None, FakeRect(200, 120, 440, 360)
+
+    assert m.run_positioning(InPosition()) is not None
+    assert shown and all(img.shape == (480, 800, 3) for img in shown)
+    assert all(shows_camera(img) for img in shown), "every enrollment redraw has the live view"
+    assert all((img[-66:] == np.array(BG, np.uint8)).all() for img in shown)
+
+
+def test_live_view_is_not_copied_per_frame(m):
+    """The frame is held by reference (no per-frame cost) unless the stream will draw on it."""
+    m._display_mode, m._display_available = "enroll", True
+    frame = m.capture_frame()
+    m.enroll_view(frame, "Step 1 of 4 - Position", "Face the camera")
+    assert m._enroll.image is frame
+    assert m._enroll.mirror is (not m.ENROLL_CAMERA_HFLIP)
 
 
 def test_positioning_timeout_refuses(m, monkeypatch):
@@ -124,15 +216,19 @@ def test_full_enrollment_on_the_enrollment_screen(m, rig, monkeypatch):
             return Calibration({"ear_baseline": 0.3, "ear_closed_baseline": 0.1}, did,
                                CALIBRATION_SOURCE_DEVICE, 1, "pi-01")
 
-    shown, steps = [], set()
+    shown, steps, live = [], set(), set()
     real_render = m.render_enroll
 
     def render(state, w, h, r):
         steps.add(state.step.split(" (")[0])
-        return real_render(state, w, h, r)
+        img = real_render(state, w, h, r)
+        if shows_camera(img):
+            live.add(state.step.split(" (")[0])
+        return img
 
     monkeypatch.setattr(m, "render_enroll", render)
     monkeypatch.setattr(m, "show_frame", lambda img: (shown.append(img.shape), -1)[1])
+    m._camera = MarkedCam()
     monkeypatch.setattr(m, "ClosedEyeCapture", Capture)
     monkeypatch.setattr(m, "CalibrationManager", Calib)
     m._display_mode, m._display_available = "enroll", True
@@ -145,4 +241,5 @@ def test_full_enrollment_on_the_enrollment_screen(m, rig, monkeypatch):
     assert m._enroll_report["contrast"] < 0.6
     assert steps == {"Step 1 of 4 - Position", "Step 2 of 4 - Face capture",
                      "Step 3 of 4 - Closed eyes", "Step 4 of 4 - Calibration"}
-    assert shown and set(shown) == {(480, 800, 3)}, "no camera frame on the panel"
+    assert shown and set(shown) == {(480, 800, 3)}, "always the 800x480 enrollment screen"
+    assert live == steps, "the live view is on the panel in every enrollment step"

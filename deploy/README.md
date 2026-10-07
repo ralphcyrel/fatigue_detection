@@ -107,10 +107,16 @@ Live view*), so operators can open it without typing the URL.
 
 ## Notes
 
-- While a session runs the launcher collapses to a strip along the bottom
-  of the screen with a **STOP** button; `main.py`'s fullscreen data screen
-  sits above it. STOP sends SIGINT, the same as Ctrl-C, so `main.py` cleans
-  up normally.
+- While a session runs, a separate strip window along the bottom of the
+  screen carries a **STOP** button; `main.py`'s fullscreen screen sits above
+  the launcher's own (unchanged, still fullscreen) window. STOP sends
+  SIGINT, the same as Ctrl-C, so `main.py` cleans up normally. When the
+  session ends the launcher re-asserts its startup geometry, raises itself
+  and checks again 150 / 600 / 1500 ms later. Each step is logged to
+  `logs/start_launcher.log` (and `logs/launcher.log`) as
+  `Window [<stage>]: requested WxH+X+Y, actual WxH+X+Y (...), layout WxH`;
+  `NOT the startup geometry - re-asserting` means the window manager had
+  moved or resized it.
 - The in-vehicle display never shows the camera image during pre-drive or
   monitoring (group decision, 2026-10-05). For camera aim / landmark
   problems: `main.py --show-video` (local window), or the **Video stream**
@@ -118,9 +124,12 @@ Live view*), so operators can open it without typing the URL.
   `http://<pi-ip>:8080/<token>/` for a laptop or phone on the same network.
   Every other path is a 404. It is LAN-only, never recorded; the full URL
   is shown on the menu, the confirm screen and the strip, and logged.
-- Enrollment shows no camera image either: a face-box outline with text
-  guidance (step 1 positions the driver before the face capture), progress
-  bars and the closed-eye countdown. Fine positioning is done on the stream.
+- Enrollment is the one exception (2026-10-07): the enrollment screen shows
+  the live camera as a mirror view, with the face box and the dashed target
+  zone on it, next to the text guidance (step 1 positions the driver before
+  the face capture), progress bars and the closed-eye countdown. It is
+  redrawn at the data screen's 10 Hz, so it costs the capture loop nothing
+  measurable.
 - If the strip ends up hidden behind the session window on a Wayland
   desktop, switch the session to X11 (`raspi-config` → *Advanced Options* →
   *Wayland* → *X11*); dock/topmost hints are honoured reliably there.

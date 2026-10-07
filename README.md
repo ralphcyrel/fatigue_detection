@@ -158,11 +158,12 @@ single source of truth:
 | Follow ignition | `main.py` (real ignition input selects the phase) |
 
 The header shows the device id and whether the backend answers `/ping`. While a
-session runs the launcher shrinks to a bottom strip with a **STOP** button
-(sends SIGINT = Ctrl-C); when `main.py` exits the menu returns with the result.
-Layout is sized for the 800×480 HDMI touchscreen and scales up to a monitor;
-it fits the monitor the window is on (not the whole X / VNC desktop) and re-fits
-every time the menu returns from a session.
+session runs a separate bottom strip carries a **STOP** button (sends SIGINT =
+Ctrl-C); when `main.py` exits the menu returns with the result, back at the
+launcher's startup geometry (re-asserted, then checked; see
+[`deploy/README.md`](deploy/README.md) for the log lines). Layout is sized for
+the 800×480 HDMI touchscreen and scales up to a monitor; it fits the monitor the
+window is on (not the whole X / VNC desktop).
 
 ```bash
 python launcher.py                        # fullscreen

@@ -77,6 +77,25 @@ class FakeCam:
         pass
 
 
+# A BGR colour the screens never draw: finding it on a canvas means camera
+# pixels reached the panel.
+MARKER = (1, 250, 3)
+
+
+class MarkedCam(FakeCam):
+    """FakeCam whose frames are filled with ``MARKER``."""
+
+    def read(self) -> np.ndarray:
+        frame = super().read()
+        frame[:] = MARKER
+        return frame
+
+
+def shows_camera(canvas: np.ndarray) -> bool:
+    """Whether any pixel of ``canvas`` is ``MARKER``."""
+    return bool((canvas == np.array(MARKER, np.uint8)).all(axis=2).any())
+
+
 class FakeExtractor:
     """Landmark extraction with a fixed cost; ``face()`` decides each frame."""
 

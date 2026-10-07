@@ -1,15 +1,18 @@
 """
-Display: the in-vehicle window never receives a camera frame outside
---show-video, frames are annotated only when someone sees them, and the
-data screen renders every state.
+Display: the in-vehicle window never shows camera pixels during pre-drive
+and monitoring (only enrollment has a live view, see test_enrollment.py),
+frames are annotated only when someone sees them, and the data screen
+renders every state.
 """
 
+import dataclasses
+import inspect
 import time
 
 import numpy as np
 import pytest
 
-from fakes import CAL, FakeAPI, FakeExtractor, ScriptedIgnition
+from fakes import CAL, FakeAPI, FakeExtractor, MarkedCam, ScriptedIgnition, shows_camera
 from modules.phase import Phase
 from modules.session_display import (BG, FACE_NONE, FACE_OK, FACE_SEARCHING, FACE_UNRECOGNISED,
                                      ScreenState, render)
@@ -56,11 +59,21 @@ def test_data_screen_renders_and_keeps_strip_clear(state):
     assert (img[-66:] == np.array(BG, np.uint8)).all(), "launcher strip area left empty"
 
 
+def test_data_screen_cannot_take_a_camera_image():
+    """The pre-drive / monitoring screen has no way to receive camera pixels at all."""
+    assert list(inspect.signature(render).parameters) == ["s", "width", "height",
+                                                          "reserve_bottom"]
+    assert not any(f.name == "image" for f in dataclasses.fields(ScreenState))
+
+
 @pytest.mark.slow
 def test_session_window_never_gets_a_camera_frame(m, rig, hp, monkeypatch):
     """Pre-drive pass -> monitoring with a no-face gap, data screen on: only canvases are shown."""
-    shown = []
-    monkeypatch.setattr(m, "show_frame", lambda img: (shown.append(img.shape), -1)[1])
+    shown, camera_on_panel = [], []
+    monkeypatch.setattr(m, "show_frame", lambda img: (shown.append(img.shape),
+                                                      camera_on_panel.append(shows_camera(img)),
+                                                      -1)[2])
+    m._camera = MarkedCam()
     m._display_mode, m._display_available, m._reserve_bottom = "data", True, 66
     monkeypatch.setattr(m, "identify_driver_bounded",
                         lambda *a, **k: {"driver_id": 6, "name": "Test Driver", "confidence": 0.6})
@@ -83,6 +96,7 @@ def test_session_window_never_gets_a_camera_frame(m, rig, hp, monkeypatch):
                      m._ignition, m._rate)
     assert len(shown) > 20
     assert set(shown) == {(480, 800, 3)}, "only data-screen canvases, never a 640x480 frame"
+    assert not any(camera_on_panel), "no camera pixels on the panel in pre-drive / monitoring"
 
 
 def test_data_screen_redraw_is_throttled(m, monkeypatch):
