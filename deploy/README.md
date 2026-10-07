@@ -85,6 +85,26 @@ The launcher's header turns red ("NO API SETTINGS") when it was started
 without them. Each session's first lines in `logs/session.log` show the
 exact command, interpreter and API settings the child received.
 
+## Portal live view (privacy)
+
+When the **Video stream** button is on, each pre-drive / monitoring session
+lists its stream on the operator portal's device page (*Devices → pi-01 →
+Live view*), so operators can open it without typing the URL.
+
+- **It shows the driver's face** to any authenticated operator who opens it.
+  The group has not yet confirmed this use; it can be switched off on the
+  portal server with `PORTAL_LIVE_VIEW=false` in its `.env` (no code change;
+  run `./docker.sh cache-clear` there if the config is cached).
+- **Frames never leave the Pi.** Only the stream's address (LAN IP, port,
+  URL token) is sent to the portal. Browsers fetch the video from the Pi
+  itself, and nothing is recorded anywhere.
+- **It exists only during an active session** with the stream on. The portal
+  drops the entry when the session ends, or 90 s after the last heartbeat if
+  the unit stops without saying so.
+- **It is reachable only from the local network.** The Pi refuses
+  non-private addresses, so a portal user elsewhere sees the link, but it
+  won't open for them.
+
 ## Notes
 
 - While a session runs the launcher collapses to a strip along the bottom

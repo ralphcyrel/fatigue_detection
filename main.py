@@ -37,7 +37,9 @@ In both phases the loop also posts a heartbeat every
 ``config.HEARTBEAT_INTERVAL_SECONDS`` (``POST /devices/{id}/heartbeat``) carrying
 the relay state as actually driven (``normal`` / ``interrupted``), so the
 operator portal can show the unit as online and spot one that has not applied
-a command.
+a command. With ``--debug-stream`` the same tick also re-sends where the video
+stream can be opened (``PUT /devices/{id}/stream``) for the portal's live view;
+``cleanup()`` withdraws it.
 
 Runs on the Raspberry Pi (Picamera2 + GPIO) and, with automatic fallbacks,
 on a development machine (cv2.VideoCapture + mocked GPIO / ignition).
@@ -69,7 +71,7 @@ from modules.blink import BlinkDetector, MicrosleepDetector
 from modules.calibration import (CLOSED_CAPTURE_ATTEMPTS, EAR_THRESHOLD_RATIO,
                                  MIN_PERCLOS_BASELINE, SELF_SEED_S, CalibrationManager,
                                  ClosedEyeCapture, ear_calibration_problem, finite_or_none)
-from modules.debug_stream import DebugStream, stream_token
+from modules.debug_stream import DebugStream, lan_address, stream_token
 from modules.ear import EARCalculator
 from modules.face_recognition_module import DriverRecognizer
 from modules.head_pose import HeadPoseEstimator
@@ -640,15 +642,20 @@ class Heartbeat:
         api_client: APIClient,
         alert_manager: Optional[AlertManager],
         interval: float = config.HEARTBEAT_INTERVAL_SECONDS,
+        stream: Optional[DebugStream] = None,
     ) -> None:
         self.api_client = api_client
         self.alert_manager = alert_manager
         self.interval = interval
+        # --debug-stream server, if running: its address rides along with
+        # every beat (the portal forgets it 90 s after the last one).
+        self.stream = stream
+        self._stream_reported = False
         self._last_sent: Optional[float] = None
 
     def tick(self, now: Optional[float] = None) -> bool:
         """
-        Queue a heartbeat if the interval has elapsed.
+        Queue a heartbeat (and stream report) if the interval has elapsed.
 
         Args:
             now: ``time.monotonic()`` for this frame (taken here if omitted).
@@ -662,7 +669,17 @@ class Heartbeat:
         self._last_sent = now
         relay = self.alert_manager.get_relay_state() if self.alert_manager else None
         self.api_client.post_heartbeat(relay)
+        if self.stream is not None:
+            # Address re-read each time: DHCP may move the unit mid-session.
+            self.api_client.report_stream(lan_address(), self.stream.port, self.stream.token)
+            self._stream_reported = True
         return True
+
+    def withdraw_stream(self) -> None:
+        """Take the stream off the portal at shutdown (only if it was listed)."""
+        if self._stream_reported:
+            self.api_client.clear_stream()
+            self._stream_reported = False
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1048,8 @@ def cleanup() -> None:
     if _ignition is not None:
         _ignition.cleanup()
     if _stream is not None:
+        if _heartbeat is not None:
+            _heartbeat.withdraw_stream()
         _stream.close()
     try:
         cv2.destroyAllWindows()
@@ -2797,8 +2816,9 @@ def main(argv: Optional[list] = None) -> int:
         else:
             rate = _rate = LoopRate()
             # Heartbeat to the portal, ticked from present() in every phase
-            # loop. Reads the relay state from _alert_manager at send time.
-            _heartbeat = Heartbeat(api_client, _alert_manager)
+            # loop. Reads the relay state from _alert_manager at send time;
+            # with --debug-stream it also keeps the portal's live view listed.
+            _heartbeat = Heartbeat(api_client, _alert_manager, stream=_stream)
             logger.info("Supervisor started in %s - %s to stop "
                         "(heartbeat every %.0fs, firmware %s)",
                         initial_phase.value,

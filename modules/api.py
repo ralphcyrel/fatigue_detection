@@ -20,6 +20,9 @@ are reused across calls) and wraps every endpoint the other modules need:
     GET  /drivers/{id}/relay-override       -> (deprecated) per-driver unlock flag
     GET  /ping                              -> backend reachability
     POST /devices/{device_id}/heartbeat     -> "still online" + actual relay state
+    PUT  /devices/{device_id}/stream        -> where the diagnostic video stream is
+                                               (--debug-stream; re-sent each heartbeat)
+    DELETE /devices/{device_id}/stream      -> session over, stop advertising it
 
 The 2026-09-28 build needs backend changes - the calibration endpoint, the
 ``foreign_device_baseline`` lock reason and the ``calibration_*`` provenance
@@ -36,9 +39,9 @@ Design rules, because this runs inside a real-time detection loop:
 * every method catches ``requests.exceptions.RequestException`` (and bad
   JSON), logs it, and returns ``None`` / ``False`` - the loop must keep
   running with the last known state if the backend is unreachable;
-* :meth:`push_fatigue_event` and :meth:`post_heartbeat` are fire-and-forget
-  on a daemon thread so a DANGER frame (or the 30 s heartbeat) is never
-  delayed by network latency.
+* :meth:`push_fatigue_event`, :meth:`post_heartbeat` and
+  :meth:`report_stream` are fire-and-forget on a daemon thread so a DANGER
+  frame (or the 30 s heartbeat) is never delayed by network latency.
 """
 
 import logging
@@ -63,6 +66,9 @@ _EVENT_OK = (200, 201, 202)
 _EVENT_OUTCOME = {200: "deduplicated", 201: "created", 202: "queued for retry"}
 _CREATED_OK = (200, 201)
 _HEARTBEAT_OK = (200, 201, 204)
+# DELETE /devices/{id}/stream runs during shutdown; never hold up the exit
+# for the full API_TIMEOUT (the portal entry expires on its own in 90 s).
+STREAM_CLEAR_TIMEOUT_S = 2.0
 
 # AlertManager.get_relay_state() -> the heartbeat's ``confirmed_state``
 # vocabulary. "interrupted" = starter circuit inhibited. Anything else
@@ -198,6 +204,9 @@ class APIClient:
         # Only used to log the offline -> online transition once rather
         # than every 30 s; races between heartbeat threads are harmless.
         self._heartbeat_ok: Optional[bool] = None
+        # Outcome of the last report_stream() ("ok", "disabled", "rejected",
+        # "unreachable"), so a 30 s refresh logs changes only.
+        self._stream_state: Optional[str] = None
         # The legacy-calibration-endpoint fallback is announced once.
         self._legacy_calibration_logged = False
         # Outcome (and HTTP status, None = no response) of the last ping(),
@@ -239,20 +248,22 @@ class APIClient:
         Perform one HTTP request, swallowing transport errors.
 
         Args:
-            method: ``"GET"`` or ``"POST"``.
+            method: ``"GET"``, ``"POST"``, ``"PUT"`` or ``"DELETE"``.
             path: Endpoint path relative to ``base_url``.
             error_level: Log level for a transport failure. ERROR by
                 default; the periodic heartbeat passes DEBUG so an offline
                 backend does not write an error line every 30 s.
-            **kwargs: Passed through to ``Session.request`` (e.g. ``json=``).
+            **kwargs: Passed through to ``Session.request`` (e.g. ``json=``,
+                or ``timeout=`` to override ``config.API_TIMEOUT``).
 
         Returns:
             The ``Response`` (any status code), or ``None`` on a transport
             level failure (DNS, connection refused, timeout, ...).
         """
         url = self._url(path)
+        kwargs.setdefault("timeout", self.timeout)
         try:
-            return self.session.request(method, url, timeout=self.timeout, **kwargs)
+            return self.session.request(method, url, **kwargs)
         except requests.exceptions.RequestException as exc:
             logger.log(error_level, "%s %s failed: %s", method, url, exc)
             return None
@@ -1042,4 +1053,107 @@ class APIClient:
                 logging.DEBUG if was_ok is False else logging.WARNING,
                 "Heartbeat rejected: HTTP %s %s", resp.status_code, resp.text[:200],
             )
+        return ok
+
+    # ------------------------------------------------------------------
+    # Diagnostic video stream (portal live view)
+    # ------------------------------------------------------------------
+
+    def report_stream(
+        self,
+        lan_ip: str,
+        port: int,
+        token: str,
+        device_id: Optional[str] = None,
+        blocking: bool = False,
+    ) -> bool:
+        """
+        Tell the portal where this unit's ``--debug-stream`` view can be opened.
+
+        ``PUT /devices/{device_id}/stream`` with ``{lan_ip, port, token}``
+
+        Only the address is sent - frames never leave the Pi; operators'
+        browsers on the same network fetch them from
+        :class:`~modules.debug_stream.DebugStream` directly. The portal keeps
+        the entry for 90 s, so :class:`main.Heartbeat` re-sends it on every
+        beat and a unit that dies stops being listed on its own. The portal
+        builds the URL itself and only accepts a private IPv4 address, so a
+        unit with no network (``lan_address()`` = 127.0.0.1) is refused
+        (HTTP 422, logged once). With the portal's live view switched off
+        the report is accepted and discarded (``status: disabled``).
+
+        Logged like the heartbeat: only changes of outcome, an unreachable
+        backend at DEBUG.
+
+        Args:
+            lan_ip: This unit's LAN address (``debug_stream.lan_address()``).
+            port: The stream server's port.
+            token: The stream's URL token.
+            device_id: Defaults to ``config.DEVICE_ID``.
+            blocking: If ``True``, send synchronously and return the real
+                outcome (tests).
+
+        Returns:
+            Non-blocking: ``True`` if the request was queued.
+            Blocking: ``True`` on HTTP 2xx, ``False`` otherwise.
+        """
+        path = f"/devices/{device_id or config.DEVICE_ID}/stream"
+        body = {"lan_ip": lan_ip, "port": int(port), "token": token}
+        if blocking:
+            return self._send_stream(path, body)
+
+        threading.Thread(
+            target=self._send_stream, args=(path, body),
+            name="stream-report", daemon=True,
+        ).start()
+        return True
+
+    def _send_stream(self, path: str, body: Dict[str, Any]) -> bool:
+        """PUT one stream report; log only changes (see :meth:`report_stream`)."""
+        resp = self._request("PUT", path, json=body, error_level=logging.DEBUG)
+        if resp is None:
+            state = "unreachable"
+        elif resp.status_code in _HEARTBEAT_OK:
+            payload = self._safe_json(resp)
+            disabled = isinstance(payload, dict) and payload.get("status") == "disabled"
+            state = "disabled" if disabled else "ok"
+        else:
+            state = "rejected"
+
+        if state != self._stream_state:
+            if state == "ok":
+                logger.info("Video stream listed on the portal (http://%s:%s/<token>/)",
+                            body["lan_ip"], body["port"])
+            elif state == "disabled":
+                logger.info("Portal live view is switched off; video stream not listed there")
+            elif state == "rejected":
+                logger.warning("Video stream report rejected: HTTP %s %s",
+                               resp.status_code, resp.text[:200])
+            else:
+                logger.debug("Video stream report not delivered: backend unreachable")
+        self._stream_state = state
+        return state in ("ok", "disabled")
+
+    def clear_stream(self, device_id: Optional[str] = None) -> bool:
+        """
+        Remove this unit's stream from the portal (the session is ending).
+
+        ``DELETE /devices/{device_id}/stream``, synchronous - it runs from
+        ``main.cleanup()``, where a daemon thread would die with the process -
+        but bounded by :data:`STREAM_CLEAR_TIMEOUT_S`. Best effort: if it
+        fails, the portal entry still expires 90 s after the last report.
+
+        Returns:
+            ``True`` on HTTP 2xx.
+        """
+        path = f"/devices/{device_id or config.DEVICE_ID}/stream"
+        resp = self._request("DELETE", path, error_level=logging.DEBUG,
+                             timeout=STREAM_CLEAR_TIMEOUT_S)
+        ok = resp is not None and resp.status_code in _HEARTBEAT_OK
+        self._stream_state = None
+        if ok:
+            logger.info("Video stream removed from the portal")
+        else:
+            logger.debug("Video stream not removed from the portal (%s); it expires on its own",
+                         "unreachable" if resp is None else f"HTTP {resp.status_code}")
         return ok

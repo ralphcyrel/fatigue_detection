@@ -6,8 +6,15 @@ DIAGNOSTIC VIEW ONLY. The in-vehicle display never shows the driver's face
 shown on a separate screen - a laptop or projector during the defense, or
 the operator's phone while positioning a driver at enrollment. It is off
 unless ``main.py --debug-stream`` is given, it serves private-network
-clients only, and nothing is recorded: no frame is written to disk and
-nothing is sent to the backend. Frames exist only in memory, one at a time.
+clients only, and nothing is recorded: no frame is written to disk and no
+frame is sent to the backend. Frames exist only in memory, one at a time.
+
+The backend does learn *where* the stream is: during pre-drive and
+monitoring (not enrollment, which sends no heartbeat), ``main.Heartbeat``
+reports this unit's LAN address, port and token
+(``APIClient.report_stream``) so the operator portal's device page can link
+to it, and ``cleanup()`` withdraws it. Operators' browsers then fetch frames
+from this server directly, which works only from the vehicle's network.
 
 Access needs a random token in the URL (``http://<pi>:<port>/<token>/``);
 every other path is a 404, so someone on the same network who finds the
