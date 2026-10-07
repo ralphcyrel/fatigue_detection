@@ -63,7 +63,12 @@ camera - `systemctl status fatigue-launcher` tells you which state it's in.
 source venv/bin/activate
 python launcher.py               # fullscreen on the touchscreen
 python launcher.py --windowed    # 800x480 window (Escape leaves fullscreen)
+python launcher.py --screen-size 800x480   # force the size if detection picks
+                                           # the wrong one (e.g. under VNC)
 ```
+
+The launcher logs the size it laid out for and where it came from, e.g.
+`Display 800x480 (monitor HDMI-1), scale 1.50, button font 29 px`.
 
 ## Starting from a desktop icon
 

@@ -160,11 +160,15 @@ single source of truth:
 The header shows the device id and whether the backend answers `/ping`. While a
 session runs the launcher shrinks to a bottom strip with a **STOP** button
 (sends SIGINT = Ctrl-C); when `main.py` exits the menu returns with the result.
-Layout is sized for the 800×480 HDMI touchscreen and scales up to a monitor.
+Layout is sized for the 800×480 HDMI touchscreen and scales up to a monitor;
+it fits the monitor the window is on (not the whole X / VNC desktop) and re-fits
+every time the menu returns from a session.
 
 ```bash
-python launcher.py               # fullscreen
-python launcher.py --windowed    # development: 800x480 window
+python launcher.py                        # fullscreen
+python launcher.py --windowed             # development: 800x480 window
+python launcher.py --screen-size 800x480  # exactly 800x480, borderless at 0,0:
+                                          # check the panel layout on a desktop
 ```
 
 To start it on boot or from a desktop icon see [`deploy/README.md`](deploy/README.md)
