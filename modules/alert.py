@@ -42,8 +42,10 @@ relay pin goes through ``_RELAY_ALLOW`` / ``_RELAY_INHIBIT`` below - never a
 literal level. INHIBIT (pin HIGH) is written at start-up (``GPIO.setup``'s
 initial value, so the pin never passes through LOW), on every return to
 pre-drive, in :meth:`AlertManager.cleanup` (which leaves the pin driven
-HIGH) and at interpreter exit. ``gpio=17=op,dh`` in
-``/boot/firmware/config.txt`` holds it HIGH while the Pi boots (see README).
+HIGH) and at interpreter exit. Once this process has exited, the launcher
+re-asserts it with :func:`force_relay_inhibit` (``pinctrl``, no line claim).
+``gpio=17=op,dh`` in ``/boot/firmware/config.txt`` holds it HIGH while the
+Pi boots (see README).
 """
 
 import atexit
@@ -54,6 +56,9 @@ from typing import Dict, Optional
 
 from config.config import BUZZER_PIN, LED_GREEN, LED_RED, LED_YELLOW, RELAY_PIN
 from modules.phase import Phase
+# Re-exported: the claim-free INHIBIT for the launcher. It lives in its own
+# module so the launcher can use it without importing RPi.GPIO.
+from modules.relay_failsafe import force_relay_inhibit  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -97,34 +102,6 @@ _INDICATOR_PINS = (LED_GREEN, LED_YELLOW, LED_RED, BUZZER_PIN)
 def _gpio_level(value: int) -> int:
     """``GPIO.HIGH`` / ``GPIO.LOW`` for a 1 / 0 logic value."""
     return GPIO.HIGH if value else GPIO.LOW
-
-
-def force_relay_inhibit() -> bool:
-    """
-    Drive the relay pin to INHIBIT without an :class:`AlertManager`.
-
-    For the launcher, after its ``main.py`` child has exited: a child that
-    was killed (SIGKILL) never ran :meth:`AlertManager.cleanup`, and on the
-    Pi 4 the pin keeps its last level - ALLOW, if pre-drive had released the
-    starter. Call it only while no child holds the pin. Touches the relay pin
-    alone (never the LEDs or buzzer) and leaves it driven HIGH.
-
-    Returns:
-        ``True`` if the pin was driven, ``False`` without ``RPi.GPIO`` or on
-        an error (logged).
-    """
-    if not GPIO_AVAILABLE:
-        logger.debug("force_relay_inhibit: RPi.GPIO not available - nothing to drive")
-        return False
-    try:
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        GPIO.setup(RELAY_PIN, GPIO.OUT, initial=_gpio_level(_RELAY_INHIBIT))
-    except Exception as exc:  # pragma: no cover - hardware only
-        logger.error("Could not drive relay pin %d to INHIBIT: %s", RELAY_PIN, exc)
-        return False
-    logger.info("Relay pin %d driven to INHIBIT (starter inhibited)", RELAY_PIN)
-    return True
 
 
 class AlertManager:
@@ -484,8 +461,10 @@ class AlertManager:
 
         Safe to call more than once and in mock mode. The relay pin is driven
         to ``_RELAY_INHIBIT`` (HIGH) and deliberately left out of
-        ``GPIO.cleanup()``, so it stays driven HIGH after the process exits
-        and the starter stays **inhibited** - fail-secure. This is harmless
+        ``GPIO.cleanup()``, so it stays driven HIGH and the starter stays
+        **inhibited** - fail-secure. (With rpi-lgpio the line claim ends
+        when the process exits; the launcher then re-drives the pin HIGH
+        with ``pinctrl``, which holds no claim.) This is harmless
         if the engine is already running, and the next ignition-OFF returns
         to pre-drive for a fresh assessment anyway. The LEDs and buzzer are
         driven LOW and released.

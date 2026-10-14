@@ -79,9 +79,11 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tu
 from urllib.parse import urlparse
 
 from config import config
-from modules.alert import force_relay_inhibit
 from modules.api import APIClient
 from modules.debug_stream import lan_address, stream_token
+# Not modules.alert: that imports RPi.GPIO, and the launcher must never claim
+# a GPIO line (lgpio claims are per process; main.py would get 'GPIO busy').
+from modules.relay_failsafe import force_relay_inhibit
 
 logger = logging.getLogger("launcher")
 
