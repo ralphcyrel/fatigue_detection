@@ -126,8 +126,11 @@ HEARTBEAT_INTERVAL_SECONDS: Final[float] = 30.0
 # ignition or fuel circuit, so it can only prevent the engine from being
 # started - it can never stop a running engine. It is driven ONLY during
 # the pre-drive phase (modules/alert.py refuses to lock in monitoring).
-# Wired normally-OPEN for fail-secure behaviour: with the Pi unpowered, the
-# pin LOW, or the process crashed before a pass, the starter is inhibited.
+# 5 V optocoupler module, LOW-level trigger, starter on the normally-OPEN
+# contact: pin LOW = coil energised = start allowed; pin HIGH (the safe
+# default) = coil released = starter inhibited. With the Pi unpowered the
+# coil is released and the starter is inhibited. Levels live in
+# modules/alert.py (_RELAY_ALLOW / _RELAY_INHIBIT).
 RELAY_PIN: Final[int] = 17
 
 # Ignition sense input (fuse tap on an ignition-switched circuit). The 12 V

@@ -33,13 +33,20 @@ relay is locked) is still tracked so the rest of the pipeline behaves
 identically.
 
 Relay wiring: the relay sits in the **starter solenoid signal** (it can only
-prevent a start, never stop a running engine) and is wired **normally-open**
-for fail-secure behaviour. The coil must be energised (pin HIGH) to close the
-contacts and *allow* a start; de-energised (pin LOW, Pi unpowered, process
-crashed, ``GPIO.cleanup()`` run) the starter is inhibited. Swap
-``_RELAY_ALLOW`` / ``_RELAY_INHIBIT`` below if your relay board is active-low.
+prevent a start, never stop a running engine) and the starter is wired to its
+**normally-open** contact for fail-secure behaviour. The board is a 5 V
+optocoupler module with a **low-level trigger**: the coil is energised while
+the pin is LOW, which closes the NO contact and *allows* a start; with the pin
+HIGH the coil is released and the starter is inhibited. Every write to the
+relay pin goes through ``_RELAY_ALLOW`` / ``_RELAY_INHIBIT`` below - never a
+literal level. INHIBIT (pin HIGH) is written at start-up (``GPIO.setup``'s
+initial value, so the pin never passes through LOW), on every return to
+pre-drive, in :meth:`AlertManager.cleanup` (which leaves the pin driven
+HIGH) and at interpreter exit. ``gpio=17=op,dh`` in
+``/boot/firmware/config.txt`` holds it HIGH while the Pi boots (see README).
 """
 
+import atexit
 import logging
 import threading
 import time
@@ -76,12 +83,48 @@ BUZZER_PATTERNS: Dict[str, float] = {
 # never rate-limited.
 WARNING_CHIRP_MIN_INTERVAL_S: float = 30.0
 
-# Logic levels for the relay (see module docstring for the wiring assumption).
-_RELAY_ALLOW: int = 1    # HIGH -> coil energised -> NO contacts closed -> start allowed
-_RELAY_INHIBIT: int = 0  # LOW  -> coil released  -> contacts open       -> start inhibited
+# Logic levels for the low-level-trigger relay (see module docstring).
+_RELAY_ALLOW: int = 0    # LOW  -> coil energised -> NO contact closed -> start allowed
+_RELAY_INHIBIT: int = 1  # HIGH -> coil released  -> NO contact open   -> start inhibited (safe default)
 
-# All output pins, in a stable order, for setup and cleanup.
+# All output pins, in a stable order.
 _ALL_PINS = (LED_GREEN, LED_YELLOW, LED_RED, BUZZER_PIN, RELAY_PIN)
+# LEDs and buzzer: driven LOW and released by cleanup(). The relay pin is not
+# released - it stays driven at _RELAY_INHIBIT.
+_INDICATOR_PINS = (LED_GREEN, LED_YELLOW, LED_RED, BUZZER_PIN)
+
+
+def _gpio_level(value: int) -> int:
+    """``GPIO.HIGH`` / ``GPIO.LOW`` for a 1 / 0 logic value."""
+    return GPIO.HIGH if value else GPIO.LOW
+
+
+def force_relay_inhibit() -> bool:
+    """
+    Drive the relay pin to INHIBIT without an :class:`AlertManager`.
+
+    For the launcher, after its ``main.py`` child has exited: a child that
+    was killed (SIGKILL) never ran :meth:`AlertManager.cleanup`, and on the
+    Pi 4 the pin keeps its last level - ALLOW, if pre-drive had released the
+    starter. Call it only while no child holds the pin. Touches the relay pin
+    alone (never the LEDs or buzzer) and leaves it driven HIGH.
+
+    Returns:
+        ``True`` if the pin was driven, ``False`` without ``RPi.GPIO`` or on
+        an error (logged).
+    """
+    if not GPIO_AVAILABLE:
+        logger.debug("force_relay_inhibit: RPi.GPIO not available - nothing to drive")
+        return False
+    try:
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        GPIO.setup(RELAY_PIN, GPIO.OUT, initial=_gpio_level(_RELAY_INHIBIT))
+    except Exception as exc:  # pragma: no cover - hardware only
+        logger.error("Could not drive relay pin %d to INHIBIT: %s", RELAY_PIN, exc)
+        return False
+    logger.info("Relay pin %d driven to INHIBIT (starter inhibited)", RELAY_PIN)
+    return True
 
 
 class AlertManager:
@@ -123,7 +166,9 @@ class AlertManager:
         self.phase: Phase = Phase(phase)
         self.current_level: Optional[str] = None
         self.relay_locked: bool = False
-        self.pin_states: Dict[int, int] = {pin: 0 for pin in _ALL_PINS}
+        self.pin_states: Dict[int, int] = {pin: 0 for pin in _INDICATOR_PINS}
+        self.pin_states[RELAY_PIN] = _RELAY_INHIBIT
+        self._closed: bool = False
 
         # Continuous-buzzer thread control. ``_buzzer_stop`` is set to halt
         # the background thread; ``_buzzer_lock`` serialises start/stop so two
@@ -140,9 +185,16 @@ class AlertManager:
         else:
             GPIO.setmode(GPIO.BCM)
             GPIO.setwarnings(False)
-            for pin in _ALL_PINS:
+            # Relay first, with INHIBIT as its initial level, so the starter
+            # is never allowed - not even for the instant between setup()
+            # and the first write.
+            GPIO.setup(RELAY_PIN, GPIO.OUT, initial=_gpio_level(_RELAY_INHIBIT))
+            for pin in _INDICATOR_PINS:
                 GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
             logger.info("AlertManager running in REAL GPIO mode (BCM numbering)")
+        # Last resort for an exit that skips cleanup() (it runs on normal
+        # interpreter exit and sys.exit, not on SIGKILL).
+        atexit.register(self._inhibit_at_exit)
 
         # Safe initial state: green on, everything else off, starter
         # inhibited until a pre-drive pass (fail-secure).
@@ -170,7 +222,7 @@ class AlertManager:
         """
         self.pin_states[pin] = value
         if not self.mock:
-            GPIO.output(pin, GPIO.HIGH if value else GPIO.LOW)
+            GPIO.output(pin, _gpio_level(value))
 
     # ------------------------------------------------------------------
     # Alert level
@@ -428,29 +480,44 @@ class AlertManager:
 
     def cleanup(self) -> None:
         """
-        Silence the buzzer, drive every output LOW and release GPIO.
+        Silence the buzzer, inhibit the starter and release the other pins.
 
-        Safe to call more than once and in mock mode. Driving the relay pin
-        LOW (and ``GPIO.cleanup()`` returning it to a floating input) leaves
-        the starter **inhibited** - fail-secure. This is harmless if the
-        engine is already running, and the next ignition-OFF returns to
-        pre-drive for a fresh assessment anyway.
+        Safe to call more than once and in mock mode. The relay pin is driven
+        to ``_RELAY_INHIBIT`` (HIGH) and deliberately left out of
+        ``GPIO.cleanup()``, so it stays driven HIGH after the process exits
+        and the starter stays **inhibited** - fail-secure. This is harmless
+        if the engine is already running, and the next ignition-OFF returns
+        to pre-drive for a fresh assessment anyway. The LEDs and buzzer are
+        driven LOW and released.
         """
+        if self._closed:
+            return
         self._stop_continuous_buzzer()
-        for pin in _ALL_PINS:
-            self._write(pin, 0)
+        self._write(RELAY_PIN, _RELAY_INHIBIT)
         self.relay_locked = True
+        for pin in _INDICATOR_PINS:
+            self._write(pin, 0)
         self.current_level = None
+        self._closed = True
 
         if self.mock:
-            logger.info("[MOCK] AlertManager cleanup - all outputs LOW")
+            logger.info("[MOCK] AlertManager cleanup - relay INHIBIT, LEDs / buzzer LOW")
             return
 
         try:
-            GPIO.cleanup()
-            logger.info("GPIO cleanup complete")
+            GPIO.cleanup(list(_INDICATOR_PINS))
+            logger.info("GPIO cleanup complete (relay pin %d left driven INHIBIT)", RELAY_PIN)
         except Exception as exc:  # pragma: no cover - hardware only
             logger.warning("GPIO.cleanup() failed: %s", exc)
+
+    def _inhibit_at_exit(self) -> None:
+        """atexit hook: drive the relay to INHIBIT if cleanup() never ran."""
+        if self._closed or self.mock:
+            return
+        try:
+            GPIO.output(RELAY_PIN, _gpio_level(_RELAY_INHIBIT))
+        except Exception:  # pragma: no cover - hardware only; logging may be gone
+            pass
 
     # ------------------------------------------------------------------
     # Head pose (Module 10)

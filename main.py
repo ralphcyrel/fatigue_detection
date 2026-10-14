@@ -49,6 +49,7 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -1033,8 +1034,14 @@ def display_text(frame: np.ndarray, text: str, color: tuple = (0, 0, 255), dy: i
 # Shutdown
 # ---------------------------------------------------------------------------
 
+def _raise_on_sigterm(signum, frame) -> None:
+    """SIGTERM handler: unwind like Ctrl-C so main()'s finally runs cleanup()."""
+    logger.warning("SIGTERM received - shutting down (starter will be inhibited)")
+    raise KeyboardInterrupt
+
+
 def cleanup() -> None:
-    """Release the camera, reset GPIO and close any OpenCV windows."""
+    """Release the camera, inhibit the starter, reset GPIO and close any OpenCV windows."""
     global _camera, _profiler
     logger.info("Shutting down...")
     if _profiler is not None:
@@ -2764,7 +2771,21 @@ def main(argv: Optional[list] = None) -> int:
             logger.error("Debug stream NOT started on port %d: %s - continuing without it",
                          args.debug_stream, exc)
 
+    # SIGTERM (the launcher's escalation, `kill`) would otherwise end the
+    # process without running the finally below - leaving the relay pin at
+    # its last level. Raise it as an interrupt so cleanup() inhibits the
+    # starter.
     try:
+        previous_sigterm = signal.signal(signal.SIGTERM, _raise_on_sigterm)
+    except ValueError:  # not the main thread (tests)
+        previous_sigterm = None
+
+    try:
+        # 0. Alerts first (auto-detects GPIO): the relay is driven to INHIBIT
+        #    before anything else runs. The phase is set once the ignition
+        #    is read (step 5).
+        _alert_manager = AlertManager(mock=args.mock_gpio, phase=Phase.PREDRIVE)
+
         # 1. Config is imported at module load; log the key values.
         logger.info("Config: device %s, camera %dx%d@%dfps, API %s, calibration %ds, "
                     "pre-drive %ds (worst %.0fs window)",
@@ -2805,8 +2826,8 @@ def main(argv: Optional[list] = None) -> int:
             _ignition = IgnitionSensor(mock=args.mock_gpio)
         initial_phase = _ignition.phase()
 
-        # 6. Alerts (auto-detects GPIO). Relay starts inhibited in pre-drive.
-        _alert_manager = AlertManager(mock=args.mock_gpio, phase=initial_phase)
+        # 6. Alerts were created in step 0 (relay inhibited); set the phase.
+        _alert_manager.set_phase(initial_phase)
 
         # 6b. Head pose (camera intrinsics derived from the frame size)
         _head_pose = HeadPoseEstimator(
@@ -2867,13 +2888,15 @@ def main(argv: Optional[list] = None) -> int:
         logger.info("Quit requested from the preview window")
         interrupted = True
     except KeyboardInterrupt:
-        logger.info("Interrupted by user (Ctrl-C)")
+        logger.info("Interrupted (Ctrl-C / SIGINT / SIGTERM)")
         interrupted = True
     except Exception:
         logger.exception("Fatal error in main loop")
         exit_code = 1
     finally:
         cleanup()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         if args.enroll and args.result_file:
             write_enroll_result(args.result_file, args.driver_id, exit_code, interrupted)
 

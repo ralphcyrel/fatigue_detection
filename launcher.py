@@ -79,6 +79,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tu
 from urllib.parse import urlparse
 
 from config import config
+from modules.alert import force_relay_inhibit
 from modules.api import APIClient
 from modules.debug_stream import lan_address, stream_token
 
@@ -1244,6 +1245,9 @@ class Launcher:
             self.root.after(CHILD_POLL_MS, self._poll_session)
             return
         session, self.session = self.session, None
+        # Session over: inhibit the starter before anything else. main.py's
+        # cleanup() already did unless it was killed; this covers that.
+        force_relay_inhibit()
         code = session.proc.poll() if session.proc is not None else None
         self._log_geometry(f"child exited: {session.label}, exit code {code}")
         self._close_strip()
@@ -1335,7 +1339,9 @@ class Launcher:
                 session.proc.wait(timeout=STOP_GRACE_S)
             except subprocess.TimeoutExpired:
                 session.proc.kill()
+                session.proc.wait()
             session.close()
+        force_relay_inhibit()   # no child left: a killed one never cleaned up
         self.root.destroy()
 
 
@@ -1357,12 +1363,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     setup_logging()
     logger.info("=== Launcher starting (device %s, API %s) ===",
                 config.DEVICE_ID, config.API_BASE_URL)
+    # No child yet: inhibit the starter in case a previous main.py was
+    # killed with the relay at ALLOW.
+    force_relay_inhibit()
     root = tk.Tk()
     app = Launcher(root, windowed=args.windowed, screen_size=args.screen_size)
     try:
         root.mainloop()
     except KeyboardInterrupt:
         app.quit()
+    finally:
+        if not (app.session and app.session.running):
+            force_relay_inhibit()
     return 0
 
 

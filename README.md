@@ -120,8 +120,14 @@ fatigue-detection/
 
 - **Starter relay (GPIO 17)** — in series with the starter solenoid signal, *not* the
   ignition or fuel circuit: it can prevent a start but can never stop a running engine.
-  Wired **normally-open** (fail-secure): the coil must be energised (pin HIGH) to allow a
-  start, so an unpowered Pi, a crash, or `GPIO.cleanup()` all leave the starter inhibited.
+  The board is a 5 V optocoupler relay module with a **low-level trigger**, and the
+  starter is wired to its **normally-open** contact (fail-secure): pin **LOW** energises
+  the coil and allows a start; pin **HIGH** releases it and inhibits the starter (the safe
+  default). `main.py` drives the pin HIGH before anything else at start-up and on every
+  exit path (including SIGTERM), and the launcher drives it HIGH again after every
+  session, so an unpowered Pi, a crash or a killed session all leave the starter inhibited.
+  Add `"gpio=17=op,dh"` to `/boot/firmware/config.txt` so GPIO 17 is held HIGH (relay
+  off) during boot.
 - **Ignition sense (GPIO 25)** — fuse tap on an ignition-switched circuit through an
   optocoupler (or a divider clamped to 3.3 V — never 12 V straight to the pin). Pulled
   down, so a disconnected tap reads OFF (pre-drive). Debounced 0.3 s in software.

@@ -26,6 +26,11 @@ folder holds the systemd unit that starts it on boot.
 
   `sudo chmod 640 /etc/fatigue-detection.env && sudo chown root:pi /etc/fatigue-detection.env`
 
+- **Starter relay held off during boot**: add `"gpio=17=op,dh"` to
+  `/boot/firmware/config.txt` so GPIO 17 is held HIGH (relay off) during
+  boot. The relay module is low-level trigger, so a LOW pin would allow a
+  start before the launcher runs.
+
 ## Install / enable
 
 ```bash
