@@ -2555,10 +2555,12 @@ def run_monitoring(
     faults.
 
     Frames with no face follow ``modules.pipeline.NoFacePolicy``: the level
-    is held (never lowered), a DANGER is latched, and ALERT / WARNING turn
-    into FAULT after ``NO_FACE_FAULT_S``. Two cases become backend faults
-    on ``POST /monitoring-faults``: FAULT (``no_face``) and a latched DANGER
-    past ``NO_FACE_HOLD_S`` (``danger_latched``, critical). Each is opened
+    is held (never lowered) and a DANGER is latched for up to
+    ``config.NO_FACE_FAULT_S``; past it the level is FAULT, from any level,
+    until a valid face returns and escalation restarts from the current
+    score. The FAULT opens a backend fault on ``POST /monitoring-faults``:
+    ``no_face`` from ALERT / WARNING, ``danger_latched`` (critical) from a
+    latched DANGER. Each is opened
     with the last scored frame's metrics, re-POSTed every
     ``MONITORING_FAULT_REFRESH_S`` while open, and resolved when the face
     returns or the ignition turns off.

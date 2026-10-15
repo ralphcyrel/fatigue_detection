@@ -223,7 +223,7 @@ class AlertManager:
         or FAULT), and at most once per :data:`WARNING_CHIRP_MIN_INTERVAL_S`.
 
         ``"FAULT"`` (monitoring: the driver has not been visible for
-        ``NO_FACE_FAULT_S``) lights yellow *and* red - a combination no
+        ``config.NO_FACE_FAULT_S``, from any level) lights yellow *and* red - a combination no
         fatigue level uses, so it cannot be read as a calmer state than the
         WARNING it may have replaced - with one long beep on entry.
 

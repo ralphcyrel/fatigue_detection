@@ -8,9 +8,9 @@ that ``1.0`` means "exactly as during the driver's alert-state
 calibration", and only the part *above* that baseline counts towards risk::
 
     EAR_excess     = max((1 / EAR_norm) - 1, 0)      (capped at 4.0)
-    BD_excess      = max(BD_norm - 1, 0)
-    BF_excess      = max(BF_norm - 1, 0)
-    PERCLOS_excess = max(PERCLOS_norm - 1, 0)
+    BD_excess      = max(BD_norm - 1, 0)             (capped at 4.0)
+    BF_excess      = max(BF_norm - 1, 0)             (capped at 4.0)
+    PERCLOS_excess = max(PERCLOS_norm - 1, 0)        (capped at 4.0)
     YAWN_excess    = max(YAWN_norm - 1, 0)           (capped at 2.0)
     MS_excess      = microsleeps in last 300 s       (capped at 3.0)
 
@@ -30,8 +30,14 @@ term elsewhere.
                      ``modules.pipeline``). Inverted because a lower EAR
                      (droopier eyes) means *more* fatigue.
 * ``BD_norm``      — blink duration / calibrated blink duration.
-* ``BF_norm``      — blink frequency / calibrated blink frequency.
-* ``PERCLOS_norm`` — PERCLOS / calibrated PERCLOS.
+* ``BF_norm``      — blink frequency / t, with t = max(calibrated frequency,
+                     ``config.BLINK_FREQ_REFERENCE`` = 20 /min) scaled to
+                     the time observed (applied in ``modules.pipeline``).
+* ``PERCLOS_norm`` — PERCLOS / t, with t = max(calibrated PERCLOS,
+                     ``config.PERCLOS_REFERENCE`` = 10 %) (applied in
+                     ``modules.pipeline``), so the excess is
+                     (PERCLOS - t) / t: anchored to an absolute level rather
+                     than a ratio to a baseline that can be ~2 %.
 * ``YAWN_norm``    — MAR / calibrated closed-mouth MAR, **but only while a
                      confirmed yawn is in progress**; the caller passes
                      ``1.0`` (zero excess) at all other times so talking
@@ -110,6 +116,18 @@ UTC.
   driver's neutral pose, and pre-drive gained a 3 s settling stage before the
   30 s window. Recorded runs replayed through this version are not
   comparable with earlier scores.
+* **2026-10-15 (later)**: the PERCLOS term is anchored to an absolute
+  reference: excess = (PERCLOS - t) / t with t = max(floored baseline,
+  ``config.PERCLOS_REFERENCE`` = 10 %), capped at 4.0 (was PERCLOS /
+  baseline - 1, which against the 2 % floor scored ordinary blinking at
+  ~9 % as 3.5). The blink-duration floor is 100 ms (was 150 ms). The
+  blink-frequency term is anchored the same way at
+  ``config.BLINK_FREQ_REFERENCE`` = 20 /min (was the 6 /min floor, against
+  which 30 /min sat at the cap). Weights and caps unchanged, so the bound
+  stays 5.05.
+  Separately - not a score change - a no-face gap of
+  ``config.NO_FACE_FAULT_S`` (2 s) or more is FAULT from any level,
+  including DANGER.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -160,6 +178,13 @@ MAX_YAWN_EXCESS: float = 2.0
 MAX_BLINK_DURATION_EXCESS: float = 4.0
 MAX_BLINK_FREQUENCY_EXCESS: float = 4.0
 
+# Cap on the PERCLOS excess, (PERCLOS - t) / t with t = max(baseline,
+# config.PERCLOS_REFERENCE) (2026-10-15). PERCLOSCalculator.normalize also
+# caps its ratio at 5.0, i.e. the same 4.0; the clamp here makes the bound
+# hold whatever the caller passes. 4.0 is reached at PERCLOS = 5t (50 % for
+# t = 10 %).
+MAX_PERCLOS_EXCESS: float = 4.0
+
 # The microsleep term is a *count*, not a ratio: its excess is the number of
 # microsleeps confirmed in the trailing ``MICROSLEEP_COUNT_WINDOW_S``, capped
 # at 3.0. Unlike every other input it is therefore already an excess when it
@@ -201,13 +226,12 @@ WARNING_THRESHOLD: float = 0.40
 DANGER_THRESHOLD: float = 0.65
 
 # Upper bound on each *excess* term, used by :meth:`FRSCalculator.theoretical_max`.
-# EAR, yawn and the two blink terms are clamped in ``compute()``; PERCLOS
-# arrives pre-capped at 5.0 from ``PERCLOSCalculator.normalize``, i.e. an
-# excess of 4.0. ``None`` would mark a term with no ceiling - every term is
-# bounded at present, which is what makes the total range finite.
+# Every term is clamped in ``compute()``. ``None`` would mark a term with no
+# ceiling - every term is bounded at present, which is what makes the total
+# range finite.
 MAX_EXCESS: Dict[str, Optional[float]] = {
     "ear": MAX_EAR_EXCESS,
-    "perclos": 4.0,
+    "perclos": MAX_PERCLOS_EXCESS,
     "blink_duration": MAX_BLINK_DURATION_EXCESS,
     "blink_frequency": MAX_BLINK_FREQUENCY_EXCESS,
     "yawn": MAX_YAWN_EXCESS,
@@ -286,8 +310,11 @@ class FRSCalculator:
                 :data:`EAR_MEDIAN_WINDOW_S` rolling median, not the frame's
                 own value.
             blink_duration_norm: blink duration / duration baseline.
-            blink_freq_norm: blink frequency / frequency baseline.
-            perclos_norm: PERCLOS / PERCLOS baseline (already capped at 5.0).
+            blink_freq_norm: blink frequency / max(frequency baseline,
+                ``config.BLINK_FREQ_REFERENCE``), scaled to the time observed.
+            perclos_norm: PERCLOS / max(PERCLOS baseline,
+                ``config.PERCLOS_REFERENCE``); the excess is capped at
+                :data:`MAX_PERCLOS_EXCESS`.
             yawn_norm: MAR / MAR baseline while a confirmed yawn is in
                 progress, else ``1.0``. Defaults to ``1.0`` (no yawn) so
                 callers without mouth tracking are unaffected.
@@ -332,7 +359,7 @@ class FRSCalculator:
                         MAX_BLINK_DURATION_EXCESS)
         bf_excess = min(max(blink_freq_norm - BASELINE, 0.0),
                         MAX_BLINK_FREQUENCY_EXCESS)
-        perclos_excess = max(perclos_norm - BASELINE, 0.0)
+        perclos_excess = min(max(perclos_norm - BASELINE, 0.0), MAX_PERCLOS_EXCESS)
         yawn_excess = min(max(yawn_norm - BASELINE, 0.0), MAX_YAWN_EXCESS)
         # A count, not a ratio: already an excess on arrival (see
         # MAX_MICROSLEEP_EXCESS), so only the cap and the floor apply.

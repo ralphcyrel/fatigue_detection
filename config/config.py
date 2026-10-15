@@ -223,6 +223,25 @@ MICROSLEEP_REQUIRES_WARNING: Final[bool] = False
 # progress are abandoned rather than extended across it.
 MAX_FRAME_GAP_S: Final[float] = 0.5
 
+# Yawn detection (modules/mar.YawnDetector), multiples of the driver's
+# closed-mouth MAR baseline. An opening starts at MAR >= YAWN_MAR_RATIO x
+# baseline, continues while MAR stays >= YAWN_MAR_RELEASE_RATIO x baseline,
+# and is a yawn once it has lasted mar.MIN_YAWN_DURATION_S (1.5 s). The
+# release ratio (2026-10-15) is hysteresis: a natural yawn wobbles around
+# 2.0x, and with a single threshold run 081406 held 1.8-2.2x for 4.2 s yet
+# never stayed >= 2.0x longer than 0.32 s. Invalid frames and gaps over
+# MAX_FRAME_GAP_S end an opening, as for eye closures.
+YAWN_MAR_RATIO: Final[float] = 2.0
+YAWN_MAR_RELEASE_RATIO: Final[float] = 1.6
+
+# Monitoring no-face policy (modules/pipeline.NoFacePolicy). Up to this long
+# a lost face holds the level (and latches DANGER); past it the reported
+# state is FAULT, whatever the level was - prolonged loss is a fault, not
+# fatigue - until a valid face returns, when escalation restarts from the
+# current score (2026-10-15; was 10 s from ALERT / WARNING and never from
+# DANGER, which held DANGER through any gap).
+NO_FACE_FAULT_S: Final[float] = 2.0
+
 # ---------------------------------------------------------------------------
 # Scoring floors and warm-up (2026-10-15)
 # ---------------------------------------------------------------------------
@@ -235,8 +254,28 @@ MAX_FRAME_GAP_S: Final[float] = 0.5
 # ordinary blink scored DANGER. These are not the degenerate-run floors in
 # modules/calibration.py (MIN_*), which only prevent a zero divisor.
 PERCLOS_BASELINE_FLOOR: Final[float] = 2.0             # percent
-BLINK_DURATION_BASELINE_FLOOR_MS: Final[float] = 150.0  # ms
+# Blink duration: 100 ms (2026-10-15; was 150 ms, which sat above the
+# 85-135 ms alert blinks replayed, so the floor rather than the driver's
+# baseline normalised the term).
+BLINK_DURATION_BASELINE_FLOOR_MS: Final[float] = 100.0  # ms
 BLINK_FREQUENCY_BASELINE_FLOOR: Final[float] = 6.0     # blinks per minute
+
+# PERCLOS is scored against an absolute anchor, not the driver's baseline
+# alone (2026-10-15): t = max(floored baseline, PERCLOS_REFERENCE) and
+# excess = min(4.0, max(0, (PERCLOS - t) / t)). Against a 2 % baseline the
+# pure ratio read ordinary blinking (~9 % at 20 fps) as an excess of 3.5;
+# anchored, 9 % scores 0, 20 % scores 1.0 and 40 % scores 3.0. The warm-up
+# prior (modules.perclos) still uses the floored baseline: it estimates this
+# driver's PERCLOS, it does not score it.
+PERCLOS_REFERENCE: Final[float] = 10.0                 # percent
+
+# Blink frequency is anchored the same way (2026-10-15): t = max(floored
+# baseline, BLINK_FREQ_REFERENCE), scaled to the time observed,
+# min(elapsed, window) / 60, and excess = min(4.0, max(0, (f - t) / t)).
+# Against the 6 /min floor a normal ~18 /min read as an excess of 2.0, and
+# 30 /min or more sat at the cap (0.60 weighted, over the pass threshold on
+# its own); anchored, 30 /min scores 0.5 and 40 /min 1.0.
+BLINK_FREQ_REFERENCE: Final[float] = 20.0              # blinks per minute
 
 # The blink-duration term is zero until at least this many blinks fall in
 # its window (modules.blink.BLINK_MEAN_WINDOW_S): a one- or two-blink "mean"

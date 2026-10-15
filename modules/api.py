@@ -668,9 +668,12 @@ class APIClient:
         something the camera failed to see. All fault types share one body
         shape (see :data:`MONITORING_FAULT_SEVERITY`):
 
-        * ``no_face`` - a gap from ALERT / WARNING crossed ``NO_FACE_FAULT_S``.
-        * ``danger_latched`` - a gap from DANGER passed ``NO_FACE_HOLD_S``;
-          the unit is holding DANGER for a driver it can no longer see.
+        * ``no_face`` - a gap from ALERT / WARNING crossed
+          ``config.NO_FACE_FAULT_S``.
+        * ``danger_latched`` - a gap from DANGER crossed
+          ``config.NO_FACE_FAULT_S``: the last thing the unit saw was DANGER
+          and it can no longer see the driver. The DANGER latch is dropped at
+          that point and the level is FAULT until the face returns.
         * ``no_ear_baseline`` - the EAR self-seed gave up; the face is seen
           but the eyes cannot be scored. ``gap_s`` is then the seconds since
           the fault opened, ``last_known`` is ``None`` (nothing was scored)

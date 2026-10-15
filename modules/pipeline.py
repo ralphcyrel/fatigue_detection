@@ -89,12 +89,14 @@ MICROSLEEP_RELEASE_HOLD_S: float = 3.0
 # of *continuous* no-face, measured with time.monotonic().
 # Up to this long a gap is a detector dropout: the level is held silently.
 NO_FACE_HOLD_S: float = 2.0
-# From ALERT / WARNING, a gap this long means the system can no longer see the
-# driver at all - a FAULT for the operator, not a fatigue verdict.
-NO_FACE_FAULT_S: float = 10.0
-# A DANGER latched across a gap is released only after the face is back and
-# its own level has been below DANGER for this long continuously. Matches
-# MICROSLEEP_RELEASE_HOLD_S, the other "don't drop DANGER on one good frame".
+# A gap this long, from any level, means the system can no longer see the
+# driver - a FAULT for the operator, not a fatigue verdict (config; 2.0 s
+# since 2026-10-15, was 10 s and only from ALERT / WARNING).
+NO_FACE_FAULT_S: float = config.NO_FACE_FAULT_S
+# A DANGER latched across a gap shorter than NO_FACE_FAULT_S is released only
+# after the face is back and its own level has been below DANGER for this
+# long continuously. Matches MICROSLEEP_RELEASE_HOLD_S, the other "don't
+# drop DANGER on one good frame". A gap that reached FAULT drops the latch.
 NO_FACE_LATCH_RELEASE_S: float = 3.0
 
 # Colour name for the FAULT level in FrameMetrics.effective_result() (the
@@ -433,9 +435,9 @@ class NoFaceVerdict:
       ``level`` is the level the gap began at.
       ``face_lost`` turns true past :data:`NO_FACE_HOLD_S`, when it stops
       being a detector dropout and is reported as a lost face.
-    * ``"LATCH"`` - the gap began at DANGER; ``level`` is DANGER for as long
-      as the gap lasts and never becomes FAULT.
-    * ``"FAULT"`` - the gap began at ALERT / WARNING and has lasted
+    * ``"LATCH"`` - the gap began at DANGER and is shorter than
+      :data:`NO_FACE_FAULT_S`; ``level`` is DANGER.
+    * ``"FAULT"`` - the gap, from any level, has lasted
       :data:`NO_FACE_FAULT_S` or more; ``level`` is ``"FAULT"``.
     * ``"OFF"``   - policy disabled (pre-drive); ``level`` is ALERT, as
       before the policy existed.
@@ -448,8 +450,8 @@ class NoFaceVerdict:
     face_lost: bool = False
     # Set on the one frame a gap opens a backend fault, else None:
     # "fault_entered" when a HOLD gap crosses into FAULT (fault_type
-    # "no_face"), "latch_lost" when a LATCH gap passes NO_FACE_HOLD_S
-    # (fault_type "danger_latched").
+    # "no_face"), "latch_lost" when a LATCH gap crosses into FAULT
+    # (fault_type "danger_latched": the driver was at DANGER when lost).
     event: Optional[str] = None
 
 
@@ -463,14 +465,17 @@ class NoFacePolicy:
     * HOLD  - from ALERT / WARNING the last level is held (not lowered to
       ALERT, not raised). Past :data:`NO_FACE_HOLD_S` the gap is reported
       as a lost face; the level is still held.
-    * LATCH - from DANGER the level stays DANGER for the whole gap, and after
-      the face returns until its own level has been below DANGER for
-      :data:`NO_FACE_LATCH_RELEASE_S`. A driver whose head drops out of
-      frame mid-microsleep is exactly the case this exists for.
-    * FAULT - from ALERT / WARNING, past :data:`NO_FACE_FAULT_S` the level
-      becomes ``"FAULT"``: the unit cannot see the driver, which is a
-      condition for an operator, not evidence of fatigue. Never entered from
-      DANGER (that would replace the strongest signal with a weaker one).
+    * LATCH - from DANGER the level stays DANGER for up to
+      :data:`NO_FACE_FAULT_S`, and if the face returns within it, until its
+      own level has been below DANGER for :data:`NO_FACE_LATCH_RELEASE_S`.
+      A driver whose head drops out of frame mid-microsleep is the case
+      this exists for.
+    * FAULT - from any level, past :data:`NO_FACE_FAULT_S` the level becomes
+      ``"FAULT"`` until a valid face returns: the unit cannot see the
+      driver, which is a condition for an operator, not evidence of fatigue
+      (2026-10-15: DANGER used to be latched through any gap). A gap that
+      reached FAULT drops the latch, and the pipeline restarts the escalation
+      from ALERT, so the level that follows comes from the current score.
 
     The detectors' own state (pose debounce, microsleep closure) is still
     cleared on every no-face frame by :meth:`MetricsPipeline.note_no_face`;
@@ -532,16 +537,17 @@ class NoFacePolicy:
 
         if not self.enabled:
             verdict = NoFaceVerdict("OFF", "ALERT", gap, entry)
+        elif gap >= self.fault_s:
+            # Prolonged loss is a fault, whatever the entry level: the latch
+            # is dropped, so the returning face is judged on its own.
+            self.latch.reset()
+            was_fault = self._last is not None and self._last.band == "FAULT"
+            event = "latch_lost" if entry == "DANGER" else "fault_entered"
+            verdict = NoFaceVerdict("FAULT", "FAULT", gap, entry, True,
+                                    None if was_fault else event)
         elif entry == "DANGER":
             self.latch.update(True, now_mono)
-            lost = gap > self.hold_s
-            was_lost = self._last is not None and self._last.face_lost
-            verdict = NoFaceVerdict("LATCH", "DANGER", gap, entry, lost,
-                                    "latch_lost" if lost and not was_lost else None)
-        elif gap >= self.fault_s:
-            was_fault = self._last is not None and self._last.band == "FAULT"
-            verdict = NoFaceVerdict("FAULT", "FAULT", gap, entry, True,
-                                    None if was_fault else "fault_entered")
+            verdict = NoFaceVerdict("LATCH", "DANGER", gap, entry, gap > self.hold_s)
         else:
             verdict = NoFaceVerdict("HOLD", entry, gap, entry, gap > self.hold_s)
         self._last = verdict
@@ -953,7 +959,9 @@ class MetricsPipeline:
             perclos = (self.perclos_calc.update(ear, ear_threshold, now_mono,
                                                 baseline=thresholds["perclos_baseline"])
                        if closure_ok else self.perclos_calc.get_perclos())
-            yawn_event = self.yawn_detector.update(mar, thresholds["yawn_threshold"], now)
+            yawn_event = self.yawn_detector.update(
+                mar, thresholds["yawn_threshold"], now,
+                release_threshold=self.yawn_release_threshold(thresholds))
             if yawn_event:
                 logger.info("Yawn detected (mouth open %.1fs, MAR %.3f vs threshold %.3f) - "
                             "%d this session",
@@ -976,19 +984,25 @@ class MetricsPipeline:
                 )
             else:
                 bd_norm = BASELINE
-            # Blink frequency: the frequency baseline was calibrated per 60 s;
-            # scale it to the time this pipeline has actually observed,
-            # min(elapsed, window), and give no term before
-            # BLINK_FREQUENCY_MIN_ELAPSED_S.
+            # Blink frequency: anchored at t = max(floored baseline,
+            # config.BLINK_FREQ_REFERENCE) per minute (2026-10-15), scaled to
+            # the time this pipeline has actually observed, min(elapsed,
+            # window), with no term before BLINK_FREQUENCY_MIN_ELAPSED_S.
             elapsed = now - self._blink_t0
             if elapsed < config.BLINK_FREQUENCY_MIN_ELAPSED_S:
                 bf_norm = BASELINE
             else:
-                bf_baseline = thresholds["blink_frequency_baseline"] * (
+                bf_reference = self.blink_freq_reference(thresholds["blink_frequency_baseline"])
+                bf_baseline = bf_reference * (
                     min(elapsed, self.blink_window_s) / CALIBRATION_BLINK_WINDOW_S
                 )
                 bf_norm = self.blink_detector.normalize_frequency(blink_freq, bf_baseline)
-            perclos_norm = self.perclos_calc.normalize(perclos, thresholds["perclos_baseline"])
+            # PERCLOS against an absolute anchor (2026-10-15): t = max(floored
+            # baseline, config.PERCLOS_REFERENCE), so perclos_norm - 1 =
+            # (PERCLOS - t) / t. A pure ratio to a ~2 % baseline read
+            # ordinary blinking as severe fatigue.
+            perclos_norm = self.perclos_calc.normalize(
+                perclos, self.perclos_reference(thresholds["perclos_baseline"]))
             # Yawn-gated: the mouth only contributes to the FRS while a confirmed
             # (sustained) yawn is in progress. Talking, laughing and the 1.5 s
             # of a yawn before it is confirmed all pass 1.0 = zero excess.
@@ -1132,9 +1146,13 @@ class MetricsPipeline:
             )
         elif verdict.event == "latch_lost":
             logger.warning(
-                "NO FACE for %.1fs at DANGER - DANGER latched, driver unobserved",
-                verdict.gap_s,
+                "NO FACE for %.1fs at DANGER - DANGER latch dropped, FAULT: the driver "
+                "cannot be observed", verdict.gap_s,
             )
+        if verdict.event is not None:
+            # Past NO_FACE_FAULT_S the pre-gap level says nothing: escalation
+            # restarts from ALERT and follows the score once the face returns.
+            self.band.reset()
 
         if self.pose_debounce.active:
             logger.info("Face lost - clearing head-pose alert%s",
@@ -1160,8 +1178,10 @@ class MetricsPipeline:
                          abandoned["closed_s"])
         self.microsleep_debounce.reset()
         # A blink in progress is abandoned too (until 2026-10-15 it was
-        # carried across the gap and the gap was added to its duration).
+        # carried across the gap and the gap was added to its duration),
+        # and so is a mouth opening.
         self.blink_detector.abandon()
+        self.yawn_detector.abandon()
         # The next face frame starts a fresh stall-guard interval.
         self._last_frame_mono = None
         # Pre-gap EAR samples say nothing about the face that comes back.
@@ -1198,7 +1218,10 @@ class MetricsPipeline:
                 self.set_pose_neutral(neutral, "seeded")
 
     def _abandon_closures(self, now: float, why: str) -> None:
-        """Drop blink / microsleep closures in progress: the time is unobserved."""
+        """Drop blink / microsleep closures and a mouth opening in progress:
+        the time is unobserved."""
+        if self.yawn_detector.abandon():
+            logger.info("%s - abandoning the mouth opening in progress", why)
         blink = self.blink_detector.abandon()
         abandoned = self.microsleep_detector.note_no_face(now)
         if blink or abandoned:
@@ -1226,6 +1249,35 @@ class MetricsPipeline:
                     self._floors_logged.add((key, value))
                     logger.info("Scoring floor: %s %.4g -> %.4g", key, value, floor)
         return out
+
+    @staticmethod
+    def perclos_reference(perclos_baseline: float) -> float:
+        """
+        The PERCLOS the term is scored against: ``max(baseline,
+        config.PERCLOS_REFERENCE)``, with ``perclos_baseline`` already floored
+        (:meth:`scoring_thresholds`).
+        """
+        return max(float(perclos_baseline), config.PERCLOS_REFERENCE)
+
+    @staticmethod
+    def yawn_release_threshold(thresholds: Dict[str, float]) -> Optional[float]:
+        """
+        MAR below which a mouth opening ends:
+        ``config.YAWN_MAR_RELEASE_RATIO`` x the MAR baseline, or ``None``
+        (the detector derives it from the entry threshold) without one.
+        """
+        baseline = finite_or_none(thresholds.get("mar_baseline"))
+        return None if not baseline else baseline * config.YAWN_MAR_RELEASE_RATIO
+
+    @staticmethod
+    def blink_freq_reference(blink_frequency_baseline: float) -> float:
+        """
+        The per-minute blink frequency the term is scored against:
+        ``max(baseline, config.BLINK_FREQ_REFERENCE)``, with the baseline
+        already floored (:meth:`scoring_thresholds`). The caller scales it
+        to the time observed.
+        """
+        return max(float(blink_frequency_baseline), config.BLINK_FREQ_REFERENCE)
 
     def reset(self) -> None:
         """Fresh per-driver history (blinks, microsleeps, PERCLOS, yawns, debounces)."""

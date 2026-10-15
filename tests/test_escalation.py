@@ -257,3 +257,86 @@ def test_settling_waits_for_an_open_eye_and_restarts_on_invalid():
     assert w.held(t) >= 3.0 and not w.settled(t), "never hand over mid-closure"
     _, t = settle_run(w, [(DT, "open")], t0=t)
     assert w.settled(t)
+
+
+# ---- PERCLOS anchored to an absolute reference -------------------------------------
+
+@pytest.mark.parametrize("perclos, baseline, excess", [
+    (9.088, 2.0, 0.0),      # the Pi run: ordinary blinking, 2 % floor -> no term
+    (20.0, 2.0, 1.0),
+    (40.0, 2.0, 3.0),
+    (60.0, 2.0, 4.0),       # capped
+    (18.0, 12.0, 0.5),      # a baseline above the reference is the anchor
+])
+def test_perclos_excess_is_anchored(perclos, baseline, excess):
+    from modules.frs import FRSCalculator
+    from modules.perclos import PERCLOSCalculator
+    t = MetricsPipeline.perclos_reference(baseline)
+    norm = PERCLOSCalculator().normalize(perclos, t)
+    r = FRSCalculator().compute(1.0, 1.0, 1.0, norm)
+    assert r["excess"]["perclos_excess"] == pytest.approx(excess, abs=1e-3)
+
+
+def test_theoretical_max_unchanged():
+    from modules.frs import FRSCalculator
+    m = FRSCalculator().theoretical_max()
+    assert m["bounded"] == pytest.approx(5.05) and m["unbounded_terms"] == []
+
+
+# ---- no-face: latch for NO_FACE_FAULT_S, then FAULT ----------------------------------
+
+def gap(pipeline, t0, seconds):
+    verdicts, t = [], t0
+    for _ in range(int(round(seconds / DT))):
+        t += DT
+        verdicts.append(pipeline.note_no_face(t, t))
+    return verdicts, t
+
+
+def test_danger_latch_becomes_fault_after_two_seconds(hp):
+    p = MetricsPipeline(hp, blink_window_s=60, no_face_policy=True)
+    ms = run(p, open_s(3.0) + closed_s(1.3))
+    assert ms[-1].level == "DANGER"
+    t = ms[-1].t
+    verdicts, t = gap(p, t, 3.0)
+    latched = [v for v in verdicts if v.gap_s < 1.99]
+    assert latched and all(v.band == "LATCH" and v.level == "DANGER" for v in latched)
+    faults = [v for v in verdicts if v.gap_s > 2.01]
+    assert faults and all(v.band == "FAULT" and v.level == "FAULT" for v in faults)
+    assert [v.event for v in verdicts if v.event] == ["latch_lost"], "one backend fault"
+    back = run(p, open_s(0.5), t0=t)
+    assert not back[0].no_face_latch, "the latch is dropped"
+    assert {m.level for m in back} == {"ALERT"}, "escalation restarts from the score"
+
+
+def test_short_gap_keeps_the_existing_latch(hp):
+    p = MetricsPipeline(hp, blink_window_s=60, no_face_policy=True)
+    ms = run(p, open_s(3.0) + closed_s(1.3))
+    verdicts, t = gap(p, ms[-1].t, 1.5)
+    assert {v.band for v in verdicts} == {"LATCH"}
+    back = run(p, open_s(2.0), t0=t)
+    assert all(m.level == "DANGER" and m.no_face_latch for m in back), \
+        "held until 3 s below DANGER"
+
+
+def test_hold_from_warning_faults_at_two_seconds(hp):
+    p = MetricsPipeline(hp, blink_window_s=60, no_face_policy=True)
+    run(p, open_s(3.0))
+    p.last_level = "WARNING"
+    verdicts, _ = gap(p, 1003.0, 2.5)
+    assert {v.band for v in verdicts if v.gap_s < 1.99} == {"HOLD"}
+    assert {v.level for v in verdicts if v.gap_s < 1.99} == {"WARNING"}
+    assert [v.event for v in verdicts if v.event] == ["fault_entered"]
+    assert verdicts[-1].level == "FAULT"
+
+
+def test_blink_frequency_is_anchored(hp):
+    assert MetricsPipeline.blink_freq_reference(3.0) == 20.0
+    assert MetricsPipeline.blink_freq_reference(24.0) == 24.0
+    p = MetricsPipeline(hp, blink_window_s=60)
+    # ~30 blinks/min for 20 s: against the 6 /min floor this was at the cap.
+    ms = run(p, open_s(1.0) + (closed_s(0.15) + open_s(1.85)) * 10)
+    m, elapsed = ms[-1], ms[-1].t - ms[0].t
+    assert m.blink_freq >= 9
+    assert m.bf_norm == pytest.approx(m.blink_freq / (20.0 * elapsed / 60.0), rel=0.01)
+    assert m.frs_result["excess"]["blink_frequency_excess"] < 1.0

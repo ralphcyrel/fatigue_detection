@@ -24,13 +24,16 @@ Typical outer-lip values (read the real ones off the ``--debug`` overlay):
     yawn                  ≈ 2.5  – 3.5× baseline, held for 4–7 s
 
 :class:`YawnDetector` separates yawns from speech with **two** conditions
-that must both hold: the MAR must exceed ``YAWN_MAR_RATIO`` (2.0) times the
+that must both hold: the MAR must reach ``YAWN_MAR_RATIO`` (2.0) times the
 driver's calibrated closed-mouth baseline — above talking, below a yawn —
-*and* stay above it continuously for ``MIN_YAWN_DURATION_S`` (1.5 s). A
-single frame below the threshold restarts the timer, so speech, laughter
-and singing (which open and close the mouth far faster than that) never
-register, while a real yawn is confirmed ~1.5 s in and remains "in
-progress" until the mouth closes.
+*and* the opening must last ``MIN_YAWN_DURATION_S`` (1.5 s). The opening
+has hysteresis (2026-10-15): it starts at 2.0x and continues while the MAR
+stays at or above ``YAWN_MAR_RELEASE_RATIO`` (1.6x), so a natural yawn
+wobbling around 2.0x is one opening rather than many short ones. Dropping
+below 1.6x ends it, so speech, laughter and singing (which open and close
+the mouth far faster than 1.5 s) still never register, while a real yawn is
+confirmed ~1.5 s in and remains "in progress" until the mouth closes.
+Invalid frames and loop stalls end an opening (:meth:`YawnDetector.abandon`).
 
 Downstream, the FRS (Module 6) consumes ``mar_norm`` **only while a yawn is
 in progress** (the caller passes ``1.0`` — zero excess — otherwise), and the
@@ -44,6 +47,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from scipy.spatial.distance import euclidean
 
+from config import config
+
 # ---------------------------------------------------------------------------
 # Mouth landmark index range (half-open, matching ``modules.landmark``).
 # Duplicated here rather than imported so this module stays free of the
@@ -54,13 +59,17 @@ MOUTH: Tuple[int, int] = (48, 68)
 # Number of landmark points that outline the mouth (outer 48–59 + inner 60–67).
 MOUTH_POINTS: int = 20
 
-# Yawn threshold as a multiple of the driver's calibrated closed-mouth MAR.
-# Talking peaks at ~1.3–1.8× and a yawn at ~2.5–3.5×; 2.0 sits in the gap.
-YAWN_MAR_RATIO: float = 2.0
+# Yawn entry threshold as a multiple of the driver's calibrated closed-mouth
+# MAR. Talking peaks at ~1.3–1.8× and a yawn at ~2.5–3.5×; 2.0 sits in the gap.
+YAWN_MAR_RATIO: float = config.YAWN_MAR_RATIO
 
-# Seconds the MAR must stay continuously above the yawn threshold before the
-# opening is confirmed as a yawn. Speech and laughter never hold a
-# yawn-sized opening this long; real yawns last 4–7 s.
+# Release threshold: an opening that reached YAWN_MAR_RATIO continues while
+# the MAR stays at or above this multiple of the baseline (hysteresis).
+YAWN_MAR_RELEASE_RATIO: float = config.YAWN_MAR_RELEASE_RATIO
+
+# Seconds an opening (entry -> release, see above) must last before it is
+# confirmed as a yawn. Speech and laughter never hold a yawn-sized opening
+# this long; real yawns last 4–7 s.
 MIN_YAWN_DURATION_S: float = 1.5
 
 
@@ -201,7 +210,8 @@ class YawnDetector:
     Attributes:
         min_duration: Seconds the mouth must stay open before an opening
             counts as a yawn.
-        mouth_open: Whether the MAR was above threshold on the last frame.
+        mouth_open: Whether an opening is in progress (entered at the yawn
+            threshold, not yet below the release threshold).
         open_time: Timestamp at which the current opening started.
         is_yawning: ``True`` from the moment the opening is confirmed as a
             yawn until the mouth closes again.
@@ -223,34 +233,42 @@ class YawnDetector:
         self.is_yawning: bool = False
         self.yawn_timestamps: List[float] = []
         self.yawn_durations: List[float] = []
+        # Time of the last frame fed in: where an abandoned yawn ends.
+        self._last_t: Optional[float] = None
 
     def update(
         self,
         mar: float,
         threshold: float,
         timestamp: Optional[float] = None,
+        release_threshold: Optional[float] = None,
     ) -> Optional[Dict[str, float]]:
         """
         Feed one frame's MAR into the state machine.
 
         Transitions:
 
-        * closed → open when ``mar > threshold``: remember the open time.
+        * closed → open when ``mar >= threshold``: remember the open time.
         * open, not yet yawning, held ≥ ``min_duration``: confirm the yawn
           and return an event (once per opening).
-        * open → closed when ``mar <= threshold``: end the opening; if it
-          was a confirmed yawn, record its total duration.
+        * open → closed when ``mar < release_threshold``: end the opening;
+          if it was a confirmed yawn, record its total duration.
 
-        A single frame at or below the threshold closes the opening, so
-        speech (which dips below the threshold many times a second) never
-        accumulates towards ``min_duration``.
+        Between the two thresholds an opening continues but none starts, so
+        a yawn wobbling around the entry threshold stays one opening, while
+        speech (which falls below the release threshold many times a
+        second) never accumulates towards ``min_duration``.
 
         Args:
             mar: Raw MAR for the current frame.
-            threshold: The driver's calibrated yawn threshold.
+            threshold: The driver's calibrated yawn (entry) threshold.
             timestamp: Frame time in seconds (``time.time()`` style).
                 Defaults to the wall clock; pass explicitly for deterministic
                 tests or video replay.
+            release_threshold: MAR below which an opening ends. Defaults to
+                ``threshold * YAWN_MAR_RELEASE_RATIO / YAWN_MAR_RATIO``, i.e.
+                1.6x baseline for the calibrated 2.0x threshold; never above
+                ``threshold``.
 
         Returns:
             ``{"timestamp": float, "duration_ms": float}`` on the frame a
@@ -258,36 +276,59 @@ class YawnDetector:
             i.e. ≈ ``min_duration``), otherwise ``None``.
         """
         now = time.time() if timestamp is None else timestamp
-        currently_open = mar > threshold
+        self._last_t = now
+        if release_threshold is None:
+            release_threshold = threshold * YAWN_MAR_RELEASE_RATIO / YAWN_MAR_RATIO
+        release_threshold = min(release_threshold, threshold)
 
-        if currently_open and not self.mouth_open:
-            # Mouth just opened past the yawn threshold — start timing.
-            self.mouth_open = True
-            self.open_time = now
+        if not self.mouth_open:
+            if mar >= threshold:
+                # Mouth just opened past the yawn threshold — start timing.
+                self.mouth_open = True
+                self.open_time = now
             return None
 
-        if currently_open and self.mouth_open and not self.is_yawning:
-            held = now - self.open_time
-            if held >= self.min_duration:
-                self.is_yawning = True
-                self.yawn_timestamps.append(now)
-                return {"timestamp": now, "duration_ms": held * 1000.0}
-            return None
-
-        if not currently_open and self.mouth_open:
-            # Mouth closed — the opening is over.
+        if mar < release_threshold:
+            # Below the release threshold — the opening is over.
             self.mouth_open = False
             if self.is_yawning:
                 self.is_yawning = False
                 self.yawn_durations.append((now - self.open_time) * 1000.0)
             return None
 
-        # No transition (still closed, or a confirmed yawn still in progress).
+        if not self.is_yawning:
+            held = now - self.open_time
+            if held >= self.min_duration:
+                self.is_yawning = True
+                self.yawn_timestamps.append(now)
+                return {"timestamp": now, "duration_ms": held * 1000.0}
+
+        # Opening continues (not yet a yawn, or a confirmed yawn in progress).
         return None
+
+    def abandon(self) -> Optional[Dict[str, float]]:
+        """
+        End the opening in progress without observing it close: an invalid
+        frame or a loop stall, where the mouth cannot be measured. A
+        confirmed yawn is recorded as ending at the last observed frame.
+
+        Returns:
+            ``{"open_s": float, "was_yawning": bool}`` if an opening was in
+            progress, else ``None``.
+        """
+        if not self.mouth_open:
+            return None
+        end = self.open_time if self._last_t is None else self._last_t
+        info = {"open_s": float(end - self.open_time), "was_yawning": self.is_yawning}
+        if self.is_yawning:
+            self.yawn_durations.append((end - self.open_time) * 1000.0)
+        self.mouth_open = False
+        self.is_yawning = False
+        return info
 
     def get_open_duration(self, current_time: Optional[float] = None) -> float:
         """
-        Seconds the mouth has been continuously open past the threshold.
+        Seconds the current opening has lasted (see :meth:`update`).
 
         Args:
             current_time: Reference "now". Defaults to ``time.time()``.
@@ -350,3 +391,4 @@ class YawnDetector:
         self.is_yawning = False
         self.yawn_timestamps.clear()
         self.yawn_durations.clear()
+        self._last_t = None
