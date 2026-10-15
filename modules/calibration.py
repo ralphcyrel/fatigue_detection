@@ -813,12 +813,14 @@ class CalibrationManager:
         baselines: Optional[Dict[str, float]] = None,
         directory: Path = config.CALIBRATIONS_DIR,
         closed_capture: Optional[Dict[str, Any]] = None,
+        pose_neutral: Optional[Dict[str, Any]] = None,
     ) -> Path:
         """
         Write ``<device>_<driver>_<UTC stamp>.csv`` (one row per frame, columns
         as in ``SAMPLE_FIELDS``) and a ``.json`` summary next to it holding
-        :meth:`raw_summary` plus the ``baselines`` that were persisted, and
-        ``closed_capture`` (the closed-eye attempts, per-frame) when given.
+        :meth:`raw_summary` plus the ``baselines`` that were persisted,
+        ``closed_capture`` (the closed-eye attempts, per-frame) and
+        ``pose_neutral`` (median head pose over the window) when given.
 
         Returns:
             Path of the CSV file.
@@ -842,6 +844,8 @@ class CalibrationManager:
         }
         if closed_capture is not None:
             summary["closed_capture"] = closed_capture
+        if pose_neutral is not None:
+            summary["pose_neutral"] = pose_neutral
         (directory / f"{stem}.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         logger.info("Calibration data written: %s (%d frames)", csv_path, len(self.samples))
         return csv_path

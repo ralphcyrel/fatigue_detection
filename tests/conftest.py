@@ -25,6 +25,8 @@ from modules.phase import Phase  # noqa: E402
 def m(monkeypatch, tmp_path):
     """main.py, isolated: fake camera, no window, logs under tmp_path."""
     monkeypatch.setattr(main.config, "LOGS_DIR", tmp_path)
+    # Enrollment stores the neutral head pose; keep it out of data/.
+    monkeypatch.setattr(main.config, "POSE_NEUTRAL_FILE", tmp_path / "pose_neutral.json")
     for name, value in {
         "_camera": FakeCam(), "_alert_manager": None, "_heartbeat": None, "_ignition": None,
         "_head_pose": None, "_profiler": None, "_rate": None, "_stream": None,

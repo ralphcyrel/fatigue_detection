@@ -32,6 +32,13 @@ LOGS_DIR: Final[Path] = BASE_DIR / "logs"
 # Per-frame CSV + JSON summary of every pre-drive assessment (results data).
 ASSESSMENTS_DIR: Final[Path] = LOGS_DIR / "assessments"
 
+# Per-frame FRS debug CSV (modules/frs_debug_log.py): every processed frame
+# in both phases with raw metrics, normalised inputs, weighted terms, FRS,
+# level and the reason for the level, to logs/debug_frs_<UTC stamp>.csv.
+# Diagnostic only; off by default. FATIGUE_DEBUG_FRS_CSV=1 turns it on
+# without editing this file.
+DEBUG_FRS_CSV: Final[bool] = os.environ.get("FATIGUE_DEBUG_FRS_CSV", "0") == "1"
+
 # Per-frame CSV + JSON summary of every enrollment calibration, so a stored
 # baseline can be traced back to the raw EAR/MAR series that produced it.
 CALIBRATIONS_DIR: Final[Path] = LOGS_DIR / "calibrations"
@@ -193,6 +200,82 @@ assert abs(_EYE_WEIGHT_SUM - 1.0) < 1e-9, (
 )
 
 # ---------------------------------------------------------------------------
+# Alert-level escalation (2026-10-15; modules/pipeline.LevelEscalator)
+# ---------------------------------------------------------------------------
+
+# ALERT -> WARNING once FRS >= 0.40 has held for this long. A head-pose alert
+# (already held HEAD_POSE_ALERT_HOLD_S) enters WARNING without further delay.
+LEVEL_WARNING_ENGAGE_S: Final[float] = 1.0
+# WARNING -> DANGER only after this long continuously in WARNING with
+# FRS >= 0.65 or a head-pose alert. There is no direct ALERT -> DANGER.
+LEVEL_DANGER_ENGAGE_S: Final[float] = 3.0
+# A level is lowered only after its condition has been false for this long.
+LEVEL_RELEASE_HOLD_S: Final[float] = 2.0
+
+# A confirmed microsleep forces DANGER directly (False), or only feeds the
+# escalation above like a head-pose alert, i.e. it must spend
+# LEVEL_DANGER_ENGAGE_S in WARNING first (True). Either way a microsleep
+# still fails the pre-drive assessment outright.
+MICROSLEEP_REQUIRES_WARNING: Final[bool] = False
+
+# A gap longer than this between two processed frames (a loop stall, e.g.
+# face recognition) is unknown time: blink and microsleep closures in
+# progress are abandoned rather than extended across it.
+MAX_FRAME_GAP_S: Final[float] = 0.5
+
+# ---------------------------------------------------------------------------
+# Scoring floors and warm-up (2026-10-15)
+# ---------------------------------------------------------------------------
+
+# Floors on the calibrated baselines the FRS normalises against, applied at
+# scoring time (modules/pipeline) to every source - stored calibrations,
+# defaults and self-seeded runs - while the stored record keeps the measured
+# value. The recorded calibrations measured 70-118 ms / 3-9 per min /
+# 0.5-1.9 % at ~20 fps (dlib under-tracks short closures), against which one
+# ordinary blink scored DANGER. These are not the degenerate-run floors in
+# modules/calibration.py (MIN_*), which only prevent a zero divisor.
+PERCLOS_BASELINE_FLOOR: Final[float] = 2.0             # percent
+BLINK_DURATION_BASELINE_FLOOR_MS: Final[float] = 150.0  # ms
+BLINK_FREQUENCY_BASELINE_FLOOR: Final[float] = 6.0     # blinks per minute
+
+# The blink-duration term is zero until at least this many blinks fall in
+# its window (modules.blink.BLINK_MEAN_WINDOW_S): a one- or two-blink "mean"
+# is a single sample.
+BLINK_DURATION_MIN_BLINKS: Final[int] = 3
+# The blink-frequency term is zero until this much time has been observed;
+# after that the baseline is scaled to min(elapsed, window), not the window.
+BLINK_FREQUENCY_MIN_ELAPSED_S: Final[float] = 10.0
+
+# ---------------------------------------------------------------------------
+# Head pose (2026-10-15: relative to the driver's own neutral pose)
+# ---------------------------------------------------------------------------
+
+# Deviation from the driver's neutral pose (degrees) that flags a pose: a
+# nod is a pitch DROP of at least this much (pitch < 0 is head down), yaw /
+# roll an absolute deviation beyond it. The neutral pose is the median over
+# enrollment's calibration window, kept on this unit in POSE_NEUTRAL_FILE;
+# without one, the median of the pre-drive settling period, or in monitoring
+# of the first HEAD_POSE_NEUTRAL_SEED_S of face time (no pose alerts until
+# then). The recorded neutral pitch on the bench mounting is +21..+27 deg,
+# which the old absolute -15 deg limit could not account for.
+HEAD_POSE_NOD_DROP_DEG: Final[float] = 15.0
+HEAD_POSE_YAW_DEVIATION_DEG: Final[float] = 30.0
+HEAD_POSE_ROLL_DEVIATION_DEG: Final[float] = 20.0
+# A flagged pose must persist this long to count as a head-pose alert.
+HEAD_POSE_ALERT_HOLD_S: Final[float] = 1.5
+HEAD_POSE_NEUTRAL_SEED_S: Final[float] = 3.0
+
+# Per-driver neutral head pose, keyed by driver id. Local to this unit on
+# purpose: it depends on the camera mounting, and the backend API has no
+# field for it.
+POSE_NEUTRAL_FILE: Final[Path] = DATA_DIR / "pose_neutral.json"
+
+# Landmark validity: a frame whose eye landmarks fall outside the image, or
+# whose eye is narrower than this (pixels, corner to corner), is invalid and
+# handled like a frame with no face - never scored as closed eyes.
+LANDMARK_MIN_EYE_WIDTH_PX: Final[float] = 8.0
+
+# ---------------------------------------------------------------------------
 # Timing windows
 # ---------------------------------------------------------------------------
 
@@ -226,9 +309,21 @@ PREDRIVE_WORST_WINDOW_SECONDS: Final[float] = 5.0
 PREDRIVE_RECOGNITION_TIMEOUT_S: Final[float] = 10.0
 PREDRIVE_RECOGNITION_MATCHES: Final[int] = 3
 
-# If the face is missing for more than this fraction of the assessment
-# window the assessment is void (treated as not recognised).
-PREDRIVE_MAX_NO_FACE_FRACTION: Final[float] = 0.5
+# Settling (2026-10-15): after recognition, the face and landmarks must be
+# valid for this long continuously before anything is scored; a lost face or
+# invalid landmarks restart it. The head pose seen here is the fallback
+# neutral pose for a driver with none stored (see POSE_NEUTRAL_FILE). If it
+# never completes within the timeout the run is an invalid assessment.
+PREDRIVE_SETTLE_SECONDS: Final[float] = 3.0
+PREDRIVE_SETTLE_TIMEOUT_S: Final[float] = 20.0
+
+# The assessment is valid only if at least this fraction of its frames had a
+# face with valid landmarks. Below it the result is FAULT (invalid
+# assessment): the starter stays inhibited and the lock is raised as
+# driver_not_recognized (the backend has no separate reason); the real cause
+# is logged locally as INVALID_ASSESSMENT with the valid-frame percentage.
+# Replaces PREDRIVE_MAX_NO_FACE_FRACTION (0.5).
+PREDRIVE_MIN_VALID_FRACTION: Final[float] = 0.80
 
 # How often (seconds, wall clock) to poll the backend for the operator's
 # decision on a pending override request.

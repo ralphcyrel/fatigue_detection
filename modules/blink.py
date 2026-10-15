@@ -114,6 +114,11 @@ class BlinkDetector:
 
         self.eyes_closed: bool = False
         self.close_time: float = 0.0
+        # Time of the last frame actually *observed* closed in the current
+        # closure. The blink / microsleep split is decided on the observed
+        # closed span (close_time .. last_closed_time), the same span
+        # MicrosleepDetector confirms on, so the two partition every closure.
+        self.last_closed_time: float = 0.0
         self.blink_durations: List[float] = []
         self.blink_timestamps: List[float] = []
 
@@ -132,6 +137,10 @@ class BlinkDetector:
         * closed → open when ``ear >= threshold``: measure the closure and, if
           it is long enough to be a real blink, record it and return an event.
 
+        The caller must call :meth:`abandon` when frames are missing (no face,
+        invalid landmarks, a loop stall): a closure is only ever measured over
+        frames that were actually observed.
+
         Args:
             ear: Raw EAR for the current frame.
             threshold: The driver's calibrated closure threshold.
@@ -141,13 +150,19 @@ class BlinkDetector:
 
         Returns:
             ``{"duration_ms": float, "timestamp": float}`` when a valid blink
-            just completed, otherwise ``None``. A closure outside
-            ``[MIN_BLINK_DURATION_MS, MICROSLEEP_MIN_DURATION_MS)`` is not a
-            blink and returns ``None``: too short is landmark jitter, too long
-            is a microsleep (see :class:`MicrosleepDetector`).
+            just completed, otherwise ``None``. A closure shorter than
+            ``MIN_BLINK_DURATION_MS`` is landmark jitter, and one whose
+            *observed* closed span reached ``MICROSLEEP_MIN_DURATION_MS`` is a
+            microsleep (see :class:`MicrosleepDetector`); neither is a blink.
+            A closure that crossed 1.0 s only in the gap before the reopening
+            frame was not observed for the full microsleep duration, so it is
+            recorded here as a (very slow) blink rather than lost.
         """
         now = time.time() if timestamp is None else timestamp
         currently_closed = ear < threshold
+
+        if currently_closed:
+            self.last_closed_time = now
 
         if currently_closed and not self.eyes_closed:
             # Eyes just shut — start timing the closure.
@@ -165,13 +180,12 @@ class BlinkDetector:
             if duration_ms < MIN_BLINK_DURATION_MS:
                 return None
 
-            # Reject closures of a second or more: those are microsleeps, a
-            # different kind of event entirely, and letting one into
-            # ``blink_durations`` both inflates the FRS blink-duration term
-            # without bound and poisons the rolling mean for the next
-            # ``AVERAGE_WINDOW`` blinks. :class:`MicrosleepDetector`, fed the
-            # same EAR stream, reports these instead.
-            if duration_ms >= MICROSLEEP_MIN_DURATION_MS:
+            # Reject closures observed shut for a second or more: those are
+            # microsleeps, a different kind of event entirely, and letting one
+            # into ``blink_durations`` both inflates the FRS blink-duration
+            # term and poisons the rolling mean. :class:`MicrosleepDetector`,
+            # fed the same EAR stream, confirms exactly these.
+            if (self.last_closed_time - self.close_time) * 1000.0 >= MICROSLEEP_MIN_DURATION_MS:
                 return None
 
             self.blink_durations.append(duration_ms)
@@ -180,6 +194,25 @@ class BlinkDetector:
 
         # No transition (still open, or still closed) — nothing to report.
         return None
+
+    def abandon(self) -> bool:
+        """
+        Drop a closure in progress without recording it (frames are missing).
+
+        Returns:
+            ``True`` if a closure was in progress.
+        """
+        was_closed = self.eyes_closed
+        self.eyes_closed = False
+        self.close_time = 0.0
+        self.last_closed_time = 0.0
+        return was_closed
+
+    def recent_count(self, current_time: Optional[float] = None,
+                     window_s: float = BLINK_MEAN_WINDOW_S) -> int:
+        """Blinks completed in the trailing ``window_s`` (the duration mean's window)."""
+        now = time.time() if current_time is None else current_time
+        return sum(1 for ts in self.blink_timestamps if ts >= now - window_s)
 
     def get_blink_frequency(self, current_time: Optional[float] = None) -> float:
         """
@@ -276,6 +309,7 @@ class BlinkDetector:
         """Clear all blink history and closure state for a new driver."""
         self.eyes_closed = False
         self.close_time = 0.0
+        self.last_closed_time = 0.0
         self.blink_durations.clear()
         self.blink_timestamps.clear()
 
@@ -350,6 +384,13 @@ class MicrosleepDetector:
         * closed → open when ``ear >= threshold``: end the closure; if it was
           a confirmed microsleep, record its total duration.
 
+        Confirmation needs a frame *observed closed* at least ``min_duration``
+        after the closure began (2026-10-15). A closure that reopens first is
+        not a microsleep, however long the gap before the reopening frame:
+        that gap is unobserved time. The caller abandons the closure
+        (:meth:`note_no_face`) on a missing face, invalid landmarks or a loop
+        stall, so every frame of a confirmed closure was measured.
+
         A single frame at or above the threshold ends the closure, matching
         ``BlinkDetector``'s test exactly so the two can never disagree about
         whether the eyes are shut.
@@ -366,25 +407,19 @@ class MicrosleepDetector:
             on the frame a microsleep is *confirmed* (``duration_ms`` is the
             closure so far, i.e. ≈ ``min_duration`` × 1000), otherwise
             ``None``. ``min_ear`` is the lowest EAR observed since the closure
-            began - always below ``threshold``, unlike the confirming frame's
-            own EAR in the boundary case described below.
+            began.
 
-            Confirmation normally happens with the eyes still shut. The one
-            exception is a closure that crosses ``min_duration`` between two
-            frames and reopens before any frame could observe it past the
-            line; that is confirmed on the reopening frame instead, so no
-            closure can be rejected by *both* detectors. Together the two
-            detectors partition every closure ≥
-            :data:`MIN_BLINK_DURATION_MS` into exactly one bucket.
+            Confirmation always happens with the eyes still shut. A closure
+            that crosses ``min_duration`` only in the gap before its reopening
+            frame is a slow blink for ``BlinkDetector``, which splits on the
+            same observed span, so the two detectors still partition every
+            closure ≥ :data:`MIN_BLINK_DURATION_MS` into exactly one bucket.
         """
         now = time.time() if timestamp is None else timestamp
         currently_closed = ear < threshold
 
-        # Deepest (lowest) EAR seen since this closure began. Reported on the
-        # event so the log can show how far the eye actually shut, rather than
-        # whatever the confirming frame happened to read - which, in the
-        # boundary case below, is the *reopening* frame and therefore sits
-        # above the threshold.
+        # Deepest (lowest) EAR seen since this closure began, reported on the
+        # event so the log shows how far the eye actually shut.
         if currently_closed:
             self.min_ear = ear if not self.eyes_closed else min(self.min_ear, ear)
 
@@ -410,20 +445,10 @@ class MicrosleepDetector:
             if self.is_microsleeping:
                 self.is_microsleeping = False
                 self.microsleep_durations.append(duration_ms)
-                return None
-            if duration_ms >= self.min_duration * 1000.0:
-                # Boundary case: the closure crossed ``min_duration`` in the
-                # gap *between* two frames, so no frame ever observed it while
-                # the eyes were still shut. ``BlinkDetector`` measures the same
-                # closure from the reopen timestamp and rejects it as too long,
-                # so without this the event would fall through both detectors
-                # and vanish. Confirm it now instead, one frame late.
-                self.microsleep_timestamps.append(now)
-                self.microsleep_durations.append(duration_ms)
-                # ``min_ear`` is the minimum over the *closed* frames, so it
-                # excludes this reopening frame's (above-threshold) value.
-                return {"timestamp": now, "duration_ms": duration_ms,
-                        "min_ear": self.min_ear}
+            # Unconfirmed: never *observed* shut for min_duration. Until
+            # 2026-10-15 this was confirmed here, on the reopening frame,
+            # which turned a blink spanning a 1 s loop stall into a
+            # microsleep. BlinkDetector records it as a slow blink instead.
             return None
 
         # No transition (still open, or a confirmed microsleep still running).

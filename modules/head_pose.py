@@ -19,8 +19,14 @@ Angle conventions (all in degrees, ``0`` = facing the camera squarely):
 * ``yaw < 0``    -> nose moved towards the **image's left** edge.
 * ``roll < 0``   -> head tilted towards the **image's left** edge.
 
-The thresholds in :class:`HeadPoseEstimator` flag a pose as an alert when any
-one of the three angles exceeds its limit.
+A pose is flagged by its *deviation from the driver's neutral pose*, not by
+the absolute angles (2026-10-15): with a generic face model and an
+uncalibrated camera the absolute pitch of a driver looking at the road
+depends on the mounting (+21..+27 deg on the bench rig), so a fixed limit
+either never fires or always does. A nod is a pitch drop of at least
+``config.HEAD_POSE_NOD_DROP_DEG`` below neutral; yaw and roll are flagged
+beyond ``config.HEAD_POSE_YAW_DEVIATION_DEG`` / ``..._ROLL_DEVIATION_DEG``.
+Without a neutral pose nothing is flagged.
 
 Implementation note: the reference model has +y pointing *up* (chin at
 ``y = -330``) while image coordinates have +y pointing *down*. A frontal face
@@ -33,6 +39,8 @@ from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from config import config
 
 # ---------------------------------------------------------------------------
 # Reference geometry
@@ -85,10 +93,11 @@ class HeadPoseEstimator:
         dist_coeffs: Lens distortion, assumed zero.
     """
 
-    # Angle limits (degrees) beyond which a pose is flagged.
-    PITCH_THRESHOLD: float = -15.0  # head down (nodding)
-    YAW_THRESHOLD: float = 30.0     # |yaw| - looking away
-    ROLL_THRESHOLD: float = 20.0    # |roll| - tilting
+    # Deviation limits (degrees) from the neutral pose beyond which a pose
+    # is flagged. See the module docstring.
+    NOD_DROP_DEG: float = config.HEAD_POSE_NOD_DROP_DEG              # nodding
+    YAW_DEVIATION_DEG: float = config.HEAD_POSE_YAW_DEVIATION_DEG    # looking away
+    ROLL_DEVIATION_DEG: float = config.HEAD_POSE_ROLL_DEVIATION_DEG  # tilting
 
     def __init__(self, frame_width: int = 640, frame_height: int = 480) -> None:
         """
@@ -124,13 +133,18 @@ class HeadPoseEstimator:
     # Estimation
     # ------------------------------------------------------------------
 
-    def estimate(self, landmarks: np.ndarray) -> Optional[Dict[str, object]]:
+    def estimate(
+        self, landmarks: np.ndarray, neutral: Optional[Dict[str, float]] = None
+    ) -> Optional[Dict[str, object]]:
         """
-        Solve for the head orientation.
+        Solve for the head orientation and flag it against a neutral pose.
 
         Args:
             landmarks: ``(68, 2)`` array of dlib landmarks in pixel
                 coordinates.
+            neutral: The driver's neutral ``{"pitch", "yaw", "roll"}``
+                (degrees). ``None`` flags nothing: without a baseline a
+                deviation cannot be judged.
 
         Returns:
             A dict::
@@ -139,9 +153,13 @@ class HeadPoseEstimator:
                   "pitch": float,            # deg, negative = head down
                   "yaw": float,              # deg, negative = towards image left
                   "roll": float,             # deg, negative = tilt to image left
-                  "is_nodding": bool,        # pitch < PITCH_THRESHOLD
-                  "is_looking_away": bool,   # |yaw| > YAW_THRESHOLD
-                  "is_tilting": bool,        # |roll| > ROLL_THRESHOLD
+                  "d_pitch": float | None,   # pitch - neutral pitch
+                  "d_yaw": float | None,
+                  "d_roll": float | None,
+                  "neutral_known": bool,
+                  "is_nodding": bool,        # d_pitch <= -NOD_DROP_DEG
+                  "is_looking_away": bool,   # |d_yaw| > YAW_DEVIATION_DEG
+                  "is_tilting": bool,        # |d_roll| > ROLL_DEVIATION_DEG
                   "alert": bool,             # any of the three
                 }
 
@@ -170,20 +188,40 @@ class HeadPoseEstimator:
             return None
 
         pitch, yaw, roll = self._euler_from_rvec(rvec)
+        return self.flag({"pitch": float(pitch), "yaw": float(yaw), "roll": float(roll)},
+                         neutral)
 
-        is_nodding = pitch < self.PITCH_THRESHOLD
-        is_looking_away = abs(yaw) > self.YAW_THRESHOLD
-        is_tilting = abs(roll) > self.ROLL_THRESHOLD
+    def flag(
+        self, pose: Dict[str, object], neutral: Optional[Dict[str, float]]
+    ) -> Dict[str, object]:
+        """
+        Add the deviation and alert fields of :meth:`estimate` to ``pose``.
 
-        return {
-            "pitch": float(pitch),
-            "yaw": float(yaw),
-            "roll": float(roll),
-            "is_nodding": bool(is_nodding),
-            "is_looking_away": bool(is_looking_away),
-            "is_tilting": bool(is_tilting),
-            "alert": bool(is_nodding or is_looking_away or is_tilting),
-        }
+        Args:
+            pose: At least ``{"pitch", "yaw", "roll"}`` in degrees.
+            neutral: As for :meth:`estimate`.
+
+        Returns:
+            A copy of ``pose`` with the deviation and flag keys set.
+        """
+        out = dict(pose)
+        if neutral is None:
+            out.update(d_pitch=None, d_yaw=None, d_roll=None, neutral_known=False,
+                       is_nodding=False, is_looking_away=False, is_tilting=False, alert=False)
+            return out
+        d_pitch = _wrap180(float(pose["pitch"]) - float(neutral["pitch"]))
+        d_yaw = _wrap180(float(pose["yaw"]) - float(neutral["yaw"]))
+        d_roll = _wrap180(float(pose["roll"]) - float(neutral["roll"]))
+        is_nodding = d_pitch <= -self.NOD_DROP_DEG
+        is_looking_away = abs(d_yaw) > self.YAW_DEVIATION_DEG
+        is_tilting = abs(d_roll) > self.ROLL_DEVIATION_DEG
+        out.update(
+            d_pitch=d_pitch, d_yaw=d_yaw, d_roll=d_roll, neutral_known=True,
+            is_nodding=bool(is_nodding), is_looking_away=bool(is_looking_away),
+            is_tilting=bool(is_tilting),
+            alert=bool(is_nodding or is_looking_away or is_tilting),
+        )
+        return out
 
     @staticmethod
     def _euler_from_rvec(rvec: np.ndarray) -> Tuple[float, float, float]:
@@ -331,3 +369,8 @@ class HeadPoseEstimator:
         if pose["is_tilting"]:
             return "TILTING"
         return "ALERT"
+
+
+def _wrap180(angle: float) -> float:
+    """Map an angle difference into ``[-180, 180)`` degrees."""
+    return (angle + 180.0) % 360.0 - 180.0

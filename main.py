@@ -75,13 +75,16 @@ from modules.calibration import (CLOSED_CAPTURE_ATTEMPTS, EAR_THRESHOLD_RATIO,
 from modules.debug_stream import DebugStream, lan_address, stream_token
 from modules.ear import EARCalculator
 from modules.face_recognition_module import DriverRecognizer
+from modules.frs_debug_log import FrsDebugLog
 from modules.head_pose import HeadPoseEstimator
 from modules.ignition import ForcedIgnition, IgnitionSensor
 from modules.landmark import LandmarkExtractor
 from modules.mar import MARCalculator
 from modules.perclos import PERCLOSCalculator
 from modules.phase import LockReason, Phase
-from modules.pipeline import HEAD_POSE_RELEASE_HOLD_S, FrameMetrics, HeadPoseDebounce, MetricsPipeline
+from modules.pipeline import (HEAD_POSE_RELEASE_HOLD_S, FrameMetrics, HeadPoseDebounce,
+                              MetricsPipeline, SettlingWatch, landmark_problem)
+from modules.pose_neutral import load_neutral, median_pose, save_neutral
 from modules.session_display import (FACE_NONE, FACE_OK, FACE_SEARCHING,
                                      FACE_UNRECOGNISED, GREEN, RED, EnrollState, ScreenState,
                                      render as render_data_screen, render_enroll)
@@ -292,6 +295,8 @@ _annotate_frame: bool = False
 _stream_frame: bool = False
 # LoopProfiler under --profile-loop (monitoring only), else a no-op.
 _profiler: Any = None
+# Per-frame FRS debug CSV (config.DEBUG_FRS_CSV); a no-op when the flag is off.
+_frs_debug = FrsDebugLog()
 # Outcome of run_enrollment for --result-file (the launcher's result screen).
 _enroll_report: Dict[str, Any] = {}
 
@@ -944,6 +949,8 @@ def _fill_screen(
         s.alert_banner = f"MICROSLEEP {closed_s:.1f}s" if closed_s > 0 else "MICROSLEEP"
     elif m.overridden:
         s.alert_banner = m.override_reason.upper()
+    elif m.pose_override:
+        s.alert_banner = "HEAD POSE"
     if pipeline is not None:
         # Display units only: the blink count is over the pipeline's window
         # (30 s in pre-drive); the calibrated baseline is per 60 s.
@@ -983,11 +990,11 @@ def draw_pose_debug(
     alert_s = debounce.alert_elapsed(now)
     normal_s = debounce.normal_elapsed(now)
     if debounce.active:
-        state, color = "OVERRIDE: DANGER", (0, 0, 255)
+        state, color = "POSE ALERT: active", (0, 0, 255)
     elif alert_s > 0:
-        state, color = "OVERRIDE: arming", (0, 220, 255)
+        state, color = "POSE ALERT: arming", (0, 220, 255)
     else:
-        state, color = "OVERRIDE: off", (0, 200, 0)
+        state, color = "POSE ALERT: off", (0, 200, 0)
 
     # Progress bar for whichever timer is currently counting.
     if debounce.active:
@@ -996,7 +1003,7 @@ def draw_pose_debug(
         bar_color = (0, 200, 0)
     else:
         frac = min(alert_s / debounce.danger_hold, 1.0)
-        label = f"alerting {alert_s:.2f}s / DANGER at {debounce.danger_hold:.2f}s"
+        label = f"alerting {alert_s:.2f}s / alert at {debounce.danger_hold:.2f}s"
         bar_color = (0, 0, 255)
 
     cv2.putText(frame, f"POSE DEBUG  {state}", (10, y0 + 18), font, 0.5, color, 1, cv2.LINE_AA)
@@ -1051,6 +1058,7 @@ def cleanup() -> None:
     if _camera is not None:
         _camera.release()
         _camera = None
+    _frs_debug.close()
     if _alert_manager is not None:
         _alert_manager.cleanup()
     if _ignition is not None:
@@ -1414,6 +1422,9 @@ def run_enrollment(
     perclos_calc = PERCLOSCalculator()
     microsleep_detector = MicrosleepDetector()
     calib = CalibrationManager()
+    # Neutral head pose = median over the calibration window (2026-10-15).
+    head_pose = _head_pose or HeadPoseEstimator(config.CAMERA_WIDTH, config.CAMERA_HEIGHT)
+    calib_poses: List[Dict[str, Any]] = []
 
     # No personal threshold exists yet. Rather than seeding one from
     # DEFAULT_THRESHOLDS (0.225 is 75 % of a 0.30 EAR but 88 % of a 0.255 one -
@@ -1483,7 +1494,11 @@ def run_enrollment(
         if frame is None:
             continue
         landmarks, rect = extractor.extract(frame)
-        if landmarks is None:
+        # Invalid landmarks are skipped like a missing face: an EAR that is
+        # not a measurement must not enter the baselines.
+        if landmark_problem(landmarks, frame.shape) is not None:
+            blink_detector.abandon()
+            microsleep_detector.note_no_face(time.time())
             enroll_view(frame, step, "Face the camera", color=(0, 200, 255), detail=calib_detail,
                         face=False, progress=status["progress"],
                         progress_label=f"Calibration - {status['seconds_remaining']} s left")
@@ -1492,6 +1507,9 @@ def run_enrollment(
 
         ear = ear_calc.compute_average_ear(landmarks)
         mar = mar_calc.compute_mar(landmarks)
+        pose = head_pose.estimate(landmarks)
+        if pose is not None:
+            calib_poses.append(pose)
         # Keep tightening to the running median as more of the driver is seen.
         ear_history.append(ear)
         threshold = float(np.median(ear_history)) * EAR_THRESHOLD_RATIO
@@ -1525,6 +1543,10 @@ def run_enrollment(
     baselines = calib.compute_baselines()
     baselines["ear_closed_baseline"] = float(closed_capture.closed_ear)
     logger.info("Calibration baselines: %s", baselines)
+    # Kept out of ``baselines``, which is POSTed as-is: the backend has no
+    # field for it, so it is stored on this unit (modules/pose_neutral.py).
+    pose_neutral = median_pose(calib_poses)
+    logger.info("Calibration neutral head pose: %s", pose_neutral)
     # Pre-floor measurements and counts, so a baseline that landed on a
     # MIN_* floor (modules/calibration.py) can be traced to its cause.
     logger.info("Calibration raw: %s", calib.raw_summary())
@@ -1535,12 +1557,13 @@ def run_enrollment(
     # Per-frame series + summary on disk, written before the backend call so
     # a rejected enrollment still leaves the evidence behind.
     try:
-        calib.write_files(config.DEVICE_ID, driver_id, baselines, closed_capture={
+        calib_csv = calib.write_files(config.DEVICE_ID, driver_id, baselines, closed_capture={
             "attempts": closed_attempts,
             "accepted": closed_capture.summary(baselines["ear_baseline"]),
             "problem": problem,
-        })
+        }, pose_neutral=pose_neutral)
     except OSError as exc:
+        calib_csv = None
         logger.error("Could not write calibration data: %s", exc)
     if problem is not None:
         logger.error("ENROLLMENT REFUSED for driver %s: %s. Nothing was sent to the backend; "
@@ -1558,6 +1581,12 @@ def run_enrollment(
         logger.error("Backend rejected enrollment for driver %s", driver_id)
         return _enroll_result(5, "rejected", "The backend did not save the enrollment.",
                               reasons=api_client.last_enroll_error or "")
+    # Stored only once the calibration it belongs to has been saved.
+    if pose_neutral is not None:
+        save_neutral(driver_id, pose_neutral, calib_csv.stem if calib_csv is not None else "")
+    else:
+        logger.warning("No neutral head pose for driver %s (too few pose estimates) - pre-drive "
+                       "will use the settling median", driver_id)
     # A Laravel FormRequest drops fields it does not validate, silently: the
     # record would come back without ear_closed_baseline and be treated as a
     # pre-2026-09-30 record (no contrast check). Read it back to be sure.
@@ -1948,12 +1977,104 @@ def identify_driver_bounded(
                 f"{counts[int(match['driver_id'])]}/{matches_required}" if match
                 else "- no match yet")
         _screen.countdown = max(0.0, deadline - time.monotonic())
-        display_text(frame, f"IDENTIFYING {seen}/{matches_required}", WHITE)
+        display_text(frame, f"Recognizing... {seen}/{matches_required}", WHITE)
         display_text(frame, f"{max(0.0, deadline - time.monotonic()):.0f}s left", GREY, dy=40)
         draw_banner(frame, "PRE-DRIVE  |  starter LOCKED  |  identifying driver", (0, 220, 255))
         present(frame)
     logger.warning("Pre-drive: driver not recognised within %.0fs (matches seen: %s)",
                    timeout_s, counts or "none")
+    return None
+
+
+def unscored_reason(problem: str) -> str:
+    """Debug-CSV reason for a frame :func:`landmark_problem` rejected."""
+    return "NO_FACE" if problem == "no_face" else f"INVALID_LANDMARKS:{problem}"
+
+
+def run_settling(
+    extractor: LandmarkExtractor,
+    head_pose: HeadPoseEstimator,
+    ignition: Any,
+    rate: LoopRate,
+    ear_threshold: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Pre-drive SETTLING (2026-10-15): between recognition and the assessment,
+    the face and landmarks must be valid for ``config.PREDRIVE_SETTLE_SECONDS``
+    continuously. A lost face or invalid landmarks restart the period. The
+    head poses seen here give the fallback neutral pose for a driver with
+    none stored.
+
+    Nothing is scored, except that microsleep detection runs throughout
+    (:class:`~modules.pipeline.SettlingWatch`, against ``ear_threshold``): a
+    confirmed microsleep ends settling at once and fails the pre-drive.
+
+    Returns:
+        ``{"neutral": median_pose(...) or None, "frames": int,
+        "microsleep": event or None}`` once settled or on a microsleep, or
+        ``None`` if it did not settle within
+        ``config.PREDRIVE_SETTLE_TIMEOUT_S`` (an invalid assessment).
+
+    Raises:
+        PhaseChanged: if the ignition turns ON meanwhile.
+    """
+    settle_s = config.PREDRIVE_SETTLE_SECONDS
+    deadline = time.monotonic() + config.PREDRIVE_SETTLE_TIMEOUT_S
+    watch = SettlingWatch(settle_s, ear_threshold)
+    logger.info("Pre-drive: settling - face and landmarks must stay valid for %.1fs "
+                "(timeout %.0fs); microsleep detection active", settle_s,
+                config.PREDRIVE_SETTLE_TIMEOUT_S)
+    while time.monotonic() < deadline:
+        check_phase(ignition, Phase.PREDRIVE)
+        frame = next_frame()
+        rate.tick()
+        now, now_mono = time.time(), time.monotonic()
+        landmarks, _rect = extractor.extract(frame)
+        problem = landmark_problem(landmarks, frame.shape)
+        banner = "PRE-DRIVE  |  starter LOCKED  |  settling"
+        if problem is not None:
+            held = watch.held(now_mono)
+            watch.invalid(now)
+            if held > 0:
+                logger.info("Settling restarted after %.1fs: %s", held, problem)
+            _frs_debug.log_unscored(now, "predrive_settling", False, "ALERT",
+                                    unscored_reason(problem))
+            _screen.face, _screen.countdown = FACE_NONE, settle_s
+            display_text(frame, "Hold still...", (0, 220, 255))
+            display_text(frame, "Face the camera" if problem == "no_face"
+                         else "Keep your whole face in view", GREY, dy=40)
+            draw_banner(frame, banner, (0, 220, 255))
+            present(frame)
+            continue
+        pose = head_pose.estimate(landmarks)
+        event = watch.valid(landmarks, now, now_mono, pose)
+        if event is not None:
+            logger.warning("MICROSLEEP during settling: eyes closed %.2fs (min EAR %.3f < "
+                           "threshold %.3f) - pre-drive fails as microsleep_detected",
+                           event["duration_ms"] / 1000.0, event["min_ear"], ear_threshold)
+            _frs_debug.log_unscored(now, "predrive_settling", True, "DANGER",
+                                    "MICROSLEEP", pose)
+            return {"neutral": None, "frames": len(watch.poses), "microsleep": event}
+        _frs_debug.log_unscored(now, "predrive_settling", True, "ALERT",
+                                "SETTLING_CLOSED" if watch.closure_in_progress else "SETTLING",
+                                pose)
+        held = watch.held(now_mono)
+        _screen.face, _screen.countdown = FACE_OK, max(0.0, settle_s - held)
+        display_text(frame, "Hold still...", (0, 220, 255))
+        display_text(frame, f"{max(0.0, settle_s - held):.1f}s", GREY, dy=40)
+        draw_banner(frame, banner, (0, 220, 255))
+        present(frame)
+        if watch.settled(now_mono):
+            neutral = median_pose(watch.poses)
+            logger.info("Pre-drive: settled after %.1fs valid (%d restarts, %d poses; settle "
+                        "neutral %s)", held, watch.restarts, len(watch.poses),
+                        "none" if neutral is None else
+                        "pitch %.1f yaw %.1f roll %.1f" % (neutral["pitch"], neutral["yaw"],
+                                                           neutral["roll"]))
+            return {"neutral": neutral, "frames": len(watch.poses), "microsleep": None}
+    logger.warning("Pre-drive: did not settle within %.0fs (%d restarts) - face/landmarks "
+                   "never valid for %.1fs", config.PREDRIVE_SETTLE_TIMEOUT_S, watch.restarts,
+                   settle_s)
     return None
 
 
@@ -2005,11 +2126,16 @@ def await_override(
     assessment_id: Optional[int],
     provenance: Optional[Dict[str, Any]] = None,
     continue_to_monitoring: bool = True,
+    display_reason: Optional[str] = None,
 ) -> bool:
     """
     Starter stays inhibited: raise one override request and poll the
     operator's decision until approved (-> release starter), the user
     presses ``r`` (-> re-assess) or the phase changes.
+
+    ``display_reason`` replaces the lock reason's text on the unit's own
+    screen only (an invalid assessment is raised to the backend as
+    ``driver_not_recognized`` but shown as what it is).
 
     Every :class:`LockReason` resolves through this one path. ``provenance``
     (``Calibration.provenance()``) goes on the request so the operator can
@@ -2024,7 +2150,7 @@ def await_override(
         approval followed by ``r`` on the "start vehicle" screen). A phase
         change raises :class:`PhaseChanged` as before.
     """
-    reason_text = LOCK_REASON_TEXT[reason]
+    reason_text = display_reason or LOCK_REASON_TEXT[reason]
     logger.warning("Pre-drive: starter stays LOCKED - %s (driver=%s)", reason.value, driver_id)
     alert_manager.lock_relay()  # already locked; explicit for clarity + log
 
@@ -2100,12 +2226,23 @@ def run_predrive_assessment(
     2. Recognise the driver (bounded)          -> else DRIVER_NOT_RECOGNIZED.
     3. This driver's calibration from this unit  -> none at all: NO_BASELINE;
        only from another unit: FOREIGN_DEVICE_BASELINE (never assessed on it).
-    4. 30 s assessment through the shared pipeline; every frame recorded.
-    5. Persist CSV/JSON + POST /assessments.
-    6. PASS -> release starter, then hand off to monitoring.
-       FAIL -> FATIGUE_DETECTED.
-    7. Any lock reason -> :func:`await_override`; the starter stays
+    4. Settle (:func:`run_settling`): face + landmarks valid for
+       ``config.PREDRIVE_SETTLE_SECONDS`` continuously; nothing scored, but
+       a microsleep confirmed here fails at once as MICROSLEEP_DETECTED.
+    5. Fresh pipeline (every rolling buffer empty), neutral head pose
+       (stored, else the settling median), then the 30 s assessment; every
+       frame recorded, invalid frames counted and never scored.
+    6. Persist CSV/JSON + POST /assessments.
+    7. PASS -> release starter, then hand off to monitoring.
+       Lock-reason priority: MICROSLEEP_DETECTED (settling or assessment)
+       > invalid assessment (fewer than ``config.PREDRIVE_MIN_VALID_FRACTION``
+       valid frames, or no settling: FAULT, raised as DRIVER_NOT_RECOGNIZED)
+       > FATIGUE_DETECTED.
+    8. Any lock reason -> :func:`await_override`; the starter stays
        inhibited until an operator approves (then as for a pass).
+
+    The display shows "Recognizing...", "Hold still..." and "Assessing..."
+    for the three stages (Hershey fonts have no ellipsis character).
 
     With ``continue_to_monitoring`` off (``--force-phase predrive``, the
     phase tested alone) a release instead waits on the "start vehicle"
@@ -2133,6 +2270,10 @@ def run_predrive_assessment(
     calibration_record: Optional[Dict[str, Any]] = None
     lock_reason: Optional[LockReason] = None
     assessment_id: Optional[int] = None
+    # Set when the run is an invalid assessment (FAULT): the real cause, for
+    # the local log, the debug CSV and the unit's screen.
+    invalid_cause: Optional[str] = None
+    settle: Optional[Dict[str, Any]] = None
 
     try:
         # 2. Recognise
@@ -2168,20 +2309,54 @@ def run_predrive_assessment(
                 thresholds = calibration.thresholds
 
         if lock_reason is None:
-            # 4. Assessment
+            # 4. Settle: the face and landmarks must be valid for
+            # PREDRIVE_SETTLE_SECONDS continuously; nothing is scored.
+            settle = run_settling(extractor, head_pose, ignition, rate,
+                                  thresholds.get("ear_threshold"))
+            if settle is not None and settle["microsleep"] is not None:
+                # A microsleep outranks everything else: fail now, no 30 s run.
+                lock_reason = LockReason.MICROSLEEP_DETECTED
+                _frs_debug.log_event(time.time(), "predrive_verdict", "DANGER",
+                                     "MICROSLEEP_DETECTED during settling (%.2fs closure)"
+                                     % (settle["microsleep"]["duration_ms"] / 1000.0))
+            elif settle is None:
+                invalid_cause = (
+                    "INVALID_ASSESSMENT: face/landmarks never valid for %.1fs within %.0fs "
+                    "(valid 0.0%% of the assessment - it never started)"
+                    % (config.PREDRIVE_SETTLE_SECONDS, config.PREDRIVE_SETTLE_TIMEOUT_S))
+                logger.warning("Pre-drive: %s - FAULT, starter stays inhibited (raised as "
+                               "driver_not_recognized)", invalid_cause)
+                lock_reason = LockReason.DRIVER_NOT_RECOGNIZED
+
+        if lock_reason is None:
+            # 5. Assessment. A fresh pipeline, so every rolling buffer
+            # (PERCLOS, blink duration / frequency, microsleep, EAR median,
+            # escalation timers) starts empty here: nothing from recognition
+            # or settling is in it.
             pipeline = MetricsPipeline(
                 head_pose,
                 blink_window_s=config.PREDRIVE_ASSESSMENT_SECONDS,
                 pose_release_hold=pose_release_hold,
                 diag_ear=diag_ear,
             )
+            stored_neutral = load_neutral(driver_id)
+            if stored_neutral is not None:
+                pipeline.set_pose_neutral(stored_neutral, "stored")
+            else:
+                # None too if settling saw too few poses: the pipeline then
+                # seeds it from the assessment's first seconds.
+                pipeline.set_pose_neutral(settle["neutral"], "settling")
             assessment = PredriveAssessment()
             assessment.calibration = calibration.provenance()
             assessment.start(time.time())
             logger.info("Pre-drive: %d s assessment started for driver %s (%s), "
-                        "calibration %s (%s)", config.PREDRIVE_ASSESSMENT_SECONDS,
-                        driver_id, driver["name"], calibration.calibration_id,
-                        calibration.source)
+                        "calibration %s (%s); scoring baselines %s",
+                        config.PREDRIVE_ASSESSMENT_SECONDS, driver_id, driver["name"],
+                        calibration.calibration_id, calibration.source,
+                        {k: round(float(v), 4) for k, v in
+                         pipeline.scoring_thresholds(thresholds).items()
+                         if k in ("perclos_baseline", "blink_duration_baseline",
+                                  "blink_frequency_baseline")})
 
             while not assessment.is_complete(time.time()):
                 check_phase(ignition, Phase.PREDRIVE)
@@ -2193,15 +2368,21 @@ def run_predrive_assessment(
                           f"starter {alert_manager.get_relay_state()}")
 
                 landmarks, _rect = extractor.extract(frame)
-                if landmarks is None:
-                    # Policy disabled here: verdict.level is ALERT. A face
-                    # missing for too long voids the assessment instead.
+                problem = landmark_problem(landmarks, frame.shape)
+                if problem is not None:
+                    # No face, or landmarks that cannot be measured: counted,
+                    # never scored. Policy disabled here: verdict.level is
+                    # ALERT. Too many of these void the assessment instead.
                     verdict = pipeline.note_no_face(now, now_mono)
-                    assessment.add_no_face(now)
+                    assessment.add_invalid(problem, now)
+                    _frs_debug.log_unscored(now, "predrive_assessing", False, verdict.level,
+                                            unscored_reason(problem))
                     alert_manager.set_alert_level(verdict.level)
                     _screen.face, _screen.level, _screen.countdown = (FACE_NONE, verdict.level,
                                                                       remaining)
-                    display_text(frame, "NO FACE")
+                    display_text(frame, "Assessing...", (0, 220, 255))
+                    display_text(frame, "NO FACE" if problem == "no_face"
+                                 else "FACE NOT FULLY VISIBLE", dy=40)
                     draw_banner(frame, banner, (0, 220, 255))
                     if debug_pose:
                         draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
@@ -2210,24 +2391,27 @@ def run_predrive_assessment(
 
                 m = pipeline.process(landmarks, thresholds, now, now_mono)
                 assessment.add(m, now)
+                _frs_debug.log_frame(m, "predrive_assessing", pipeline.pose_neutral_source)
                 # LEDs / buzzer give the driver feedback; the relay is decided
                 # once, below, on the aggregate - never per frame.
                 alert_manager.set_alert_level(m.level)
                 _screen.countdown = remaining
+                display_text(frame, "Assessing...", (0, 220, 255))
                 draw_overlay(frame, driver, m, fps, pipeline, thresholds, landmarks)
                 draw_banner(frame, banner, (0, 220, 255))
                 if debug_pose:
                     draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
                 present(frame)
 
-            # 5. Persist
+            # 6. Persist
             result = assessment.result()
-            logger.info("Pre-drive result: passed=%s void=%s worst_%.0fs_mean=%.3f mean=%.3f "
-                        "median=%.3f max=%.3f n=%d no_face=%d pose_override_frames=%d "
-                        "yawns=%d microsleeps=%d",
-                        result["passed"], result["void"], result["worst_window_s"],
-                        result["worst_window_mean"], result["mean_frs"], result["median_frs"],
-                        result["max_frs"], result["n_samples"], result["n_no_face"],
+            logger.info("Pre-drive result: passed=%s void=%s valid=%.1f%% worst_%.0fs_mean=%.3f "
+                        "mean=%.3f median=%.3f max=%.3f n=%d invalid=%d %s "
+                        "pose_override_frames=%d yawns=%d microsleeps=%d",
+                        result["passed"], result["void"], result["valid_fraction"] * 100,
+                        result["worst_window_s"], result["worst_window_mean"],
+                        result["mean_frs"], result["median_frs"], result["max_frs"],
+                        result["n_samples"], result["n_no_face"], result["invalid_reasons"],
                         result["pose_override_frames"], result["yawns"],
                         result["microsleeps"])
             try:
@@ -2235,15 +2419,17 @@ def run_predrive_assessment(
             except OSError as exc:
                 logger.error("Could not write assessment files: %s", exc)
 
-            if result["void"]:
-                # Not enough face to judge - treat like an unrecognised driver.
-                logger.warning("Pre-drive: assessment VOID (face missing %.0f%% of frames)",
-                               result["no_face_fraction"] * 100)
-                lock_reason = LockReason.DRIVER_NOT_RECOGNIZED
-            elif result["failed_on_microsleep"]:
+            # Priority (2026-10-15): microsleep_detected > invalid assessment
+            # > FRS fail. A confirmed microsleep was measured on valid frames
+            # throughout, so it stands even if the run as a whole was invalid.
+            if result["failed_on_microsleep"]:
                 # Checked before the aggregate so the lock reason names the
                 # real finding: a microsleep fails outright, and the worst
                 # window can easily still be under the threshold when it does.
+                if result["void"]:
+                    logger.warning("Pre-drive: assessment also INVALID (valid frames %.1f%%) - "
+                                   "the microsleep takes priority",
+                                   result["valid_fraction"] * 100)
                 logger.warning(
                     "Pre-drive: FAILED ON MICROSLEEP - %d confirmed during the %.0fs "
                     "assessment (worst %.0fs mean %.3f vs threshold %.2f; the aggregate "
@@ -2255,6 +2441,18 @@ def run_predrive_assessment(
                     else "PASSED",
                 )
                 lock_reason = LockReason.MICROSLEEP_DETECTED
+            elif result["void"]:
+                # Not enough valid frames to judge: an invalid assessment
+                # (FAULT), not fatigue. Raised as driver_not_recognized - the
+                # backend has no separate reason - with the real cause here.
+                invalid_cause = ("INVALID_ASSESSMENT: valid frames %.1f%% < %.0f%% (%s)"
+                                 % (result["valid_fraction"] * 100,
+                                    result["min_valid_fraction"] * 100,
+                                    ", ".join(f"{k} {v}" for k, v in
+                                              result["invalid_reasons"].items()) or "no frames"))
+                logger.warning("Pre-drive: %s - FAULT, starter stays inhibited (raised as "
+                               "driver_not_recognized)", invalid_cause)
+                lock_reason = LockReason.DRIVER_NOT_RECOGNIZED
             elif not result["passed"]:
                 logger.warning(
                     "Pre-drive: FAILED on aggregate - worst %.0fs mean %.3f >= %.2f",
@@ -2266,11 +2464,15 @@ def run_predrive_assessment(
             assessment_id = api_client.post_assessment(
                 config.DEVICE_ID, driver_id, result, lock_reason)
 
-            # 6. Verdict
+            # 7. Verdict
             if lock_reason is None:
                 logger.info("Pre-drive PASSED (worst %.0fs mean %.3f < %.2f) - releasing starter",
                             result["worst_window_s"], result["worst_window_mean"],
                             result["pass_threshold"])
+                _frs_debug.log_event(time.time(), "predrive_verdict", "ALERT",
+                                     "PASS worst_%.0fs_mean=%.3f valid=%.1f%%"
+                                     % (result["worst_window_s"], result["worst_window_mean"],
+                                        result["valid_fraction"] * 100))
                 alert_manager.unlock_relay()
                 alert_manager.set_alert_level("ALERT")
                 if continue_to_monitoring:
@@ -2278,12 +2480,22 @@ def run_predrive_assessment(
                     return True
                 wait_for_ignition(ignition, rate, "ASSESSMENT PASSED - start vehicle", (0, 200, 0))
                 return False
+            if invalid_cause is None:
+                _frs_debug.log_event(time.time(), "predrive_verdict", "DANGER",
+                                     "%s worst_%.0fs_mean=%.3f microsleeps=%d"
+                                     % (lock_reason.value.upper(), result["worst_window_s"],
+                                        result["worst_window_mean"], result["microsleeps"]))
 
-        # 7. Lock path (every lock reason)
-        alert_manager.set_alert_level("ALERT")
+        # 8. Lock path (every lock reason). An invalid assessment shows FAULT
+        # and its real cause on the unit; the backend gets the lock reason.
+        if invalid_cause is not None:
+            _frs_debug.log_event(time.time(), "predrive_verdict", "FAULT", invalid_cause)
+        alert_manager.set_alert_level("FAULT" if invalid_cause is not None else "ALERT")
         return await_override(api_client, alert_manager, ignition, rate, driver_id,
                               lock_reason, assessment_id, calibration_record,
-                              continue_to_monitoring=continue_to_monitoring)
+                              continue_to_monitoring=continue_to_monitoring,
+                              display_reason=("INVALID ASSESSMENT" if invalid_cause is not None
+                                              else None))
 
     except PhaseChanged:
         logger.info("Pre-drive: ignition turned ON - leaving pre-drive (starter %s)",
@@ -2423,9 +2635,13 @@ def run_monitoring(
         # DANGER: the pipeline's NoFacePolicy holds, latches or faults.
         with prof.section("landmarks"):
             landmarks, _rect = extractor.extract(frame)
-        if landmarks is None:
+            # Invalid landmarks are handled exactly like no face (2026-10-15).
+            problem = landmark_problem(landmarks, frame.shape)
+        if problem is not None:
             with prof.section("pipeline"):
                 verdict = pipeline.note_no_face(now, now_mono)
+            _frs_debug.log_unscored(now, "monitoring", False, verdict.level,
+                                    f"{unscored_reason(problem)}:{verdict.band}")
             if verdict.level != last_level:
                 logger.info("Level %s -> %s (no face %.1fs, %s)", last_level or "(none)",
                             verdict.level, verdict.gap_s, verdict.band)
@@ -2487,6 +2703,10 @@ def run_monitoring(
             # Spaced from the END of the ~1 s attempt, so the loop always
             # gets UNRECOGNISED_RETRY_S of real frames between stalls.
             next_identify = time.monotonic() + UNRECOGNISED_RETRY_S
+            # Re-stamp the frame after the ~1 s call, so recognition time is
+            # never counted as eye-closure time: the pipeline sees the gap and
+            # abandons any closure in progress (config.MAX_FRAME_GAP_S).
+            now, now_mono = time.time(), time.monotonic()
             if match is None:
                 if not defaults_logged:
                     logger.warning("Monitoring: driver not recognised - self-seeding the EAR "
@@ -2526,6 +2746,11 @@ def run_monitoring(
                 # (on a self-seeded baseline) don't leak into this driver's.
                 # That includes a self-seed that gave up: it starts over.
                 pipeline.reset()
+                # This driver's neutral head pose from enrollment on this
+                # unit; without one it is seeded from the next few seconds.
+                stored_neutral = load_neutral(current_driver_id)
+                if stored_neutral is not None:
+                    pipeline.set_pose_neutral(stored_neutral, "stored")
                 if seed_fault is not None:
                     logger.info("Driver identified - no_ear_baseline fault resolved (%s)",
                                 "calibration loaded" if calibration is not None
@@ -2539,6 +2764,7 @@ def run_monitoring(
         with prof.section("pipeline"):
             m = pipeline.process(landmarks, thresholds, now, now_mono,
                                  self_seed=calibration is None or calibration.self_seed_ear)
+        _frs_debug.log_frame(m, "monitoring", pipeline.pose_neutral_source)
         last_m = m
         if m.seed_failed and seed_fault is None:
             seed_fault = OpenFault(
@@ -2573,8 +2799,9 @@ def run_monitoring(
                 pipeline.frs_calc.format_breakdown(m.frs_result) if m.scored
                 else "not scored (EAR self-seed gave up - no baseline)" if m.seed_failed
                 else "not scored (self-seeding EAR baseline)",
-                f"  [{m.override_reason} override forcing DANGER]" if m.overridden else "",
-                f"  [band {m.band} held; raw {m.frs_result['level']}]"
+                f"  [{m.override_reason} override forcing DANGER]" if m.overridden else
+                f"  [{m.level_reason}]",
+                f"  [escalation {m.band}; raw band {m.frs_result['level']}]"
                 if m.scored and not m.overridden and m.band != m.frs_result["level"] else "",
             )
             logger.debug(
@@ -2705,7 +2932,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--pose-release-hold", type=float, default=HEAD_POSE_RELEASE_HOLD_S, metavar="SECONDS",
-        help="seconds the head pose must be normal before a head-pose DANGER "
+        help="seconds the head pose must be normal before a head-pose alert "
              f"is released (default {HEAD_POSE_RELEASE_HOLD_S})",
     )
     args = parser.parse_args(argv)

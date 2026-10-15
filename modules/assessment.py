@@ -37,11 +37,21 @@ lock.
 Per-frame scoring
 -----------------
 Each frame is recorded twice: ``frs_raw`` (the pipeline's eye + mouth FRS)
-and ``frs_scored`` = ``max(frs_raw, DANGER_THRESHOLD)`` while a DANGER
-override (head pose or microsleep) is active, else ``frs_raw``. A sustained
-nod during the assessment therefore fails it, and the raw series is still
-available for analysis. Frames with no face are counted but not scored; if
-too many are missing the assessment is void.
+and ``frs_scored`` = ``max(frs_raw, DANGER_THRESHOLD)`` while the level is
+DANGER for a reason other than the FRS band (a microsleep, or a head-pose
+alert that has escalated through WARNING), else ``frs_raw``. A sustained nod
+during the assessment therefore fails it, and the raw series is still
+available for analysis.
+
+Valid frames (2026-10-15)
+-------------------------
+Frames with no face or with invalid landmarks (``pipeline.landmark_problem``)
+are counted, by reason, but never scored - never treated as closed eyes. If
+fewer than ``config.PREDRIVE_MIN_VALID_FRACTION`` of the assessment's frames
+were valid, the assessment is void: an *invalid assessment* (FAULT), not a
+fatigue verdict. ``result()`` reports it as ``invalid_cause`` =
+``"INVALID_ASSESSMENT"`` with ``valid_fraction``; the backend still receives
+it as ``void`` (no API change).
 
 Every sample is kept and written to ``logs/assessments/<device>_<driver>_
 <timestamp>.csv`` (plus a ``.json`` summary) and returned in
@@ -92,8 +102,8 @@ class PredriveAssessment:
         duration_s: Length of the scored window.
         worst_window_s: Length of the rolling window for the verdict.
         pass_threshold: ``worst_window_mean`` must be strictly below this.
-        max_no_face_fraction: Void the assessment if more than this fraction
-            of frames had no face.
+        min_valid_fraction: Void the assessment if fewer than this fraction
+            of frames had a face with valid landmarks.
     """
 
     def __init__(
@@ -101,17 +111,19 @@ class PredriveAssessment:
         duration_s: float = config.PREDRIVE_ASSESSMENT_SECONDS,
         worst_window_s: float = config.PREDRIVE_WORST_WINDOW_SECONDS,
         pass_threshold: float = WARNING_THRESHOLD,
-        max_no_face_fraction: float = config.PREDRIVE_MAX_NO_FACE_FRACTION,
+        min_valid_fraction: float = config.PREDRIVE_MIN_VALID_FRACTION,
     ) -> None:
         self.duration_s = float(duration_s)
         self.worst_window_s = float(worst_window_s)
         self.pass_threshold = float(pass_threshold)
-        self.max_no_face_fraction = float(max_no_face_fraction)
+        self.min_valid_fraction = float(min_valid_fraction)
 
         self.start_time: float = 0.0
         self.end_time: float = 0.0
         self.samples: List[Dict[str, Any]] = []
+        # Frames not scored (no face, invalid landmarks), in total and by reason.
         self.no_face_frames: int = 0
+        self.invalid_reasons: Dict[str, int] = {}
         self._started = False
         # Which calibration the run was scored against (api.Calibration
         # .provenance()); set by the caller, echoed in result() so it lands in
@@ -126,6 +138,7 @@ class PredriveAssessment:
         self.end_time = 0.0
         self.samples = []
         self.no_face_frames = 0
+        self.invalid_reasons = {}
         self._started = True
 
     def progress(self, now: Optional[float] = None) -> float:
@@ -161,7 +174,11 @@ class PredriveAssessment:
             raise RuntimeError("PredriveAssessment.add() called before start()")
         t = m.t if now is None else now
         frs_raw = m.frs
-        frs_scored = max(frs_raw, DANGER_THRESHOLD) if m.overridden else frs_raw
+        # DANGER held by the FRS band alone scores the FRS itself; DANGER from
+        # a microsleep or an escalated head-pose alert scores at least the
+        # DANGER threshold, as the overrides always did.
+        forced = m.level == "DANGER" and m.level_reason != "BAND"
+        frs_scored = max(frs_raw, DANGER_THRESHOLD) if forced else frs_raw
         comps = m.frs_result.get("components", {})
         pose = m.pose or {}
         self.samples.append({
@@ -189,9 +206,18 @@ class PredriveAssessment:
             "microsleep_confirmed": m.microsleep_event is not None,
         })
 
+    def add_invalid(self, reason: str = "no_face", now: Optional[float] = None) -> None:
+        """
+        Record a frame that could not be measured - no face, or invalid
+        landmarks (``reason`` from ``pipeline.landmark_problem``). Counted,
+        never scored.
+        """
+        self.no_face_frames += 1
+        self.invalid_reasons[reason] = self.invalid_reasons.get(reason, 0) + 1
+
     def add_no_face(self, now: Optional[float] = None) -> None:
         """Record a frame in which no face was found (counted, not scored)."""
-        self.no_face_frames += 1
+        self.add_invalid("no_face", now)
 
     # ------------------------------------------------------------------
 
@@ -236,13 +262,17 @@ class PredriveAssessment:
         return sum(1 for s in self.samples if s["microsleep_confirmed"])
 
     def no_face_fraction(self) -> float:
-        """Fraction of all frames (scored + unscored) that had no face."""
+        """Fraction of all frames (scored + unscored) that could not be measured."""
         total = len(self.samples) + self.no_face_frames
         return self.no_face_frames / total if total else 1.0
 
+    def valid_fraction(self) -> float:
+        """Fraction of all frames that had a face with valid landmarks."""
+        return 1.0 - self.no_face_fraction()
+
     def is_void(self) -> bool:
-        """``True`` if too few scored frames to trust the verdict."""
-        return not self.samples or self.no_face_fraction() > self.max_no_face_fraction
+        """``True`` if too few valid frames to trust the verdict (invalid assessment)."""
+        return not self.samples or self.valid_fraction() < self.min_valid_fraction
 
     def result(self) -> Dict[str, Any]:
         """
@@ -264,6 +294,9 @@ class PredriveAssessment:
             "n_samples": len(self.samples),
             "n_no_face": self.no_face_frames,
             "no_face_fraction": round(self.no_face_fraction(), 4),
+            "valid_fraction": round(self.valid_fraction(), 4),
+            "min_valid_fraction": self.min_valid_fraction,
+            "invalid_reasons": dict(self.invalid_reasons),
             "mean_frs": float(f.mean()) if len(f) else 0.0,
             "median_frs": float(np.median(f)) if len(f) else 0.0,
             "max_frs": float(f.max()) if len(f) else 0.0,
@@ -280,6 +313,8 @@ class PredriveAssessment:
             # distinguishable lock reason rather than a generic fatigue fail.
             "failed_on_microsleep": microsleeps > 0,
             "void": void,
+            # Local record of why a void run was void (the backend gets "void").
+            "invalid_cause": "INVALID_ASSESSMENT" if void else None,
             "passed": (not void) and worst < self.pass_threshold and microsleeps == 0,
             "calibration": dict(self.calibration),
             "samples": list(self.samples),

@@ -98,6 +98,18 @@ UTC.
   calibration scores against a self-seeded EAR baseline instead of the
   population 0.30 / 0.225. Assessment JSONs from this version carry a
   ``calibration`` block naming the calibration used.
+* **2026-10-15**: scoring floors on the PERCLOS / blink-duration /
+  blink-frequency baselines (2.0 %, 150 ms, 6 /min; ``config``), applied at
+  scoring time in ``modules.pipeline``; the blink-duration term is zero until
+  3 blinks are in its window, and the blink-frequency term zero for the first
+  10 s and normalised against the baseline scaled to the time observed
+  (it was the full window). Closures are no longer measured across missing
+  frames or loop stalls, and a microsleep needs a full observed closure.
+  Separately - not a score change - the level became ``LevelEscalator``
+  (engage delays; no ALERT -> DANGER jump), head pose became relative to the
+  driver's neutral pose, and pre-drive gained a 3 s settling stage before the
+  30 s window. Recorded runs replayed through this version are not
+  comparable with earlier scores.
 """
 
 from typing import Dict, List, Optional, Tuple
