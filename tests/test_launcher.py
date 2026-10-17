@@ -204,9 +204,10 @@ def test_menu_fits(make_app, size, stream_on):
     app.last_result = f"Enroll {LONG_NAME}: SAVED - backend DROPPED the closed-eye baseline"
     app.show_menu()
     assert cut_off(app) == []
-    # The longest labels, measured directly: every line inside the button's
+    # Every menu label, measured directly: every line inside the button's
     # padding and within its height - nothing wrapped or clipped.
-    for label in (launcher.LABEL_PREDRIVE, launcher.LABEL_IGNITION):
+    for label in (launcher.LABEL_ENROLL, launcher.LABEL_PREDRIVE, launcher.LABEL_MONITORING,
+                  app._stream_label(), launcher.LABEL_QUIT):
         btn = button(app, label)
         inner_w = btn.winfo_width() - 2 * int(btn.cget("padx"))
         inner_h = btn.winfo_height() - 2 * int(btn.cget("pady"))
@@ -217,6 +218,41 @@ def test_menu_fits(make_app, size, stream_on):
     # Fitting must not overshoot: the panel keeps finger-sized text.
     if size == (800, 480):
         assert -int(app.font_button.cget("size")) >= 20
+
+
+@pytest.mark.parametrize("size", SIZES)
+@pytest.mark.parametrize("stream_on", [False, True])
+def test_menu_grid_has_five_buttons_and_no_gap(make_app, size, stream_on):
+    """Two columns, in order; Quit spans the last row so no cell is left empty."""
+    app = make_app(size)
+    app.stream_on = stream_on
+    app.show_menu()
+    app.root.update()
+    menu = [w for w in app.container.winfo_children() if isinstance(w, tk.Button)]
+    cells = {}
+    for btn in menu:
+        info = btn.grid_info()
+        cells[btn.cget("text")] = (int(info["row"]), int(info["column"]),
+                                   int(info["columnspan"]))
+    assert cells == {
+        launcher.LABEL_ENROLL: (1, 0, 1), launcher.LABEL_PREDRIVE: (1, 1, 1),
+        launcher.LABEL_MONITORING: (2, 0, 1), app._stream_label(): (2, 1, 1),
+        launcher.LABEL_QUIT: (3, 0, 2),
+    }
+    assert button(app, app._stream_label()).cget("bg") == (
+        launcher.BTN_ASSIGNED if stream_on else launcher.BTN)
+    assert button(app, launcher.LABEL_QUIT).cget("bg") == launcher.BTN_QUIT
+    assert not any("ignition" in b.cget("text").lower() for b in menu)
+    assert "Follow ignition" not in launcher.SESSIONS
+    # Same row height for every row (Tk gives the rounding pixel to the last
+    # row), and the Quit row is as wide as the two columns above it - no gap
+    # beside it.
+    left, right = button(app, launcher.LABEL_ENROLL), button(app, launcher.LABEL_PREDRIVE)
+    quit_btn = button(app, launcher.LABEL_QUIT)
+    assert left.winfo_height() == right.winfo_height()
+    assert abs(quit_btn.winfo_height() - left.winfo_height()) <= 1
+    assert quit_btn.winfo_x() == left.winfo_x()
+    assert quit_btn.winfo_x() + quit_btn.winfo_width() == right.winfo_x() + right.winfo_width()
 
 
 @pytest.mark.parametrize("size", SIZES)

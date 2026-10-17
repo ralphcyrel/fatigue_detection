@@ -10,7 +10,6 @@ source of truth for how a session runs::
     Pre-drive -> monitoring   -> main.py --sequence   (pass / approved override
                                  continues into monitoring, no ignition input)
     Monitoring only (test)    -> main.py --force-phase monitoring
-    Follow ignition           -> main.py            (real ignition input)
 
 While a session runs, a slim always-on-top strip along the bottom of the
 screen carries a STOP button (sends SIGINT, which ``main.py`` already
@@ -123,10 +122,9 @@ MIN_FONT_PX = 8
 LABEL_ENROLL = "Enroll driver"
 LABEL_PREDRIVE = "Pre-drive assessment\n→ monitoring"
 LABEL_MONITORING = "Monitoring only\n(test)"
-LABEL_IGNITION = "Follow ignition\n(real input)"
 LABEL_STREAM = "Video stream: {}\n(laptop / phone view)"
 LABEL_QUIT = "Quit"
-MENU_LABELS = (LABEL_ENROLL, LABEL_PREDRIVE, LABEL_MONITORING, LABEL_IGNITION,
+MENU_LABELS = (LABEL_ENROLL, LABEL_PREDRIVE, LABEL_MONITORING,
                LABEL_STREAM.format("OFF"), LABEL_STREAM.format("ON"), LABEL_QUIT)
 
 # Backend pill text by reachability (None = not known yet).
@@ -182,7 +180,6 @@ RESULT_BAD = "#c0392b"
 SESSIONS: Dict[str, List[str]] = {
     "Pre-drive assessment": ["--sequence"],
     "Monitoring only (test)": ["--force-phase", "monitoring"],
-    "Follow ignition": [],
 }
 
 
@@ -910,8 +907,9 @@ class Launcher:
         f = self._clear()
         f.columnconfigure((0, 1), weight=1, uniform="col")
         f.rowconfigure(0, weight=0)
+        # uniform: the one-line Quit row stays as tall as the rows above it.
         for r in (1, 2, 3):
-            f.rowconfigure(r, weight=1, minsize=self.px(ROW_MIN_PX))
+            f.rowconfigure(r, weight=1, minsize=self.px(ROW_MIN_PX), uniform="row")
         f.rowconfigure(4, weight=0)
         pad = self.px(4)
 
@@ -926,15 +924,13 @@ class Launcher:
         self._button(f, LABEL_MONITORING,
                      lambda: self.start_session("Monitoring only (test)")).grid(
             row=2, column=0, sticky="nsew", padx=pad, pady=pad)
-        self._button(f, LABEL_IGNITION,
-                     lambda: self.start_session("Follow ignition")).grid(
-            row=2, column=1, sticky="nsew", padx=pad, pady=pad)
-
         self._button(f, self._stream_label(), self._toggle_stream,
                      bg=BTN_ASSIGNED if self.stream_on else BTN).grid(
-            row=3, column=0, sticky="nsew", padx=pad, pady=pad)
+            row=2, column=1, sticky="nsew", padx=pad, pady=pad)
+
+        # Five buttons in two columns: Quit takes the whole last row.
         self._button(f, LABEL_QUIT, self.quit, bg=BTN_QUIT).grid(
-            row=3, column=1, sticky="nsew", padx=pad, pady=pad)
+            row=3, column=0, columnspan=2, sticky="nsew", padx=pad, pady=pad)
 
         note, color = self.last_result, "#dddddd"
         if self.api_problem and not note:
