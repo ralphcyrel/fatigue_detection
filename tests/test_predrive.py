@@ -814,3 +814,79 @@ def test_monitoring_after_predrive_reuses_its_calibration(m, rig, hp, ign, known
     assert rec["driver_id"] == 6 and rec["identify_attempts"] == 1, "confirmed once"
     assert microsleeps and microsleeps[0].scored, "on the cached calibration, not a self-seed"
     assert rec["max_frame_gap_s"] < m.config.MAX_FRAME_GAP_S
+
+
+def test_driver_swap_in_monitoring_is_a_fault_not_scored_on_the_old_calibration(
+        m, rig, hp, ign, known_driver, tmp_path, monkeypatch, caplog):
+    """
+    Pre-drive passes driver 6; ~5 s into monitoring recognition matches
+    driver 7. From that frame: self-seeded baseline (never 6's calibration),
+    no calibration fetch even with a 5 s backend, a driver-mismatch fault
+    (sent as no_ear_baseline) for driver 7, and the notice on screen.
+    """
+    from fakes import ScriptedIgnition, SlowCalibrationAPI, TimedFace, monitoring_summaries
+
+    class FaultAPI(SlowCalibrationAPI):
+        def __init__(self):
+            super().__init__(delay=5.0)
+            self.faults = []
+
+        def push_monitoring_fault(self, fault_uuid, status, fault_type, driver_id, *a, **k):
+            self.calls.append("push_monitoring_fault")
+            # (entry_level, started_at, gap_s, last_known, resolved_at, resolution)
+            resolution = a[5] if len(a) > 5 else k.get("resolution")
+            self.faults.append((status, fault_type, driver_id, resolution))
+            return True
+
+    class SwapRecognizer(FakeRecognizer):
+        """No match at monitoring's first attempt (driver 6 kept), then driver 7."""
+
+        def identify(self, frame):
+            self.calls += 1
+            return (None if self.calls == 1
+                    else {"driver_id": 7, "name": "Someone Else", "confidence": 0.7})
+
+    monkeypatch.setattr(m, "show_frame", Operator(m, (READY, 0.3, m.KEY_BEGIN)))
+    api = FaultAPI()
+    am = rig(api, ign)
+    assert m.run_predrive_assessment(api, FakeExtractor(), FakeRecognizer(0.0), am, hp, ign,
+                                     m.LoopRate())
+    fetches = []
+    real_fetch = m.CalibrationFetch
+    monkeypatch.setattr(m, "CalibrationFetch",
+                        lambda *a, **k: fetches.append(a) or real_fetch(*a, **k))
+    frames = []
+    real_process = m.MetricsPipeline.process
+
+    def process(self, landmarks, thresholds, now, now_mono, self_seed=False):
+        out = real_process(self, landmarks, thresholds, now, now_mono, self_seed=self_seed)
+        frames.append((now_mono, self_seed, thresholds.get("ear_threshold")))
+        return out
+    monkeypatch.setattr(m.MetricsPipeline, "process", process)
+    notices = []
+    monkeypatch.setattr(m, "show_frame", lambda img: (
+        notices.append((m._screen.phase, m._screen.status[0][0] if m._screen.status else "")),
+        -1)[1])
+    m._ignition = ScriptedIgnition([(8.0, Phase.MONITORING), (99, Phase.PREDRIVE)])
+    caplog.set_level("INFO", logger="fatigue")
+    m.run_monitoring(api, TimedFace(lambda t: "open"), SwapRecognizer(0.0), am, hp,
+                     m._ignition, m.LoopRate(), from_release=True)
+
+    (rec,) = monitoring_summaries(tmp_path)
+    swap = rec["driver_mismatch"]
+    assert swap["expected_driver_id"] == 6 and swap["driver_id"] == 7
+    assert 4.5 < swap["at_s"] < 6.5, "at the 5 s retry"
+    t_swap = frames[0][0] + swap["at_s"] - 0.1
+    before = [f for f in frames if f[0] < t_swap - 0.2]
+    after = [f for f in frames if f[0] > t_swap + 0.2]
+    assert before and all(not seed and th == pytest.approx(0.225) for _, seed, th in before),         "driver 6 scored on their cached calibration"
+    assert after and all(seed for _, seed, _th in after), "driver 7: self-seeded, from the swap on"
+    assert fetches == [] and "get_driver_calibration" not in api.calls, "nothing fetched or waited for"
+    assert api.faults[0] == ("open", m.FAULT_TYPE_DRIVER_MISMATCH, 7, None)
+    assert m.FAULT_TYPE_DRIVER_MISMATCH == "no_ear_baseline", "an existing fault type: no API change"
+    assert api.faults[-1] == ("resolved", "no_ear_baseline", 7, "ignition_off")
+    assert any("DRIVER CHANGED - driver 7 NOT ASSESSED" in line for _p, line in notices)
+    assert any("DRIVER CHANGED - NOT ASSESSED" in phase for phase, _l in notices)
+    assert "DRIVER MISMATCH: recognised driver 7" in caplog.text
+    assert rec["driver_id"] == 7 and rec["calibration_source"] == "self-seeded (driver mismatch)"
+    assert rec["max_frame_gap_s"] < m.config.MAX_FRAME_GAP_S

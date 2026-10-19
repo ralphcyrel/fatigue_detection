@@ -138,6 +138,14 @@ FAULT_TYPE_FOR_EVENT: Dict[str, str] = {
 }
 # Opened when the EAR self-seed gives up (FrameMetrics.seed_failed).
 FAULT_TYPE_NO_EAR_BASELINE: str = "no_ear_baseline"
+# Opened when monitoring recognises someone other than the driver who passed
+# pre-drive (2026-10-19). The backend has no type for it, and adding one is an
+# API change, so it goes out as the closest existing one: no_ear_baseline -
+# the face is seen, but this driver is scored on a self-seeded baseline, not
+# an assessed calibration. Same body (gap_s = seconds open, last_known null),
+# resolved "ignition_off" when monitoring ends. Distinguished locally by the
+# DRIVER MISMATCH log line and the run summary's driver_mismatch.
+FAULT_TYPE_DRIVER_MISMATCH: str = FAULT_TYPE_NO_EAR_BASELINE
 
 
 @dataclass
@@ -3195,6 +3203,13 @@ def run_monitoring(
     the loop, as before. The worst gap between two frames is logged at the
     end and saved with the run's summary in ``logs/monitoring/``.
 
+    A different driver (2026-10-19): if recognition matches someone other
+    than the driver who passed pre-drive, that driver has not been assessed.
+    Scoring switches at once to a fresh self-seeded baseline (no calibration
+    is fetched or waited for), a driver-mismatch fault is opened (reported as
+    ``no_ear_baseline``, see :data:`FAULT_TYPE_DRIVER_MISMATCH`) and the
+    screen says so for the rest of the session.
+
     Calibration (2026-10-19) never blocks either. Entered from a pre-drive
     that loaded and used the driver's calibration (``from_release``), that
     calibration is used from the first frame and nothing is fetched;
@@ -3257,6 +3272,13 @@ def run_monitoring(
     calibration_fetch: Optional[CalibrationFetch] = None
     calibration_source: Optional[str] = None
     calibration_after: Optional[float] = None
+    # The driver pre-drive released the starter for (None: none, or not from a
+    # release) and, once someone else is recognised, the mismatch and its fault.
+    released_id: Optional[int] = (int(_released_driver["driver_id"])
+                                  if from_release and _released_driver is not None
+                                  and _released_driver.get("driver_id") is not None else None)
+    mismatch: Optional[Dict[str, Any]] = None
+    mismatch_fault: Optional[OpenFault] = None
     # Recognition requests: this run's owner token; the generation moves on
     # at every face loss longer than NO_FACE_FAULT_S (older answers are void).
     inline_recognition = InlineRecognition(recognizer)
@@ -3324,6 +3346,7 @@ def run_monitoring(
             "identify_attempts": identify_attempts,
             "identified_after_s": None if identified_after is None else round(identified_after, 3),
             "calibration_source": calibration_source,
+            "driver_mismatch": mismatch,
             "calibration_after_s": (None if calibration_after is None
                                     else round(calibration_after, 3)),
             "recognition": "worker" if _recognition is not None and not _recognition.failed
@@ -3356,6 +3379,9 @@ def run_monitoring(
         if seed_fault is not None:
             seed_fault.push(api_client, "resolved", time.monotonic(),
                             datetime.now(timezone.utc), resolution)
+        if mismatch_fault is not None:
+            mismatch_fault.push(api_client, "resolved", time.monotonic(),
+                                datetime.now(timezone.utc), resolution)
 
     # Started by the confirmed start of a pre-drive that passed: same driver,
     # calibration already loaded (and checked) there - used from the first
@@ -3404,6 +3430,14 @@ def run_monitoring(
                                         "assessment passed"), (0, 0, 255)
             else:
                 banner, banner_color = "MONITORING  |  relay never engages", (0, 200, 0)
+            if mismatch is not None:
+                banner, banner_color = "MONITORING  |  DRIVER CHANGED - NOT ASSESSED", RED
+                # First status line on every frame for the rest of the session.
+                display_text(frame, f"DRIVER CHANGED - driver {mismatch['driver_id']} NOT "
+                             f"ASSESSED (pre-drive: driver {mismatch['expected_driver_id']})", RED)
+                if mismatch_fault is not None:
+                    with prof.section("api"):
+                        mismatch_fault.refresh_elapsed(api_client, now_mono)
 
             # Landmarks. No face never lowers the level and never raises it to
             # DANGER: the pipeline's NoFacePolicy holds, latches or faults.
@@ -3520,6 +3554,54 @@ def run_monitoring(
                         logger.info("Monitoring: recognition attempt %d - no match, driver stays "
                                     "UNRECOGNISED; next attempt in %.0fs",
                                     identify_attempts, UNRECOGNISED_RETRY_S)
+                elif released_id is not None and int(match["driver_id"]) != released_id:
+                    # Someone other than the driver who passed pre-drive: not
+                    # assessed. Never scored on the previous driver's
+                    # calibration, and nothing is waited for - a fresh
+                    # self-seed from this frame on.
+                    driver = match
+                    current_driver_id = int(match["driver_id"])
+                    identify_pending = False
+                    identified_after = now_mono - started_mono
+                    mismatch = {"expected_driver_id": released_id,
+                                "driver_id": current_driver_id,
+                                "name": match.get("name"),
+                                "at_s": round(now_mono - started_mono, 3)}
+                    logger.error("DRIVER MISMATCH: recognised driver %s (%s, confidence %.2f, "
+                                 "attempt %d), but pre-drive assessed driver %s - this driver "
+                                 "has NOT been assessed. Scoring switches to a self-seeded EAR "
+                                 "baseline now; fault raised (as %s).", current_driver_id,
+                                 match.get("name"), match["confidence"], identify_attempts,
+                                 released_id, FAULT_TYPE_DRIVER_MISMATCH)
+                    calibration, thresholds = None, dict(DEFAULT_THRESHOLDS)
+                    calibration_fetch = None
+                    calibration_source = "self-seeded (driver mismatch)"
+                    calibration_after = now_mono - started_mono
+                    pipeline.reset()
+                    stored_neutral = load_neutral(current_driver_id)
+                    if stored_neutral is not None:
+                        pipeline.set_pose_neutral(stored_neutral, "stored")
+                    if seed_fault is not None:
+                        # That self-seed was the previous driver's; this one's
+                        # starts over.
+                        with prof.section("api"):
+                            seed_fault.push(api_client, "resolved", now_mono,
+                                            datetime.now(timezone.utc), "driver_identified")
+                        seed_fault = None
+                    mismatch_fault = OpenFault(
+                        fault_uuid=str(uuid.uuid4()),
+                        fault_type=FAULT_TYPE_DRIVER_MISMATCH,
+                        driver_id=current_driver_id,
+                        entry_level=last_level or "ALERT",
+                        started_at=datetime.now(timezone.utc),
+                        last_known=None,
+                        gap_s=0.0,
+                        last_push_mono=now_mono,
+                        opened_mono=now_mono,
+                    )
+                    with prof.section("api"):
+                        mismatch_fault.push(api_client, "open", now_mono)
+                    last_danger_push = float("-inf")
                 elif int(match["driver_id"]) == current_driver_id:
                     identify_pending = False
                     logger.info("Monitoring: driver %s confirmed by recognition (attempt %d) - "
