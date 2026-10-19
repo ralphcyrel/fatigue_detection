@@ -40,7 +40,7 @@ def m(monkeypatch, tmp_path):
         "_window_ready": False, "_reserve_bottom": 0, "_enroll_report": {},
         "_last_screen_draw": float("-inf"),
         "_session_state": None, "_state_note": "", "_state_file": None, "_recognition": None,
-        "_recognition_factory": None,
+        "_recognition_factory": None, "_calibration_cache": {}, "_released_driver": None,
     }.items():
         monkeypatch.setattr(main, name, value)
     # Fresh operator requests: nothing pending from another test.

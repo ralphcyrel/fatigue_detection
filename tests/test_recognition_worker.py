@@ -5,7 +5,6 @@ loss discarded, only one worker, and none left behind - by END SESSION, a
 crash, or main.py being killed outright.
 """
 
-import json
 import logging
 import multiprocessing
 import os
@@ -14,11 +13,11 @@ import sys
 import textwrap
 import time
 
-import numpy as np
 import pytest
 
-from fakes import (FakeAPI, FakeExtractor, FakeRect, FakeRecognizer, Operator, ScriptedIgnition,
-                   SlowRecognizerFactory, close_eyes, synthetic_landmarks)
+from fakes import (FakeAPI, FakeExtractor, FakeRecognizer, Operator, ScriptedIgnition,
+                   SlowRecognizerFactory, TimedFace)
+from fakes import monitoring_summaries as summaries
 from modules.phase import Phase, SessionState
 from modules.recognition_worker import RecognitionWorker
 
@@ -54,29 +53,6 @@ def wait_gone(pid: int, timeout: float = 15.0) -> bool:
     while pid_alive(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
     return not pid_alive(pid)
-
-
-def summaries(tmp_path):
-    """The monitoring runs' saved summaries (logs/monitoring/*.json)."""
-    return [json.loads(p.read_text(encoding="utf-8"))
-            for p in sorted((tmp_path / "monitoring").glob("*.json"))]
-
-
-class TimedFace:
-    """Extractor whose face follows ``state(t)`` (seconds since the first call)."""
-
-    def __init__(self, state):
-        self.state, self.t0 = state, None
-        self.rng = np.random.default_rng(0)
-
-    def extract(self, frame):
-        time.sleep(0.015)
-        self.t0 = self.t0 or time.monotonic()
-        state = self.state(time.monotonic() - self.t0)
-        if state is None:
-            return None, None
-        lm = synthetic_landmarks(self.rng)
-        return (close_eyes(lm) if state == "closed" else lm), FakeRect(200, 120, 440, 360)
 
 
 # ---- monitoring off the frame loop --------------------------------------------

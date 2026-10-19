@@ -775,3 +775,42 @@ def test_microsleep_during_reidentification_is_detected(m, rig, hp, ign, known_d
     assert closure["busy"] and closure["busy"][0], "closed while identify() was running"
     assert sum(closure["busy"]) >= len(closure["busy"]) // 2
     assert seen["reason"] is m.LockReason.MICROSLEEP_DETECTED and am.relay_locked
+
+
+def test_monitoring_after_predrive_reuses_its_calibration(m, rig, hp, ign, known_driver,
+                                                          tmp_path, monkeypatch):
+    """
+    Monitoring started by the confirmed start: pre-drive's calibration is used
+    from the first frame, nothing is fetched - so a backend taking 5 s cannot
+    matter - and a 1.1 s closure 0.5 s in is confirmed on that calibration
+    (a self-seeded baseline would not even have a threshold yet).
+    """
+    from fakes import ScriptedIgnition, SlowCalibrationAPI, TimedFace, monitoring_summaries
+    monkeypatch.setattr(m, "show_frame", Operator(m, (READY, 0.3, m.KEY_BEGIN)))
+    api = SlowCalibrationAPI(delay=5.0)
+    am = rig(api, ign)
+    assert m.run_predrive_assessment(api, FakeExtractor(), FakeRecognizer(0.0), am, hp, ign,
+                                     m.LoopRate())
+    assert set(m._calibration_cache) == {6} and m._released_driver["driver_id"] == 6
+    fetches = []
+    real_fetch = m.CalibrationFetch
+    monkeypatch.setattr(m, "CalibrationFetch",
+                        lambda *a, **k: fetches.append(a) or real_fetch(*a, **k))
+    microsleeps = []
+    real_process = m.MetricsPipeline.process
+
+    def process(self, *a, **k):
+        out = real_process(self, *a, **k)
+        if out.microsleep_event is not None:
+            microsleeps.append(out)
+        return out
+    monkeypatch.setattr(m.MetricsPipeline, "process", process)
+    m._ignition = ScriptedIgnition([(3.0, Phase.MONITORING), (99, Phase.PREDRIVE)])
+    m.run_monitoring(api, TimedFace(lambda t: "closed" if 0.5 <= t < 1.6 else "open"),
+                     FakeRecognizer(0.0), am, hp, m._ignition, m.LoopRate(), from_release=True)
+    (rec,) = monitoring_summaries(tmp_path)
+    assert fetches == [] and "get_driver_calibration" not in api.calls, "nothing fetched"
+    assert rec["calibration_source"] == "pre-drive hand-off" and rec["calibration_after_s"] == 0.0
+    assert rec["driver_id"] == 6 and rec["identify_attempts"] == 1, "confirmed once"
+    assert microsleeps and microsleeps[0].scored, "on the cached calibration, not a self-seed"
+    assert rec["max_frame_gap_s"] < m.config.MAX_FRAME_GAP_S

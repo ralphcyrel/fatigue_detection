@@ -7,6 +7,7 @@ script. Costs are modelled with ``time.sleep`` so the loops run at a
 realistic pace.
 """
 
+import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -269,3 +270,42 @@ class BrokenRecognizerFactory:
 
     def __call__(self):
         raise RuntimeError("no model in the worker")
+
+
+class SlowCalibrationAPI(FakeAPI):
+    """
+    FakeAPI whose calibration GET takes ``delay`` s (a slow or dead backend)
+    and then returns ``calibration`` - ``None``: unreachable / no record.
+    """
+
+    def __init__(self, delay: float = 5.0, calibration: Optional[Calibration] = CAL) -> None:
+        super().__init__()
+        self.delay, self.calibration = delay, calibration
+
+    def get_driver_calibration(self, driver_id: int) -> Optional[Calibration]:
+        self.calls.append("get_driver_calibration")
+        time.sleep(self.delay)
+        return self.calibration
+
+
+class TimedFace:
+    """Extractor whose face follows ``state(t)`` (seconds since its first call)."""
+
+    def __init__(self, state) -> None:
+        self.state, self.t0 = state, None
+        self.rng = np.random.default_rng(0)
+
+    def extract(self, frame: np.ndarray):
+        time.sleep(0.015)
+        self.t0 = self.t0 or time.monotonic()
+        state = self.state(time.monotonic() - self.t0)
+        if state is None:
+            return None, None
+        lm = synthetic_landmarks(self.rng)
+        return (close_eyes(lm) if state == "closed" else lm), FakeRect(200, 120, 440, 360)
+
+
+def monitoring_summaries(logs_dir) -> List[Dict[str, Any]]:
+    """The monitoring runs' saved summaries (logs/monitoring/*.json), oldest first."""
+    return [json.loads(p.read_text(encoding="utf-8"))
+            for p in sorted((logs_dir / "monitoring").glob("*.json"))]

@@ -228,6 +228,14 @@ class APIClient:
             logger.warning("APIClient: no API token configured (FATIGUE_API_TOKEN)")
         logger.info("APIClient targeting %s (timeout %ss)", self.base_url, self.timeout)
 
+    def clone(self) -> "APIClient":
+        """
+        A client for the same backend with its own ``requests.Session``
+        (sessions are not thread-safe), for a call made off the frame loop -
+        main.py's monitoring calibration fetch.
+        """
+        return APIClient(self.base_url, self.token)
+
     # ------------------------------------------------------------------
     # Internal request helpers
     # ------------------------------------------------------------------

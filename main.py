@@ -344,6 +344,12 @@ _recognition_factory: Any = None
 # re-run, a change of driver, the hand-off to monitoring - is never taken by
 # the next one.
 _recognition_owner = itertools.count(1)
+# The calibration the current pre-drive cycle loaded and used (driver_id ->
+# Calibration), and the driver it released the starter for. Monitoring
+# entered from that release reuses it instead of fetching it again
+# (2026-10-19). Cleared at every pre-drive cycle and END SESSION.
+_calibration_cache: Dict[int, Calibration] = {}
+_released_driver: Optional[Dict[str, Any]] = None
 
 
 class QuitRequested(Exception):
@@ -2011,6 +2017,40 @@ def load_calibration(
     return usable, usable.provenance()
 
 
+class CalibrationFetch:
+    """
+    :func:`load_calibration` (monitoring rules) on a background thread, so
+    the frame loop never waits for the backend (2026-10-19). Unlike dlib, an
+    HTTP wait releases the GIL, so a thread is enough. The thread gets its
+    own client (``APIClient.clone``: a ``requests.Session`` is not
+    thread-safe) and is a daemon: an answer that never comes is simply never
+    taken.
+    """
+
+    def __init__(self, api_client: Any, driver_id: int) -> None:
+        self.driver_id = int(driver_id)
+        self.started = time.monotonic()
+        self._result: Optional[Tuple[Optional[Calibration], Optional[Dict[str, Any]]]] = None
+        self._done = threading.Event()
+        clone = getattr(type(api_client), "clone", None)
+        client = api_client.clone() if callable(clone) else api_client
+        threading.Thread(target=self._run, args=(client,), name="calibration-fetch",
+                         daemon=True).start()
+
+    def _run(self, client: Any) -> None:
+        try:
+            self._result = load_calibration(client, self.driver_id, Phase.MONITORING)
+        except Exception:
+            logger.exception("Calibration fetch for driver %s failed", self.driver_id)
+            self._result = (None, None)
+        finally:
+            self._done.set()
+
+    def poll(self) -> Optional[Tuple[Optional[Calibration], Optional[Dict[str, Any]]]]:
+        """``load_calibration``'s result once it is in, else ``None``. Never blocks."""
+        return self._result if self._done.is_set() else None
+
+
 def check_threshold_sanity(thresholds: Dict[str, float], source: str) -> bool:
     """
     Check that ``ear_threshold`` is consistent with ``ear_baseline``.
@@ -2618,6 +2658,9 @@ def run_predrive_assessment(
     # rolling window. time.time() is only recorded and logged.
     cycle_started = time.monotonic()
     cycle_started_wall = time.time()
+    global _released_driver
+    _calibration_cache.clear()
+    _released_driver = None
     logger.info("=== PRE-DRIVE phase (no ignition input) - starter %s ===",
                 alert_manager.get_relay_state())
 
@@ -2667,6 +2710,8 @@ def run_predrive_assessment(
                 lock_reason = LockReason.FOREIGN_DEVICE_BASELINE
             else:
                 thresholds = calibration.thresholds
+                # Monitoring after this cycle's start reuses it (no fetch).
+                _calibration_cache[driver_id] = calibration
 
         if lock_reason is None:
             # 4. Settle: the face and landmarks must be valid for
@@ -2941,6 +2986,7 @@ def run_predrive_assessment(
                         log_start_confirmed(source, cycle_started, time.monotonic(),
                                             assessment)
                         close_assessment(assessment, driver_id, "confirmed", source=source)
+                        _released_driver = driver
                         if continue_to_monitoring:
                             show_release(rate, "START CONFIRMED")
                         return True
@@ -2950,12 +2996,18 @@ def run_predrive_assessment(
         if invalid_cause is not None:
             _frs_debug.log_event(time.time(), "predrive_verdict", "FAULT", invalid_cause)
         alert_manager.set_alert_level("FAULT" if invalid_cause is not None else "ALERT")
-        return await_override(api_client, alert_manager, ignition, rate, driver_id,
-                              lock_reason, assessment_id, calibration_record,
-                              continue_to_monitoring=continue_to_monitoring,
-                              display_reason=("INVALID ASSESSMENT" if invalid_cause is not None
-                                              else None),
-                              cycle_started=cycle_started)
+        released = await_override(api_client, alert_manager, ignition, rate, driver_id,
+                                  lock_reason, assessment_id, calibration_record,
+                                  continue_to_monitoring=continue_to_monitoring,
+                                  display_reason=("INVALID ASSESSMENT" if invalid_cause is not None
+                                                  else None),
+                                  cycle_started=cycle_started)
+        if released:
+            # Approved override: monitoring reuses this cycle's calibration
+            # only if one was loaded and cached (not for no_baseline /
+            # foreign_device_baseline / not recognised).
+            _released_driver = driver
+        return released
 
     except (SessionEnded, QuitRequested, KeyboardInterrupt) as exc:
         # The trial's record says how it ended (END SESSION, or STOP / quit).
@@ -3075,6 +3127,9 @@ def end_session(alert_manager: AlertManager) -> None:
     # No recognition process outlives the session; the next driver's starts
     # when IDLE is left.
     stop_recognition("END SESSION")
+    global _released_driver
+    _calibration_cache.clear()
+    _released_driver = None
     logger.warning("SESSION ENDED by the operator at %s (was %s) - starter %s, alerts off, "
                    "pre-drive / READY_TO_START state cleared", _stamp(time.time()), was,
                    alert_manager.get_relay_state())
@@ -3140,6 +3195,16 @@ def run_monitoring(
     the loop, as before. The worst gap between two frames is logged at the
     end and saved with the run's summary in ``logs/monitoring/``.
 
+    Calibration (2026-10-19) never blocks either. Entered from a pre-drive
+    that loaded and used the driver's calibration (``from_release``), that
+    calibration is used from the first frame and nothing is fetched;
+    recognition then confirms the driver once. Otherwise, once the driver is
+    identified, their calibration comes from the pre-drive cache if it holds
+    them, else from :class:`CalibrationFetch` on a background thread; until
+    it answers the current values (self-seeded baseline) stay in use, and if
+    it brings nothing (backend unreachable, no record) that is logged and
+    monitoring carries on unchanged.
+
     Frames with no face follow ``modules.pipeline.NoFacePolicy``: the level
     is held (never lowered) and a DANGER is latched for up to
     ``config.NO_FACE_FAULT_S``; past it the level is FAULT, from any level,
@@ -3186,6 +3251,12 @@ def run_monitoring(
     # Unrecognised-driver retry schedule (UNRECOGNISED_RETRY_S).
     next_identify = float("-inf")
     identify_attempts = 0
+    # Identification still wanted (until a match is accepted).
+    identify_pending = True
+    # Calibration fetch running off the frame loop (CalibrationFetch), if any.
+    calibration_fetch: Optional[CalibrationFetch] = None
+    calibration_source: Optional[str] = None
+    calibration_after: Optional[float] = None
     # Recognition requests: this run's owner token; the generation moves on
     # at every face loss longer than NO_FACE_FAULT_S (older answers are void).
     inline_recognition = InlineRecognition(recognizer)
@@ -3213,6 +3284,33 @@ def run_monitoring(
     # See from_release: whether this session has seen the ignition ON yet.
     ignition_seen_on = False
 
+    def apply_calibration(cal: Calibration, source: str, now_mono: float) -> None:
+        """Score from here on against ``cal`` (the identified driver's)."""
+        nonlocal calibration, thresholds, seed_fault, last_danger_push
+        nonlocal calibration_source, calibration_after
+        calibration, thresholds = cal, cal.thresholds
+        calibration_source = source
+        calibration_after = now_mono - started_mono
+        logger.info("Monitoring: driver %s's calibration %s in use (%s)", current_driver_id,
+                    cal.calibration_id, source)
+        # Fresh history so metrics accumulated before recognition (on a
+        # self-seeded baseline) don't leak into this driver's. That includes
+        # a self-seed that gave up: it starts over.
+        pipeline.reset()
+        # This driver's neutral head pose from enrollment on this unit;
+        # without one it is seeded from the next few seconds.
+        stored_neutral = load_neutral(current_driver_id)
+        if stored_neutral is not None:
+            pipeline.set_pose_neutral(stored_neutral, "stored")
+        if seed_fault is not None:
+            logger.info("Driver identified - no_ear_baseline fault resolved (calibration "
+                        "loaded)")
+            with prof.section("api"):
+                seed_fault.push(api_client, "resolved", now_mono,
+                                datetime.now(timezone.utc), "driver_identified")
+            seed_fault = None
+        last_danger_push = float("-inf")
+
     def summary() -> None:
         """Log and save how the frame loop did this run (every exit)."""
         duration = time.monotonic() - started_mono
@@ -3225,6 +3323,9 @@ def run_monitoring(
             "frame_gaps_over_limit": gaps_over, "max_frame_gap_limit_s": config.MAX_FRAME_GAP_S,
             "identify_attempts": identify_attempts,
             "identified_after_s": None if identified_after is None else round(identified_after, 3),
+            "calibration_source": calibration_source,
+            "calibration_after_s": (None if calibration_after is None
+                                    else round(calibration_after, 3)),
             "recognition": "worker" if _recognition is not None and not _recognition.failed
                            else "inline",
         }
@@ -3255,6 +3356,23 @@ def run_monitoring(
         if seed_fault is not None:
             seed_fault.push(api_client, "resolved", time.monotonic(),
                             datetime.now(timezone.utc), resolution)
+
+    # Started by the confirmed start of a pre-drive that passed: same driver,
+    # calibration already loaded (and checked) there - used from the first
+    # frame, no backend fetch. Recognition still confirms the driver once.
+    handoff = _released_driver if from_release else None
+    cached = (_calibration_cache.get(int(handoff["driver_id"]))
+              if handoff is not None else None)
+    if cached is not None:
+        driver, current_driver_id = handoff, int(handoff["driver_id"])
+        calibration, thresholds = cached, cached.thresholds
+        calibration_source, calibration_after = "pre-drive hand-off", 0.0
+        stored_neutral = load_neutral(current_driver_id)
+        if stored_neutral is not None:
+            pipeline.set_pose_neutral(stored_neutral, "stored")
+        logger.info("Monitoring: driver %s (%s) from pre-drive - calibration %s reused, no "
+                    "backend fetch; recognition confirms the driver once", current_driver_id,
+                    handoff.get("name"), cached.calibration_id)
 
     try:
         while True:
@@ -3356,7 +3474,7 @@ def run_monitoring(
             # session (see docstring). Submitted to the worker on a face frame,
             # answered on a later one; inline only if the worker is unavailable.
             identified = None
-            if current_driver_id is None:
+            if identify_pending:
                 channel = recognition_channel(inline_recognition)
                 with prof.section("recognition"):
                     identified = channel.poll()
@@ -3385,7 +3503,13 @@ def run_monitoring(
                 # Spaced from the answer to this attempt, so the loop always gets
                 # UNRECOGNISED_RETRY_S between attempts.
                 next_identify = now_mono + UNRECOGNISED_RETRY_S
-                if match is None:
+                if match is None and current_driver_id is not None:
+                    # Pre-drive's driver, not (yet) confirmed: a non-match does
+                    # not contradict them, so their calibration stays.
+                    logger.info("Monitoring: recognition attempt %d - no match; keeping "
+                                "pre-drive's driver %s, next attempt in %.0fs",
+                                identify_attempts, current_driver_id, UNRECOGNISED_RETRY_S)
+                elif match is None:
                     if not defaults_logged:
                         logger.warning("Monitoring: driver not recognised - self-seeding the EAR "
                                        "baseline from this driver's own EAR (overrides only for "
@@ -3396,9 +3520,18 @@ def run_monitoring(
                         logger.info("Monitoring: recognition attempt %d - no match, driver stays "
                                     "UNRECOGNISED; next attempt in %.0fs",
                                     identify_attempts, UNRECOGNISED_RETRY_S)
+                elif int(match["driver_id"]) == current_driver_id:
+                    identify_pending = False
+                    logger.info("Monitoring: driver %s confirmed by recognition (attempt %d) - "
+                                "pre-drive's calibration kept, recognition stops for this "
+                                "session", current_driver_id, identify_attempts)
                 else:
+                    if current_driver_id is not None:
+                        logger.warning("Monitoring: recognised driver %s, not pre-drive's %s - "
+                                       "switching driver", match["driver_id"], current_driver_id)
                     driver = match
                     current_driver_id = int(match["driver_id"])
+                    identify_pending = False
                     identified_after = now_mono - started_mono
                     logger.info("Driver identified: %s (id=%s, confidence %.2f, attempt %d) - "
                                 "recognition stops for this session", match["name"],
@@ -3412,33 +3545,51 @@ def run_monitoring(
                     # unquantified (a stated limitation). Self-seed only when
                     # there is no calibration, or (a flagged repair) when the
                     # record has no EAR baseline.
-                    with prof.section("api"):   # synchronous GET, once, on recognition
-                        calibration, _ = load_calibration(api_client, current_driver_id,
-                                                          Phase.MONITORING)
-                    if calibration is None:
-                        logger.warning("Monitoring: no usable calibration for driver %s - "
-                                       "self-seeding the EAR baseline; re-enrol with "
-                                       "`main.py --enroll`", current_driver_id)
-                    thresholds = (calibration.thresholds if calibration is not None
-                                  else dict(DEFAULT_THRESHOLDS))
-                    # Fresh history so metrics accumulated before recognition
-                    # (on a self-seeded baseline) don't leak into this driver's.
-                    # That includes a self-seed that gave up: it starts over.
-                    pipeline.reset()
-                    # This driver's neutral head pose from enrollment on this
-                    # unit; without one it is seeded from the next few seconds.
-                    stored_neutral = load_neutral(current_driver_id)
-                    if stored_neutral is not None:
-                        pipeline.set_pose_neutral(stored_neutral, "stored")
-                    if seed_fault is not None:
-                        logger.info("Driver identified - no_ear_baseline fault resolved (%s)",
-                                    "calibration loaded" if calibration is not None
-                                    else "self-seed restarts")
-                        with prof.section("api"):
-                            seed_fault.push(api_client, "resolved", now_mono,
-                                            datetime.now(timezone.utc), "driver_identified")
-                        seed_fault = None
-                    last_danger_push = float("-inf")
+                    cached = _calibration_cache.get(current_driver_id)
+                    if cached is not None:
+                        apply_calibration(cached, "cached from pre-drive", now_mono)
+                    else:
+                        # Off the frame loop (2026-10-19): the GET can take up to
+                        # API_TIMEOUT, or not come back at all. Until it answers
+                        # the current values stay in use.
+                        calibration_fetch = CalibrationFetch(api_client, current_driver_id)
+                        logger.info("Monitoring: fetching driver %s's calibration off the frame "
+                                    "loop - scoring continues on %s until it arrives",
+                                    current_driver_id,
+                                    "the current calibration" if calibration is not None
+                                    else "the self-seeded EAR baseline")
+
+            # The calibration fetch, if one is out: applied on the first face
+            # frame after it answers; never waited for.
+            if calibration_fetch is not None:
+                fetched = calibration_fetch.poll()
+                if fetched is not None:
+                    fetch, calibration_fetch = calibration_fetch, None
+                    waited = now_mono - fetch.started
+                    if fetch.driver_id != current_driver_id:
+                        logger.info("Monitoring: calibration for driver %s arrived after a "
+                                    "driver change - discarded", fetch.driver_id)
+                    elif fetched[0] is not None:
+                        apply_calibration(fetched[0], "fetched in %.1fs, off the frame loop"
+                                          % waited, now_mono)
+                    else:
+                        logger.warning("Monitoring: no usable calibration for driver %s after "
+                                       "%.1fs (backend unreachable, no record, or unusable) - "
+                                       "keeps running on %s; re-enrol with `main.py --enroll` "
+                                       "if this persists", current_driver_id, waited,
+                                       "the current calibration" if calibration is not None
+                                       else "the self-seeded EAR baseline")
+                        calibration_source = calibration_source or "none (fetch failed)"
+                        if seed_fault is not None:
+                            # The self-seed had given up: it starts over for
+                            # this driver, as on identification before.
+                            pipeline.reset()
+                            logger.info("Driver identified - no_ear_baseline fault resolved "
+                                        "(self-seed restarts)")
+                            with prof.section("api"):
+                                seed_fault.push(api_client, "resolved", now_mono,
+                                                datetime.now(timezone.utc), "driver_identified")
+                            seed_fault = None
 
             with prof.section("pipeline"):
                 m = pipeline.process(landmarks, thresholds, now, now_mono,
