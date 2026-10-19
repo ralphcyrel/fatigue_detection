@@ -693,6 +693,8 @@ class Launcher:
         self._end_confirming = False
         self._end_confirm_job: Optional[str] = None
         self._stopping = False
+        # Times this session's strip was found under another window and raised.
+        self._strip_raises = 0
 
         # Sizes are set by _apply_size. The other fonts are re-fitted
         # wherever they are used, so shrinking one never shrinks text
@@ -1324,6 +1326,15 @@ class Launcher:
         MONITORING / START NEXT DRIVER (see ``LABEL_BEGIN``). Only the
         widgets inside the strip change with the child's state; the window
         itself is never re-mapped or resized.
+
+        Outside --windowed the strip is override-redirect (unmanaged). On the
+        Pi (2026-10-19) main.py's fullscreen window covered the managed dock
+        strip, topmost and re-lifted every poll notwithstanding: window
+        managers stack a fullscreen window above docks and "always on top".
+        A window manager cannot stack an unmanaged window - it stays where
+        the launcher raises it (labwc and Wayfire draw Xwayland's unmanaged
+        windows above every managed one) - so the strip is raised whenever
+        it reports being covered, and on every poll.
         """
         self._close_strip()
         x, y = self._home[:2]
@@ -1332,12 +1343,14 @@ class Launcher:
         strip.withdraw()
         strip.title("Fatigue Detection - STOP")
         strip.protocol("WM_DELETE_WINDOW", self._stop_session)
-        strip.overrideredirect(bool(self.forced_size) and not self.windowed)
+        strip.overrideredirect(not self.windowed)
         self._set_x11_type(strip, "dock")
         strip.attributes("-topmost", True)
         strip.geometry(f"{self.win_w}x{h}+{x}+{y + self.win_h - h}")
+        strip.bind("<Visibility>", self._on_strip_visibility)
         self.strip = strip
         self._strip_state, self._end_confirming, self._stopping = None, False, False
+        self._strip_raises = 0
 
         f = tk.Frame(strip, bg=BG)
         f.pack(fill="both", expand=True)
@@ -1519,10 +1532,32 @@ class Launcher:
             self.session.request("end_session")
         self._layout_strip()
 
+    def _on_strip_visibility(self, event: tk.Event) -> None:
+        """The strip (not one of its widgets) became partly or fully covered: raise it."""
+        if event.widget is self.strip and event.state != "VisibilityUnobscured":
+            self._raise_strip(str(event.state))
+
+    def _raise_strip(self, covered: Optional[str] = None) -> None:
+        """
+        Put the strip above main.py's window. ``covered``: the strip reported
+        being covered (logged the first time each session; the count is
+        logged when the strip closes - the evidence for the Pi test).
+        """
+        if self.strip is None:
+            return
+        self.strip.lift()
+        if covered is not None:
+            self._strip_raises += 1
+            if self._strip_raises == 1:
+                logger.info("Strip covered (%s) - raised above main.py's window", covered)
+
     def _close_strip(self) -> None:
         self._cancel_end_job()
         self.strip_buttons = {}
         if self.strip is not None:
+            if self._strip_raises:
+                logger.info("Strip was covered and raised %d time(s) this session",
+                            self._strip_raises)
             self.strip.destroy()
             self.strip = None
 
@@ -1542,7 +1577,7 @@ class Launcher:
             return
         if self.session.running:
             if self.strip is not None:
-                self.strip.lift()       # stay above main.py's fullscreen window
+                self._raise_strip()     # stay above main.py's fullscreen window
                 if getattr(self.session, "controls", False):
                     state = self.session.child_state()
                     if state != self._strip_state:

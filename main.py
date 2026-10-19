@@ -106,6 +106,7 @@ from modules.session_display import (FACE_NONE, FACE_OK, FACE_SEARCHING,
                                      render as render_data_screen, render_enroll)
 from modules.start_confirm import (BEGIN, END_SESSION, OperatorRequests, TouchStartConfirm,
                                    make_start_confirm)
+from modules.text_render import put_text, text_size
 
 logger = logging.getLogger("fatigue")
 
@@ -949,7 +950,7 @@ def draw_banner(frame: np.ndarray, text: str, color: tuple = WHITE) -> None:
         return  # nobody sees the camera image this frame
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, h - 30), (w, h), (0, 0, 0), -1)
-    cv2.putText(frame, text, (10, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+    put_text(frame, text, (10, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
 def draw_overlay(
@@ -997,7 +998,7 @@ def draw_overlay(
     # Dark strip behind the text keeps it legible over a bright face.
     cv2.rectangle(frame, (0, 0), (w, 135), (0, 0, 0), -1)
 
-    cv2.putText(frame, f"Driver: {name}", (10, 25), font, 0.6, WHITE, 1, cv2.LINE_AA)
+    put_text(frame, f"Driver: {name}", (10, 25), font, 0.6, WHITE, 1)
     cv2.putText(frame, f"FPS: {fps:.1f}" if fps is not None else "FPS: --",
                 (w - 150, 25), font, 0.5, WHITE, 1, cv2.LINE_AA)
     cv2.putText(frame, f"FRS: {m.frs:.3f}" if m.scored
@@ -1161,10 +1162,10 @@ def display_text(frame: np.ndarray, text: str, color: tuple = (0, 0, 255), dy: i
         return  # nobody sees the camera image this frame
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale, thickness = 1.0, 2
-    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+    tw, th = text_size(text, font, scale, thickness)
     x = max((frame.shape[1] - tw) // 2, 0)
     y = (frame.shape[0] + th) // 2 + dy
-    cv2.putText(frame, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+    put_text(frame, text, (x, y), font, scale, color, thickness)
 
 
 # ---------------------------------------------------------------------------

@@ -223,6 +223,12 @@ Live view*), so operators can open it without typing the URL.
   the face capture), progress bars and the closed-eye countdown. It is
   redrawn at the data screen's 10 Hz, so it costs the capture loop nothing
   measurable.
-- If the strip ends up hidden behind the session window on a Wayland
-  desktop, switch the session to X11 (`raspi-config` → *Advanced Options* →
-  *Wayland* → *X11*); dock/topmost hints are honoured reliably there.
+- The strip is an unmanaged (override-redirect) window, raised whenever it
+  reports being covered and every 500 ms: as a managed dock / topmost
+  window it ended up under `main.py`'s fullscreen window on the Pi
+  (2026-10-19), so BEGIN MONITORING and END SESSION could not be touched.
+  `Strip covered (...) - raised above main.py's window` in
+  `logs/start_launcher.log` means that happened and was undone; the count
+  is logged when the session ends. If the strip still ends up hidden on a
+  Wayland desktop, switch the session to X11 (`raspi-config` → *Advanced
+  Options* → *Wayland* → *X11*).

@@ -23,6 +23,9 @@
 opencv-python<4.12
 dlib
 face-recognition
+# Draws text that is not ASCII (driver names like Acuña) on the data screen:
+# OpenCV's Hershey fonts have ASCII only. Also a face-recognition dependency.
+Pillow
 imutils
 # dlib 19.24.1 fails on numpy 2 (see the OpenCV note above).
 numpy<2

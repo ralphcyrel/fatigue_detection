@@ -19,6 +19,8 @@ existing draw helpers and read by :func:`render`, nothing else.
 
 The canvas is drawn with OpenCV (Hershey fonts) so it goes through the same
 ``cv2.imshow`` window as the old preview and needs no extra GUI toolkit.
+Text that is not ASCII (a driver called Acuña) goes through
+:mod:`modules.text_render`, since Hershey has no ñ.
 """
 
 from dataclasses import dataclass, field
@@ -26,6 +28,8 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from modules.text_render import put_text, text_size
 
 # Colours (BGR). Level colours match main.LEVEL_BGR.
 LEVEL_BGR = {
@@ -124,15 +128,15 @@ def _text(img: np.ndarray, text: str, x: int, y: int, scale: float,
 
     ``max_w`` shrinks the scale until the text fits (long status lines).
     """
-    (w, _h), _ = cv2.getTextSize(text, font, scale, thick)
+    w, _h = text_size(text, font, scale, thick)
     if max_w is not None and w > max_w and w > 0:
         scale *= max_w / w
-        (w, _h), _ = cv2.getTextSize(text, font, scale, thick)
+        w, _h = text_size(text, font, scale, thick)
     if align == "center":
         x -= w // 2
     elif align == "right":
         x -= w
-    cv2.putText(img, text, (int(x), int(y)), font, scale, color, thick, cv2.LINE_AA)
+    put_text(img, text, (int(x), int(y)), font, scale, color, thick)
     return w
 
 
@@ -315,7 +319,7 @@ def _wrap(text: str, scale: float, thick: int, max_w: int, font: int = FONT) -> 
         line = ""
         for word in para.split():
             trial = f"{line} {word}".strip()
-            if line and cv2.getTextSize(trial, font, scale, thick)[0][0] > max_w:
+            if line and text_size(trial, font, scale, thick)[0] > max_w:
                 lines.append(line)
                 line = word
             else:

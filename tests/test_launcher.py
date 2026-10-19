@@ -308,6 +308,41 @@ def test_running_strip_fits(make_app, size):
     assert cut_off(app) == []                   # strip, and the screen behind main.py's
 
 
+@pytest.mark.parametrize("windowed", [False, True])
+def test_strip_is_unmanaged_outside_windowed(make_app, windowed):
+    """
+    On the Pi main.py's fullscreen window covered the managed dock strip
+    (2026-10-19): window managers put fullscreen above docks and topmost.
+    An unmanaged strip stays where the launcher raises it. --windowed
+    (development) keeps a normal, movable window.
+    """
+    app = make_app((800, 480), windowed=windowed)
+    app._show_running(SimpleNamespace(label="Pre-drive assessment"))
+    app.root.update()
+    assert bool(app.strip.overrideredirect()) is not windowed
+    assert int(app.strip.attributes("-topmost")) == 1
+
+
+def test_covered_strip_is_raised_and_logged(make_app, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="launcher")
+    app = make_app((800, 480))
+    app._show_running(SimpleNamespace(label="Pre-drive assessment"))
+    app.root.update()
+    lifts = []
+    monkeypatch.setattr(app.strip, "lift", lambda *a: lifts.append(a))
+    child = app.strip.winfo_children()[0]
+    app._on_strip_visibility(SimpleNamespace(widget=child, state="VisibilityFullyObscured"))
+    app._on_strip_visibility(SimpleNamespace(widget=app.strip, state="VisibilityUnobscured"))
+    assert lifts == [], "only the strip itself being covered counts"
+    app._on_strip_visibility(SimpleNamespace(widget=app.strip, state="VisibilityFullyObscured"))
+    app._on_strip_visibility(SimpleNamespace(widget=app.strip,
+                                             state="VisibilityPartiallyObscured"))
+    assert len(lifts) == 2
+    assert caplog.text.count("Strip covered") == 1, "logged once per session"
+    app._close_strip()
+    assert "covered and raised 2 time(s)" in caplog.text
+
+
 def wait_for(app, condition, timeout=3.0):
     deadline = time.monotonic() + timeout
     while not condition() and time.monotonic() < deadline:
