@@ -69,7 +69,7 @@ class FrsDebugLog:
         self.path: Optional[Path] = None
         self._fh: Any = None
         self._writer: Optional[csv.DictWriter] = None
-        self._last_t: Optional[float] = None
+        self._last_t: Optional[float] = None   # time.monotonic() of the last row
 
     def _open(self, now: float) -> bool:
         """Create the file on the first row. Returns False (and disables) on error."""
@@ -92,9 +92,12 @@ class FrsDebugLog:
     def _write(self, row: Dict[str, Any], now: float) -> None:
         if not self.enabled or not self._open(now):
             return
-        row["timestamp"] = round(now, 3)
-        row["dt_ms"] = None if self._last_t is None else round((now - self._last_t) * 1000.0, 1)
-        self._last_t = now
+        row["timestamp"] = round(now, 3)            # wall clock: for reading only
+        # The gap since the previous row on the monotonic clock (2026-10-19),
+        # so a wall-clock step never shows up as a frame gap.
+        mono = time.monotonic()
+        row["dt_ms"] = None if self._last_t is None else round((mono - self._last_t) * 1000.0, 1)
+        self._last_t = mono
         try:
             self._writer.writerow(row)  # type: ignore[union-attr]
         except OSError as exc:

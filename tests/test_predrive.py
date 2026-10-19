@@ -109,12 +109,13 @@ def test_confirmation_advances_to_monitoring(m, rig, hp, ign, known_driver, runs
     run = runs[0]
     events = {e["event"]: e for e in run.timeline}
     assert list(events) == ["ready_entered", "confirmed", "ended"]
-    assert events["confirmed"]["t_abs"] - events["ready_entered"]["t_abs"] >= 1.0
+    assert events["confirmed"]["t_mono"] - events["ready_entered"]["t_mono"] >= 1.0
     summary = run.timeline_summary()
     assert summary["end_reason"] == "confirmed"
-    assert summary["first_ready_at"] < summary["confirmed_at"]
+    assert summary["first_ready_at"] < summary["confirmed_at"]          # wall, for the record
     assert summary["predrive_duration_s"] == pytest.approx(
-        summary["confirmed_at"] - summary["predrive_started_at"], abs=1e-3)
+        events["confirmed"]["t_mono"] - run.predrive_started_mono, abs=1e-3)
+    assert summary["time_to_first_ready_s"] < summary["predrive_duration_s"]
 
 
 def test_isolated_pass_r_reruns(m, rig, hp, ign, known_driver, monkeypatch):
@@ -522,3 +523,242 @@ def test_rolling_window_forgets_old_frames_and_needs_the_minimum():
         a.add_invalid("no_face", t)
     w = a.window_verdict(t)
     assert not w["passed"] and w["reason"] == "invalid"
+
+
+# ---- clocks: a wall-clock step changes nothing (2026-10-19) -------------------
+
+WALL_KEYS = {"started_at", "ended_at", "predrive_started_at", "first_ready_at",
+             "confirmed_at", "timeline", "samples"}
+
+
+def _scripted_run(hp, jump):
+    """
+    45 s at 20 fps through MetricsPipeline + PredriveAssessment, on a scripted
+    face: blinks every 3 s, a 0.8 s no-face gap at 20 s, a 1.4 s closure (a
+    microsleep) at 38 s. Monotonic time runs straight; the wall clock jumps by
+    ``jump`` seconds at 12 s. Returns everything the run decided.
+    """
+    from fakes import THRESHOLDS, close_eyes, synthetic_landmarks
+    from modules.pipeline import MetricsPipeline
+
+    rng = np.random.default_rng(1)
+    pipe = MetricsPipeline(hp, blink_window_s=30.0)
+    a = PredriveAssessment(duration_s=30.0, worst_window_s=5.0)
+    mono0, wall0, dt = 5000.0, 1.8e9, 0.05
+    a.start(mono0)
+    decided, first_window = [], None
+    for i in range(int(45.0 / dt)):
+        rel = i * dt
+        t, wall = mono0 + rel, wall0 + rel + (jump if rel >= 12.0 else 0.0)
+        if first_window is None and a.is_complete(t):
+            first_window = a.result()
+            a.freeze(t)
+            decided.append(("eligible", i))
+        if 20.0 <= rel < 20.8:
+            v = pipe.note_no_face(wall, t)
+            a.add_invalid("no_face", t)
+            decided.append(("no_face", v.level, v.band))
+        else:
+            lm = synthetic_landmarks(rng)
+            if rel % 3.0 < 0.15 or 38.0 <= rel < 39.4:
+                lm = close_eyes(lm)
+            mm = pipe.process(lm, THRESHOLDS, wall, t)
+            a.add(mm, t)
+            assert mm.t == wall and mm.t_mono == t
+            decided.append((round(mm.frs, 9), mm.level, mm.band, mm.microsleep_event is not None,
+                            mm.blink_freq, round(mm.perclos, 9), round(mm.blink_duration_ms, 6)))
+        if a.frozen:
+            decided.append(tuple(sorted(a.window_verdict(t).items())))
+    a.mark("ended", mono0 + 45.0, reason="test")
+    kept = {k: v for k, v in first_window.items() if k not in WALL_KEYS}
+    kept["samples"] = [{k: v for k, v in smp.items() if k != "t_abs"}
+                       for smp in first_window["samples"]]
+    timing = {k: v for k, v in a.timeline_summary().items() if k not in WALL_KEYS}
+    return decided, kept, timing, first_window
+
+
+@pytest.mark.parametrize("jump", [600.0, -600.0])
+def test_wall_clock_jump_changes_nothing(hp, jump):
+    """+/-10 min wall-clock step at 12 s: every level, window, verdict and duration identical."""
+    base = _scripted_run(hp, 0.0)
+    jumped = _scripted_run(hp, jump)
+    assert jumped[0] == base[0], "per-frame metrics, levels and rolling verdicts"
+    assert jumped[1] == base[1], "the first-window verdict (what goes to the backend)"
+    assert jumped[2] == base[2], "durations: time to READY, pre-drive duration, frame gaps"
+    # It really jumped: only the recorded wall clock moved.
+    samples, ref = jumped[3]["samples"], base[3]["samples"]
+    late = [i for i, smp in enumerate(ref) if smp["t_rel"] >= 12.0]
+    assert late and all(samples[i]["t_abs"] - ref[i]["t_abs"] == pytest.approx(jump)
+                        for i in late)
+    assert ("eligible", 600) in base[0], "eligible at exactly 30 s of monotonic time"
+    assert any(row[3] for row in base[0] if len(row) == 7), "the microsleep was seen"
+
+
+@pytest.mark.parametrize("jump", [600.0, -600.0])
+@pytest.mark.parametrize("during", ["SETTLING", "ASSESSING"])
+def test_predrive_loop_ignores_a_wall_clock_jump(m, rig, hp, ign, known_driver, transitions,
+                                                 runs, monkeypatch, jump, during):
+    """The real loop: settling still takes 3 s and READY still comes at the minimum."""
+    real_time = time.time
+    offset = {"v": 0.0}
+    monkeypatch.setattr(time, "time", lambda: real_time() + offset["v"])
+    target = getattr(SessionState, during)
+
+    def show(frame):
+        entered = [t for s, _n, _l, t in transitions if s is target]
+        if entered and offset["v"] == 0.0 and time.monotonic() - entered[-1] >= 1.0:
+            offset["v"] = jump                       # the NTP step
+        readies = [t for s, _n, _l, t in transitions if s is READY]
+        if readies and time.monotonic() - readies[-1] > 0.5:
+            return m.KEY_QUIT
+        return -1
+    monkeypatch.setattr(m, "show_frame", show)
+    api = FakeAPI()
+    am = rig(api, ign)
+    with pytest.raises(m.QuitRequested):
+        m.run_predrive_assessment(api, FakeExtractor(), FakeRecognizer(0.0), am, hp, ign,
+                                  m.LoopRate())
+    assert offset["v"] == jump, "the jump happened"
+    at = {s: t for s, _n, _l, t in reversed(transitions)}
+    settle = at[ASSESSING] - at[SessionState.SETTLING]
+    to_ready = at[READY] - at[ASSESSING]
+    assert m.config.PREDRIVE_SETTLE_SECONDS <= settle < m.config.PREDRIVE_SETTLE_SECONDS + 0.6
+    assert runs[0].duration_s <= to_ready < runs[0].duration_s + 0.6
+    first = runs[0].timeline[0]
+    assert first["event"] == "ready_entered"
+    assert runs[0].duration_s <= first["t_rel"] < runs[0].duration_s + 0.6
+    assert api.calls.count("post_assessment") == 1
+
+
+# ---- re-identification off the frame loop (2026-10-19) ------------------------
+
+@pytest.fixture
+def worker(m):
+    """``worker(factory)``: a real RecognitionWorker process, started and ready."""
+    from modules.recognition_worker import RecognitionWorker
+    made = []
+
+    def make(factory):
+        w = RecognitionWorker(factory)
+        w.start()
+        made.append(w)
+        deadline = time.monotonic() + 60.0
+        while not w.ready and not w.failed and time.monotonic() < deadline:
+            w.poll()
+            time.sleep(0.05)
+        assert w.ready, "worker started"
+        m._recognition = w
+        return w
+    yield make
+    for w in made:
+        w.close()
+
+
+GAPS = {}
+
+
+def test_reidentification_never_blocks_the_frame_loop(m, rig, hp, ign, known_driver, transitions,
+                                                      runs, monkeypatch, worker):
+    """A 1 s identify() (the Pi's cost) in the worker: frames keep coming, READY holds."""
+    from fakes import SlowRecognizerFactory
+    monkeypatch.setattr(m.config, "PREDRIVE_REIDENTIFY_S", 0.2)   # back-to-back attempts
+    w = worker(SlowRecognizerFactory(cost=1.0))
+    monkeypatch.setattr(m, "show_frame", Operator(m, (READY, 5.0, m.KEY_QUIT)))
+    api = FakeAPI()
+    am = rig(api, ign)
+    with pytest.raises(m.QuitRequested):
+        m.run_predrive_assessment(api, FakeExtractor(), FakeRecognizer(0.0), am, hp, ign,
+                                  m.LoopRate())
+    gap = runs[0].max_frame_gap_s
+    GAPS["worker"] = gap
+    assert w.calls >= 4 and w.max_call_s >= 1.0, "several 1 s identifications ran"
+    assert gap < m.config.MAX_FRAME_GAP_S, f"frame loop paused {gap:.3f}s"
+    assert states(transitions).count(READY) == 1, "same driver: READY never dropped"
+    print(f"\nworst frame gap, re-identification in the worker: {gap * 1000:.0f} ms "
+          f"({w.calls} calls, longest {w.max_call_s:.2f}s)")
+
+
+def test_inline_reidentification_blocks_the_frame_loop(m, rig, hp, ign, known_driver, runs,
+                                                       monkeypatch):
+    """The fallback (and the old behaviour), for comparison: each call stalls the loop."""
+    monkeypatch.setattr(m.config, "PREDRIVE_REIDENTIFY_S", 0.2)
+    monkeypatch.setattr(m, "show_frame", Operator(m, (READY, 3.0, m.KEY_QUIT)))
+    api = FakeAPI()
+    am = rig(api, ign)
+    with pytest.raises(m.QuitRequested):
+        m.run_predrive_assessment(api, FakeExtractor(), FakeRecognizer(1.0), am, hp, ign,
+                                  m.LoopRate())
+    GAPS["inline"] = runs[0].max_frame_gap_s
+    assert runs[0].max_frame_gap_s >= 1.0
+    print(f"\nworst frame gap, re-identification inline: "
+          f"{runs[0].max_frame_gap_s * 1000:.0f} ms")
+
+
+def test_driver_change_through_the_worker(m, rig, hp, ign, known_driver, transitions, runs,
+                                          monkeypatch, worker, caplog):
+    from fakes import SlowRecognizerFactory
+    monkeypatch.setattr(m.config, "PREDRIVE_REIDENTIFY_S", 0.3)
+    worker(SlowRecognizerFactory(cost=0.3, same=2, then=7))
+    monkeypatch.setattr(m, "show_frame", Operator(m, timeout_s=40.0))
+    api = FakeAPI()
+    am = rig(api, ign)
+    caplog.set_level("INFO", logger="fatigue")
+    released = m.run_predrive_assessment(api, FakeExtractor(), FakeRecognizer(0.0), am, hp, ign,
+                                         m.LoopRate())
+    assert released is False and am.relay_locked
+    seq = [(s, locked) for s, _note, locked, _t in transitions]
+    i = seq.index((READY, False))
+    assert seq[i + 1] == (ASSESSING, True)
+    assert "DRIVER CHANGED from 6 to 7" in caplog.text
+    assert runs[0].max_frame_gap_s < m.config.MAX_FRAME_GAP_S
+
+
+def test_driver_check_discards_results_from_before_a_face_loss(m):
+    same = {"driver_id": 6, "name": "Test Driver", "confidence": 0.6}
+    c = m.DriverCheck(6, interval_s=10.0, matches_required=3)
+    before = c.generation
+    c.face_lost(2.5)
+    assert not c.confirmed
+    assert c.observe(same, 0.0, before) is None and not c.confirmed, "stale: ignored"
+    assert c.observe(same, 0.0, c.generation) is None and c.confirmed
+
+
+def test_a_broken_worker_reports_failure(m):
+    """A worker that cannot start fails cleanly; the loop then uses InlineRecognition."""
+    from fakes import BrokenRecognizerFactory
+    from modules.recognition_worker import RecognitionWorker
+    w = RecognitionWorker(BrokenRecognizerFactory())
+    w.start()
+    deadline = time.monotonic() + 60.0
+    while not w.failed and time.monotonic() < deadline:
+        w.poll()
+        time.sleep(0.05)
+    try:
+        assert w.failed and not w.ready
+        assert w.submit(np.zeros((4, 4, 3), np.uint8), 0) is False
+    finally:
+        w.close()
+
+
+def test_worker_runs_the_real_recognizer():
+    """The production path: KnownFaces -> DriverRecognizer (dlib) in the spawned child."""
+    from modules.recognition_worker import KnownFaces, RecognitionWorker
+    rng = np.random.default_rng(0)
+    w = RecognitionWorker(KnownFaces({1: list(rng.normal(0, 0.1, 128))}, {1: "Nobody"}, 0.5))
+    w.start()
+    try:
+        deadline = time.monotonic() + 60.0
+        while not w.ready and not w.failed and time.monotonic() < deadline:
+            w.poll()
+            time.sleep(0.05)
+        assert w.ready, "face_recognition loaded in the worker"
+        assert w.submit(np.zeros((480, 640, 3), np.uint8), "tag")
+        result = None
+        while result is None and time.monotonic() < deadline:
+            result = w.poll()
+            time.sleep(0.02)
+        assert result is not None
+        tag, match, faces, seconds = result
+        assert tag == "tag" and match is None and faces == 0, "blank frame: no face"
+    finally:
+        w.close()

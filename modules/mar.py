@@ -262,8 +262,8 @@ class YawnDetector:
         Args:
             mar: Raw MAR for the current frame.
             threshold: The driver's calibrated yawn (entry) threshold.
-            timestamp: Frame time in seconds (``time.time()`` style).
-                Defaults to the wall clock; pass explicitly for deterministic
+            timestamp: Frame time in seconds (``time.monotonic()``).
+                Defaults to the monotonic clock; pass explicitly for deterministic
                 tests or video replay.
             release_threshold: MAR below which an opening ends. Defaults to
                 ``threshold * YAWN_MAR_RELEASE_RATIO / YAWN_MAR_RATIO``, i.e.
@@ -275,7 +275,7 @@ class YawnDetector:
             yawn is *confirmed* (``duration_ms`` is the opening so far,
             i.e. ≈ ``min_duration``), otherwise ``None``.
         """
-        now = time.time() if timestamp is None else timestamp
+        now = time.monotonic() if timestamp is None else timestamp
         self._last_t = now
         if release_threshold is None:
             release_threshold = threshold * YAWN_MAR_RELEASE_RATIO / YAWN_MAR_RATIO
@@ -331,14 +331,14 @@ class YawnDetector:
         Seconds the current opening has lasted (see :meth:`update`).
 
         Args:
-            current_time: Reference "now". Defaults to ``time.time()``.
+            current_time: Reference "now". Defaults to ``time.monotonic()``.
 
         Returns:
             ``0.0`` if the mouth is closed.
         """
         if not self.mouth_open:
             return 0.0
-        now = time.time() if current_time is None else current_time
+        now = time.monotonic() if current_time is None else current_time
         return float(now - self.open_time)
 
     def get_yawn_count(self, window_seconds: Optional[float] = None,
@@ -350,14 +350,14 @@ class YawnDetector:
             window_seconds: Only count yawns confirmed within this many
                 seconds of ``current_time``; ``None`` counts all since
                 ``reset()``.
-            current_time: Reference "now". Defaults to ``time.time()``.
+            current_time: Reference "now". Defaults to ``time.monotonic()``.
 
         Returns:
             The yawn count.
         """
         if window_seconds is None:
             return len(self.yawn_timestamps)
-        now = time.time() if current_time is None else current_time
+        now = time.monotonic() if current_time is None else current_time
         cutoff = now - window_seconds
         return sum(1 for t in self.yawn_timestamps if t >= cutoff)
 
@@ -366,7 +366,7 @@ class YawnDetector:
         Snapshot for the overlay.
 
         Args:
-            current_time: Reference "now". Defaults to ``time.time()``.
+            current_time: Reference "now". Defaults to ``time.monotonic()``.
 
         Returns:
             ``{"state": "closed"|"open"|"yawning", "open_s": float,

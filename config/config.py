@@ -220,7 +220,9 @@ MICROSLEEP_REQUIRES_WARNING: Final[bool] = False
 
 # A gap longer than this between two processed frames (a loop stall, e.g.
 # face recognition) is unknown time: blink and microsleep closures in
-# progress are abandoned rather than extended across it.
+# progress are abandoned rather than extended across it. Like every duration
+# (2026-10-19) it is measured on time.monotonic(); the wall clock is only
+# recorded (CSV / JSON t_abs, API timestamps, log lines).
 MAX_FRAME_GAP_S: Final[float] = 0.5
 
 # Yawn detection (modules/mar.YawnDetector), multiples of the driver's
@@ -350,13 +352,14 @@ START_CONFIRM_MODE: Final[str] = "touch"
 
 # While eligible (READY_TO_START, or re-assessing after it), the recognised
 # driver is re-identified this often (seconds, measured from the end of the
-# previous attempt) so a change of driver drops READY. Each attempt stalls
-# the loop for ~1 s on the Pi; closures in progress are abandoned across it
-# as for any stall (MAX_FRAME_GAP_S). Not run during the first 30 s, which
-# stay exactly as the fixed assessment saw them. After a face loss longer
-# than NO_FACE_FAULT_S the driver is re-identified on every face frame until
-# confirmed. A different enrolled driver matched PREDRIVE_RECOGNITION_MATCHES
-# times restarts the pre-drive for them.
+# previous attempt) so a change of driver drops READY. Each attempt (~1 s on
+# the Pi) runs in the recognition worker process (modules/recognition_worker.py),
+# so the frame loop never waits for it; only if the worker cannot run does it
+# fall back to the frame loop, where closures are abandoned across the stall
+# as for any other (MAX_FRAME_GAP_S). Not run during the first 30 s. After a
+# face loss longer than NO_FACE_FAULT_S the driver is re-identified as fast as
+# the worker answers until confirmed. A different enrolled driver matched
+# PREDRIVE_RECOGNITION_MATCHES times restarts the pre-drive for them.
 PREDRIVE_REIDENTIFY_S: Final[float] = 10.0
 
 # The verdict is taken on the WORST rolling window of this length (mean FRS

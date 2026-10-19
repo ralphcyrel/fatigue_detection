@@ -235,3 +235,34 @@ class Operator:
 
     def states(self) -> List[Any]:
         return [h["state"] for h in self.history]
+
+
+class SlowRecognizerFactory:
+    """
+    Picklable factory for ``RecognitionWorker`` (runs in the spawned child):
+    a recogniser whose ``identify()`` costs ``cost`` s - the Pi's ~1 s - and
+    matches driver ``driver_id`` for the first ``same`` calls, then ``then``.
+    """
+
+    def __init__(self, cost: float = 1.0, driver_id: int = 6, same: Optional[int] = None,
+                 then: int = 7) -> None:
+        self.cost, self.driver_id, self.same, self.then = cost, driver_id, same, then
+
+    def __call__(self) -> "FakeRecognizer":
+        factory = self
+
+        class Slow(FakeRecognizer):
+            def identify(self, frame):
+                self.calls += 1
+                time.sleep(factory.cost)
+                did = (factory.driver_id if factory.same is None or self.calls <= factory.same
+                       else factory.then)
+                return {"driver_id": did, "name": f"Driver {did}", "confidence": 0.6}
+        return Slow(cost=0.0)
+
+
+class BrokenRecognizerFactory:
+    """A worker factory that fails in the child (no dlib model, say)."""
+
+    def __call__(self):
+        raise RuntimeError("no model in the worker")

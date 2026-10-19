@@ -56,7 +56,7 @@ second counted ~6x one mid-run. The rolling samples are still kept in
 ``perclos_values`` for diagnostics; they are only used as a last-resort
 fallback when the caller never supplied ``eye_closed``.
 
-Progress is measured in wall-clock time rather than frame count so a slow
+Progress is measured in elapsed (monotonic) time rather than frame count so a slow
 frame rate merely reduces the number of samples instead of stretching the
 calibration period. Every time-dependent method accepts an optional
 ``timestamp`` so the module can be driven deterministically in tests or
@@ -479,7 +479,7 @@ class CalibrationManager:
         duration: Calibration length in seconds.
         fps: Expected frame rate (used only to report expected sample count).
         is_calibrating: ``True`` between ``start()`` and completion.
-        start_time: ``time.time()`` at which ``start()`` was called.
+        start_time: ``time.monotonic()`` at which ``start()`` was called.
         ear_values: EAR sample per frame.
         blink_durations: Duration (ms) of each blink completed during calibration.
         microsleep_durations: Closure duration (ms) at the moment each
@@ -515,6 +515,7 @@ class CalibrationManager:
 
         self.is_calibrating: bool = False
         self.start_time: float = 0.0
+        self.started_wall: float = 0.0
         self._completed: bool = False
 
         self.ear_values: List[float] = []
@@ -534,7 +535,7 @@ class CalibrationManager:
         Reset all buffers and begin a new calibration period.
 
         Args:
-            timestamp: Start time in seconds. Defaults to ``time.time()``.
+            timestamp: Start time in seconds. Defaults to ``time.monotonic()``.
         """
         self.closed_frames = 0
         self.flagged_frames = 0
@@ -546,7 +547,10 @@ class CalibrationManager:
         self.perclos_values.clear()
         self.mar_values.clear()
 
-        self.start_time = time.time() if timestamp is None else timestamp
+        self.start_time = time.monotonic() if timestamp is None else timestamp
+        # Wall clock for the record (file name, started_at, t_abs) only;
+        # every duration is measured on the monotonic timestamps above.
+        self.started_wall = time.time()
         self.is_calibrating = True
         self._completed = False
 
@@ -573,7 +577,7 @@ class CalibrationManager:
                 diagnostics; the baseline is derived from the blink count).
             perclos: Current rolling PERCLOS percentage (kept for
                 diagnostics; the baseline is counted from ``eye_closed``).
-            timestamp: Frame time in seconds. Defaults to ``time.time()``.
+            timestamp: Frame time in seconds. Defaults to ``time.monotonic()``.
             mar: Raw MAR for this frame, or ``None`` if the caller does not
                 track the mouth (then no MAR baseline is produced).
             eye_closed: Whether this frame counted as closed (``ear <
@@ -602,7 +606,7 @@ class CalibrationManager:
         if not self.is_calibrating and not self._completed:
             raise RuntimeError("CalibrationManager.update() called before start()")
 
-        now = time.time() if timestamp is None else timestamp
+        now = time.monotonic() if timestamp is None else timestamp
 
         # Keep collecting only while the window is open; frames that arrive
         # after completion are ignored so late samples don't skew baselines.
@@ -637,7 +641,7 @@ class CalibrationManager:
                 self.closed_frames += int(bool(eye_closed))
             self.samples.append({
                 "t_rel": now - self.start_time,
-                "t_abs": now,
+                "t_abs": time.time(),
                 "ear": float(ear),
                 "threshold": None if threshold is None else float(threshold),
                 "eye_closed": eye_closed,
@@ -826,7 +830,7 @@ class CalibrationManager:
             Path of the CSV file.
         """
         directory.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.start_time))
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.started_wall))
         stem = f"{device_id}_{driver_id if driver_id is not None else 'unknown'}_{stamp}"
         csv_path = directory / f"{stem}.csv"
         with csv_path.open("w", newline="", encoding="utf-8") as fh:
@@ -837,7 +841,7 @@ class CalibrationManager:
         summary: Dict[str, Any] = {
             "device_id": device_id,
             "driver_id": driver_id,
-            "started_at": self.start_time,
+            "started_at": self.started_wall,
             "csv": csv_path.name,
             "raw": self.raw_summary(),
             "baselines": baselines,
@@ -855,7 +859,7 @@ class CalibrationManager:
         Fraction of the calibration period that has elapsed.
 
         Args:
-            timestamp: Reference "now" in seconds. Defaults to ``time.time()``.
+            timestamp: Reference "now" in seconds. Defaults to ``time.monotonic()``.
 
         Returns:
             ``0.0`` before ``start()``; otherwise ``elapsed / duration``
@@ -865,7 +869,7 @@ class CalibrationManager:
             return 0.0
         if self.duration <= 0:
             return 1.0
-        now = time.time() if timestamp is None else timestamp
+        now = time.monotonic() if timestamp is None else timestamp
         elapsed = now - self.start_time
         return float(min(max(elapsed / self.duration, 0.0), 1.0))
 
@@ -874,7 +878,7 @@ class CalibrationManager:
         Whether the calibration duration has been reached.
 
         Args:
-            timestamp: Reference "now" in seconds. Defaults to ``time.time()``.
+            timestamp: Reference "now" in seconds. Defaults to ``time.monotonic()``.
 
         Returns:
             ``True`` once ``duration`` seconds have elapsed since ``start()``.

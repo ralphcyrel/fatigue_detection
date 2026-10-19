@@ -60,6 +60,13 @@ enrolled driver matched 3 times by the re-identification every
 `PREDRIVE_REIDENTIFY_S`, or after a face loss) restarts pre-drive for the new
 driver.
 
+Every duration, timeout and window (settling, the 30 s minimum, the rolling
+window, `NO_FACE_FAULT_S`, `MAX_FRAME_GAP_S`, escalation, READY / confirmation
+timing) is measured on `time.monotonic()`; the wall clock is only recorded
+(`t_abs`, API timestamps, log lines), so an NTP step after a cold boot changes
+nothing. Each pre-drive run logs and records its worst frame gap
+(`max_frame_gap_s`).
+
 The READY_TO_START entries / losses and the start confirmation are logged
 separately (`READY_TO_START at …`, `START CONFIRMED by … - pre-drive duration
 …`) and recorded in the assessment JSON (`timeline`, `first_ready_at`,
@@ -86,6 +93,7 @@ Every assessment writes its full per-frame series to `logs/assessments/<device>_
 | `modules/assessment.py` | Pre-drive scoring: worst-5 s-window aggregate on the first 30 s and on the rolling last 30 s, per-frame CSV/JSON, READY / confirmation timeline. |
 | `modules/phase.py` | `Phase`, `SessionState` and `LockReason` enums. |
 | `modules/start_confirm.py` | Operator requests (BEGIN / END SESSION) and the start confirmation behind `START_CONFIRM_MODE`. |
+| `modules/recognition_worker.py` | Pre-drive re-identification in a separate (spawned) process, so the ~1 s `identify()` never pauses the frame loop (dlib holds the GIL, so a thread would). |
 | `modules/ignition.py` | Pinned phase source (`ForcedIgnition`). The GPIO 25 ignition sense was removed (deferred hardware). |
 | `modules/alert.py` | Drives the GPIO LEDs and buzzer from the alert level, and the **starter-inhibit relay** from the pre-drive verdict only. |
 | `modules/api.py` | HTTP client for the Laravel backend (encodings, thresholds, enrollment, fatigue events, assessments, override requests). |

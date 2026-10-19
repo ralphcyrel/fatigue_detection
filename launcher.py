@@ -505,7 +505,7 @@ class Session:
         proc = self.proc
         if proc is None or proc.poll() is not None:
             return
-        now = time.time()
+        now = time.monotonic()
         if self._stop_requested_at is None:
             self._stop_requested_at = now
             logger.info("Stop requested for %s (pid %s)", self.label, proc.pid)

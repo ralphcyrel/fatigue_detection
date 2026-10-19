@@ -323,8 +323,11 @@ class SettlingWatch:
 
     Typical use, per frame::
 
-        watch.invalid(now)                          # no face / bad landmarks
+        watch.invalid(now_mono)                     # no face / bad landmarks
         event = watch.valid(landmarks, now, now_mono, pose)
+
+    Everything is timed on ``now_mono`` (``time.monotonic()``); ``now``
+    (wall clock) is accepted for symmetry with the pipeline and not used.
         if event: ...fail as microsleep_detected
         if watch.settled(now_mono): ...start the assessment
     """
@@ -338,13 +341,13 @@ class SettlingWatch:
         self.restarts = 0
         self._last_valid_mono: Optional[float] = None
 
-    def invalid(self, now: float) -> Optional[Dict[str, object]]:
+    def invalid(self, now_mono: float) -> Optional[Dict[str, object]]:
         """A frame with no face or invalid landmarks: restart, abandon any closure."""
         if self.since is not None:
             self.restarts += 1
         self.since, self._last_valid_mono = None, None
         self.poses.clear()
-        return self.microsleeps.note_no_face(now)
+        return self.microsleeps.note_no_face(now_mono)
 
     def valid(self, landmarks: np.ndarray, now: float, now_mono: float,
               pose: Optional[Dict[str, Any]] = None,
@@ -356,7 +359,7 @@ class SettlingWatch:
         """
         if self._last_valid_mono is not None and \
                 now_mono - self._last_valid_mono > config.MAX_FRAME_GAP_S:
-            self.microsleeps.note_no_face(now)       # stall: unobserved time
+            self.microsleeps.note_no_face(now_mono)  # stall: unobserved time
         self._last_valid_mono = now_mono
         if self.since is None:
             self.since = now_mono
@@ -365,7 +368,7 @@ class SettlingWatch:
         if self.ear_threshold is None:
             return None
         value = _EAR_CALC.compute_average_ear(landmarks) if ear is None else ear
-        return self.microsleeps.update(value, self.ear_threshold, now)
+        return self.microsleeps.update(value, self.ear_threshold, now_mono)
 
     @property
     def closure_in_progress(self) -> bool:
@@ -587,7 +590,7 @@ class NoFacePolicy:
 class FrameMetrics:
     """Everything the pipeline derived from one frame."""
 
-    t: float                       # time.time() of the frame
+    t: float                       # time.time() of the frame - records / API only
     ear: float
     mar: float
     perclos: float                 # percent
@@ -633,6 +636,8 @@ class FrameMetrics:
     # The EAR self-seed gave up (EarSelfSeed.gave_up): no baseline, level
     # FAULT unless a DANGER override is active.
     seed_failed: bool = False
+    # time.monotonic() of the frame: what every duration was measured on.
+    t_mono: float = 0.0
 
     @property
     def frs(self) -> float:
@@ -794,7 +799,7 @@ class MetricsPipeline:
         # time.monotonic() of the last processed frame (stall guard); None
         # after a no-face frame, which has already abandoned every closure.
         self._last_frame_mono: Optional[float] = None
-        # time.time() of the first scored frame: how much of the blink
+        # time.monotonic() of the first scored frame: how much of the blink
         # frequency window has actually been observed.
         self._blink_t0: Optional[float] = None
         # (key, stored value) pairs whose scoring floor was already logged.
@@ -825,8 +830,13 @@ class MetricsPipeline:
         Args:
             landmarks: ``(68, 2)`` dlib landmarks.
             thresholds: The driver's baseline dict (all keys present).
-            now: ``time.time()`` for the frame (blink / yawn timestamps).
-            now_mono: ``time.monotonic()`` for the frame (pose debounce).
+            now: ``time.time()`` for the frame. Recorded in
+                :attr:`FrameMetrics.t` only; nothing is timed on it.
+            now_mono: ``time.monotonic()`` for the frame. Every duration,
+                window and timeout - blink, microsleep, yawn, PERCLOS, head
+                pose, escalation, the stall guard - is measured on it
+                (2026-10-19), so a wall-clock step (NTP sync on a Pi with no
+                RTC) cannot shorten or stretch any of them.
             self_seed: No usable calibration (monitoring only):
                 ``ear_baseline`` / ``ear_threshold`` are taken from
                 :attr:`ear_seed` instead of ``thresholds``, which then need
@@ -838,6 +848,9 @@ class MetricsPipeline:
             A :class:`FrameMetrics`.
         """
         self._frames += 1
+        # From here on ``now`` is the monotonic clock; the wall clock is kept
+        # only for the record (FrameMetrics.t).
+        wall, now = now, now_mono
 
         # Stall guard (2026-10-15): a gap since the last processed frame
         # longer than config.MAX_FRAME_GAP_S is unobserved time. A closure in
@@ -1041,7 +1054,7 @@ class MetricsPipeline:
         no_face_latch, gap_ended = self.no_face.on_face(own_level, now_mono)
 
         metrics = FrameMetrics(
-            t=now, ear=ear, mar=mar, perclos=perclos,
+            t=wall, t_mono=now_mono, ear=ear, mar=mar, perclos=perclos,
             blink_duration_ms=blink_duration_ms, blink_freq=blink_freq,
             ear_norm=ear_norm, bd_norm=bd_norm, bf_norm=bf_norm,
             perclos_norm=perclos_norm, mar_norm=mar_norm, yawn_norm=yawn_norm,
@@ -1080,7 +1093,7 @@ class MetricsPipeline:
         Args:
             ear: Raw EAR for this frame.
             thresholds: The driver's threshold dict.
-            now: ``time.time()`` for the frame.
+            now: ``time.monotonic()`` for the frame.
         """
         # Either may be None while self-seeding (the provisional threshold
         # exists from 2 s, the baseline only once the seed freezes at 5 s).
@@ -1127,10 +1140,11 @@ class MetricsPipeline:
            clearing the overrides in step 1 no longer drops the level.
 
         Args:
-            now: ``time.time()`` for the frame, used to report how long the
-                eyes had been shut. Defaults to the wall clock.
-            now_mono: ``time.monotonic()`` for the frame (policy timing).
-                Defaults to the monotonic clock.
+            now: ``time.time()`` for the frame. Not used for timing (kept for
+                the callers' symmetry with :meth:`process`).
+            now_mono: ``time.monotonic()`` for the frame: the policy timing
+                and how long the eyes had been shut. Defaults to the
+                monotonic clock.
 
         Returns:
             A :class:`NoFaceVerdict`; drive ``verdict.level``.
@@ -1159,7 +1173,7 @@ class MetricsPipeline:
                         " (level latched at DANGER)" if verdict.band == "LATCH" else "")
         self.pose_debounce.reset()
 
-        abandoned = self.microsleep_detector.note_no_face(now)
+        abandoned = self.microsleep_detector.note_no_face(now_mono)
         if abandoned and abandoned["was_microsleeping"]:
             logger.warning(
                 "FACE LOST MID-MICROSLEEP after %.2fs of eye closure - abandoning the "

@@ -118,15 +118,22 @@ class DriverRecognizer:
             # Fall back to a generic label if the API didn't send a name.
             names[driver_id] = str(record.get("name", f"Driver {driver_id}"))
 
-        # Swap in atomically so a frame processed mid-reload never sees a
-        # half-populated cache.
-        self.encodings = encodings
-        self.names = names
-        self._known_ids = list(encodings.keys())
-        self._known_encodings = [encodings[i] for i in self._known_ids]
-
+        self.set_encodings(encodings, names)
         logger.info("Loaded %d driver face encodings", len(self.encodings))
         return len(self.encodings)
+
+    def set_encodings(self, encodings: Dict[int, np.ndarray], names: Dict[int, str]) -> None:
+        """
+        Use these encodings (``driver_id -> (128,) float64``) and names. Also
+        how the recognition worker process (modules/recognition_worker.py)
+        gets the parent's encodings without an API client.
+        """
+        # Swap in atomically so a frame processed mid-reload never sees a
+        # half-populated cache.
+        self.encodings = dict(encodings)
+        self.names = dict(names)
+        self._known_ids = list(self.encodings.keys())
+        self._known_encodings = [self.encodings[i] for i in self._known_ids]
 
     def reload_encodings(self) -> int:
         """

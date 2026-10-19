@@ -96,7 +96,7 @@ class BlinkDetector:
     Attributes:
         frequency_window: Rolling window (seconds) for frequency counting.
         eyes_closed: ``True`` while the eyes are currently below threshold.
-        close_time: ``time.time()`` at which the current closure began.
+        close_time: ``time.monotonic()`` at which the current closure began.
         blink_durations: Durations (ms) of every valid blink this session.
         blink_timestamps: Completion timestamps of every valid blink.
     """
@@ -144,8 +144,8 @@ class BlinkDetector:
         Args:
             ear: Raw EAR for the current frame.
             threshold: The driver's calibrated closure threshold.
-            timestamp: Frame time in seconds (``time.time()`` style). Defaults
-                to the wall clock; pass explicitly for deterministic tests or
+            timestamp: Frame time in seconds (``time.monotonic()``). Defaults
+                to the monotonic clock; pass explicitly for deterministic tests or
                 when replaying recorded video.
 
         Returns:
@@ -158,7 +158,7 @@ class BlinkDetector:
             frame was not observed for the full microsleep duration, so it is
             recorded here as a (very slow) blink rather than lost.
         """
-        now = time.time() if timestamp is None else timestamp
+        now = time.monotonic() if timestamp is None else timestamp
         currently_closed = ear < threshold
 
         if currently_closed:
@@ -211,7 +211,7 @@ class BlinkDetector:
     def recent_count(self, current_time: Optional[float] = None,
                      window_s: float = BLINK_MEAN_WINDOW_S) -> int:
         """Blinks completed in the trailing ``window_s`` (the duration mean's window)."""
-        now = time.time() if current_time is None else current_time
+        now = time.monotonic() if current_time is None else current_time
         return sum(1 for ts in self.blink_timestamps if ts >= now - window_s)
 
     def get_blink_frequency(self, current_time: Optional[float] = None) -> float:
@@ -219,12 +219,12 @@ class BlinkDetector:
         Count blinks that completed within the last ``frequency_window`` s.
 
         Args:
-            current_time: Reference "now" in seconds. Defaults to wall clock.
+            current_time: Reference "now" in seconds. Defaults to the monotonic clock.
 
         Returns:
             Number of blinks in the window, as a float (blinks per window).
         """
-        now = time.time() if current_time is None else current_time
+        now = time.monotonic() if current_time is None else current_time
         window_start = now - self.frequency_window
 
         # Timestamps are appended in order, so a linear scan from the end
@@ -250,7 +250,7 @@ class BlinkDetector:
         range on a single sample.
 
         Args:
-            current_time: Reference "now" in seconds. Defaults to the wall
+            current_time: Reference "now" in seconds. Defaults to the monotonic
                 clock; pass explicitly for deterministic tests or replay.
 
         Returns:
@@ -258,7 +258,7 @@ class BlinkDetector:
         """
         if not self.blink_durations:
             return 0.0
-        now = time.time() if current_time is None else current_time
+        now = time.monotonic() if current_time is None else current_time
         cutoff = now - BLINK_MEAN_WINDOW_S
         # durations and timestamps are appended together in update(), so they
         # stay index-aligned and can be zipped directly.
@@ -398,8 +398,8 @@ class MicrosleepDetector:
         Args:
             ear: Raw EAR for the current frame.
             threshold: The driver's calibrated closure threshold.
-            timestamp: Frame time in seconds (``time.time()`` style). Defaults
-                to the wall clock; pass explicitly for deterministic tests or
+            timestamp: Frame time in seconds (``time.monotonic()``). Defaults
+                to the monotonic clock; pass explicitly for deterministic tests or
                 when replaying recorded video.
 
         Returns:
@@ -415,7 +415,7 @@ class MicrosleepDetector:
             same observed span, so the two detectors still partition every
             closure ≥ :data:`MIN_BLINK_DURATION_MS` into exactly one bucket.
         """
-        now = time.time() if timestamp is None else timestamp
+        now = time.monotonic() if timestamp is None else timestamp
         currently_closed = ear < threshold
 
         # Deepest (lowest) EAR seen since this closure began, reported on the
@@ -459,14 +459,14 @@ class MicrosleepDetector:
         Seconds the eyes have been continuously closed.
 
         Args:
-            current_time: Reference "now". Defaults to ``time.time()``.
+            current_time: Reference "now". Defaults to ``time.monotonic()``.
 
         Returns:
             ``0.0`` if the eyes are open.
         """
         if not self.eyes_closed:
             return 0.0
-        now = time.time() if current_time is None else current_time
+        now = time.monotonic() if current_time is None else current_time
         return float(now - self.close_time)
 
     def get_microsleep_count(
@@ -481,14 +481,14 @@ class MicrosleepDetector:
             window_seconds: Only count microsleeps confirmed within this many
                 seconds of ``current_time``; ``None`` counts all since
                 ``reset()``.
-            current_time: Reference "now". Defaults to ``time.time()``.
+            current_time: Reference "now". Defaults to ``time.monotonic()``.
 
         Returns:
             The microsleep count.
         """
         if window_seconds is None:
             return len(self.microsleep_timestamps)
-        now = time.time() if current_time is None else current_time
+        now = time.monotonic() if current_time is None else current_time
         cutoff = now - window_seconds
         return sum(1 for t in self.microsleep_timestamps if t >= cutoff)
 
@@ -497,7 +497,7 @@ class MicrosleepDetector:
         Snapshot for the overlay.
 
         Args:
-            current_time: Reference "now". Defaults to ``time.time()``.
+            current_time: Reference "now". Defaults to ``time.monotonic()``.
 
         Returns:
             ``{"state": "open"|"closed"|"microsleep", "closed_s": float,
@@ -528,7 +528,7 @@ class MicrosleepDetector:
         ``MetricsPipeline.note_no_face`` clears the head-pose override.
 
         Args:
-            current_time: Reference "now". Defaults to ``time.time()``.
+            current_time: Reference "now". Defaults to ``time.monotonic()``.
 
         Returns:
             ``None`` if the eyes were already open and nothing was in

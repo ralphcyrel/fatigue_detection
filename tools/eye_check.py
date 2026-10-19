@@ -108,9 +108,9 @@ class Session:
 
     def countdown(self, text: str) -> None:
         print(f"\n>>> {text}")
-        start = time.time()
+        start = time.monotonic()
         announced = None
-        while (left := LEAD_S - (time.time() - start)) > 0:
+        while (left := LEAD_S - (time.monotonic() - start)) > 0:
             if announced != int(left) + 1:
                 announced = int(left) + 1
                 print(f"    {announced}...", flush=True)
@@ -207,33 +207,33 @@ def main() -> int:
         # ---- open ---------------------------------------------------------
         s.countdown("EYES OPEN - look at the camera normally")
         print(f"    capturing {args.open_s:.0f}s eyes open...")
-        start, n = time.time(), 0
-        while time.time() - start < args.open_s:
+        start, n = time.monotonic(), 0
+        while time.monotonic() - start < args.open_s:
             frame, lm = s.frame()
             if frame is None:
                 continue
             if lm is None:
                 s.show(frame, "NO FACE")
                 continue
-            ear = record("open", time.time() - start, frame, lm, n)
+            ear = record("open", time.monotonic() - start, frame, lm, n)
             n += 1
             s.show(frame, f"EYES OPEN  EAR {ear:.3f}")
 
         # ---- closed (enrollment timing) -----------------------------------
         s.countdown("CLOSE YOUR EYES at zero and keep them shut until told to open")
         cap = ClosedEyeCapture()
-        cap.start(time.time())
+        cap.start(time.monotonic())
         print(f"\a    CLOSE NOW - capturing {cap.duration_s:.0f}s "
               f"(first {cap.settle_s:.1f}s discarded)", flush=True)
         n = 0
-        while not cap.done(time.time()):
+        while not cap.done(time.monotonic()):
             frame, lm = s.frame()
             if frame is None:
                 continue
             if lm is None:
                 s.show(frame, "NO FACE - keep facing the camera")
                 continue
-            now = time.time()
+            now = time.monotonic()
             ear = eye_ears(s.ear, lm)[0]
             cap.update(ear, now)
             if cap.elapsed(now) >= cap.settle_s:   # snapshots from the measured part only

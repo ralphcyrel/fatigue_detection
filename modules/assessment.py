@@ -76,6 +76,16 @@ goes on until the driver confirms the start (or the session ends), and:
 * :meth:`mark` records the READY_TO_START entries / losses, the start
   confirmation and the end of the run in ``timeline``, which the JSON
   summary carries for reporting the real pre-drive duration of each trial.
+
+Clocks (2026-10-19)
+-------------------
+Every ``now`` here is ``time.monotonic()``: the 30 s minimum, the rolling
+window, the worst-window scan and every duration in the timeline are
+measured on it, so a wall-clock step (an NTP sync after a cold boot - the Pi
+has no RTC) cannot end the assessment early or hold it open. The wall clock
+is only *recorded*: ``t_abs`` of each sample (the frame's ``FrameMetrics.t``),
+``started_at`` / ``ended_at`` (sent to the backend), the timeline's ``t_abs``
+and the file names.
 """
 
 import bisect
@@ -152,9 +162,15 @@ class PredriveAssessment:
         self.pass_threshold = float(pass_threshold)
         self.min_valid_fraction = float(min_valid_fraction)
 
+        # time.monotonic() of start() / of completion (0 = not yet), and the
+        # wall clock at the same two moments, for the record.
         self.start_time: float = 0.0
         self.end_time: float = 0.0
+        self.started_wall: float = 0.0
+        self.ended_wall: float = 0.0
         self.samples: List[Dict[str, Any]] = []
+        # time.monotonic() of each entry of ``samples``.
+        self._sample_mono: List[float] = []
         # Frames not scored (no face, invalid landmarks), in total and by reason.
         self.no_face_frames: int = 0
         self.invalid_reasons: Dict[str, int] = {}
@@ -163,8 +179,10 @@ class PredriveAssessment:
         # .provenance()); set by the caller, echoed in result() so it lands in
         # the JSON summary and POST /assessments.
         self.calibration: Dict[str, Any] = {}
-        # time.time() the pre-drive cycle began (recognition), set by the
-        # caller: the start of the trial's pre-drive duration.
+        # When the pre-drive cycle began (recognition), set by the caller:
+        # the start of the trial's pre-drive duration. Monotonic for the
+        # duration, wall clock for the record.
+        self.predrive_started_mono: Optional[float] = None
         self.predrive_started_at: Optional[float] = None
         self.timeline: List[Dict[str, Any]] = []
         self._reset_rolling()
@@ -184,15 +202,26 @@ class PredriveAssessment:
         self._next_open = 0
         self._csv_fh = None
         self._csv_writer = None
+        # Frame loop health: the longest gap between two frames handed to
+        # add() / add_invalid(), on the monotonic clock.
+        self.max_frame_gap_s = 0.0
+        self._last_frame_t: Optional[float] = None
+
+    def _frame_at(self, t: float) -> None:
+        if self._last_frame_t is not None:
+            self.max_frame_gap_s = max(self.max_frame_gap_s, t - self._last_frame_t)
+        self._last_frame_t = t
 
     # ------------------------------------------------------------------
 
     def start(self, now: Optional[float] = None) -> None:
-        """Reset and open the window at ``now`` (``time.time()`` style)."""
+        """Reset and open the window at ``now`` (``time.monotonic()``)."""
         self.close_stream()
-        self.start_time = time.time() if now is None else now
-        self.end_time = 0.0
+        self.start_time = time.monotonic() if now is None else now
+        self.started_wall = time.time()
+        self.end_time = self.ended_wall = 0.0
         self.samples = []
+        self._sample_mono = []
         self.no_face_frames = 0
         self.invalid_reasons = {}
         self.timeline = []
@@ -204,12 +233,12 @@ class PredriveAssessment:
         """Fraction of the window elapsed, clamped to ``[0, 1]``."""
         if not self._started or self.duration_s <= 0:
             return 1.0 if self._started else 0.0
-        t = time.time() if now is None else now
+        t = time.monotonic() if now is None else now
         return float(min(max((t - self.start_time) / self.duration_s, 0.0), 1.0))
 
     def seconds_remaining(self, now: Optional[float] = None) -> float:
         """Seconds until the window closes (0 once complete)."""
-        t = time.time() if now is None else now
+        t = time.monotonic() if now is None else now
         return max(0.0, self.duration_s - (t - self.start_time))
 
     def is_complete(self, now: Optional[float] = None) -> bool:
@@ -218,7 +247,8 @@ class PredriveAssessment:
             return False
         done = self.progress(now) >= 1.0
         if done and self.end_time == 0.0:
-            self.end_time = time.time() if now is None else now
+            self.end_time = time.monotonic() if now is None else now
+            self.ended_wall = time.time()
         return done
 
     def add(self, m: FrameMetrics, now: Optional[float] = None) -> None:
@@ -227,11 +257,12 @@ class PredriveAssessment:
 
         Args:
             m: Pipeline output for the frame.
-            now: Frame time (``time.time()``); defaults to ``m.t``.
+            now: Frame time (``time.monotonic()``); defaults to ``m.t_mono``.
+                The sample's ``t_abs`` is the frame's wall clock, ``m.t``.
         """
         if not self._started:
             raise RuntimeError("PredriveAssessment.add() called before start()")
-        t = m.t if now is None else now
+        t = m.t_mono if now is None else now
         frs_raw = m.frs
         # DANGER held by the FRS band alone scores the FRS itself; DANGER from
         # a microsleep or an escalated head-pose alert scores at least the
@@ -242,7 +273,7 @@ class PredriveAssessment:
         pose = m.pose or {}
         sample = {
             "t_rel": round(t - self.start_time, 3),
-            "t_abs": t,
+            "t_abs": m.t,
             "ear": m.ear, "mar": m.mar, "perclos": m.perclos,
             "blink_duration_ms": m.blink_duration_ms, "blink_freq": m.blink_freq,
             "ear_norm": m.ear_norm, "ear_norm_frs": m.ear_norm_frs,
@@ -266,18 +297,23 @@ class PredriveAssessment:
         }
         if not self._frozen:
             self.samples.append(sample)
+            self._sample_mono.append(t)
         elif self._csv_writer is not None:
             self._csv_writer.writerow({k: sample.get(k) for k in SAMPLE_FIELDS})
         self._push(t, frs_scored, sample["microsleep_confirmed"])
+        self._frame_at(t)
 
     def add_invalid(self, reason: str = "no_face", now: Optional[float] = None) -> None:
         """
         Record a frame that could not be measured - no face, or invalid
         landmarks (``reason`` from ``pipeline.landmark_problem``). Counted,
         never scored. Counts in :meth:`result` stop at :meth:`freeze`; the
-        rolling window counts it by ``now`` (the wall clock if omitted).
+        rolling window counts it by ``now`` (``time.monotonic()``; the clock
+        if omitted).
         """
-        self._invalid_t.append(time.time() if now is None else now)
+        t = time.monotonic() if now is None else now
+        self._invalid_t.append(t)
+        self._frame_at(t)
         if self._frozen:
             return
         self.no_face_frames += 1
@@ -292,14 +328,18 @@ class PredriveAssessment:
     def worst_window_mean(self) -> float:
         """
         Maximum over all windows of length ``worst_window_s`` of the mean
-        ``frs_scored``, using sample timestamps (the loop rate varies).
+        ``frs_scored``, using sample timestamps (the loop rate varies) - the
+        monotonic ones recorded by :meth:`add`, or ``t_abs`` for a sample list
+        built elsewhere (a replay from a CSV).
 
         Returns:
             ``0.0`` if there are no samples.
         """
         if not self.samples:
             return 0.0
-        t = np.array([s["t_abs"] for s in self.samples], dtype=float)
+        times = (self._sample_mono if len(self._sample_mono) == len(self.samples)
+                 else [s["t_abs"] for s in self.samples])
+        t = np.array(times, dtype=float)
         f = np.array([s["frs_scored"] for s in self.samples], dtype=float)
         if len(t) == 1 or t[-1] - t[0] <= self.worst_window_s:
             return round(float(f.mean()), 6)
@@ -346,8 +386,8 @@ class PredriveAssessment:
                 del times[:k]
 
     def elapsed(self, now: Optional[float] = None) -> float:
-        """Seconds since :meth:`start`."""
-        return (time.time() if now is None else now) - self.start_time
+        """Seconds since :meth:`start` (``now``: ``time.monotonic()``)."""
+        return (time.monotonic() if now is None else now) - self.start_time
 
     def window_verdict(self, now: Optional[float] = None) -> Dict[str, Any]:
         """
@@ -363,7 +403,7 @@ class PredriveAssessment:
             ``worst_window_mean``, ``valid_fraction``, ``microsleeps``,
             ``n_samples`` and ``n_invalid`` in the window.
         """
-        now = time.time() if now is None else now
+        now = time.monotonic() if now is None else now
         cutoff = now - self.duration_s
         self._prune(cutoff)
         s = bisect.bisect_left(self._t, cutoff)
@@ -418,11 +458,12 @@ class PredriveAssessment:
     def mark(self, event: str, now: Optional[float] = None, **detail: Any) -> None:
         """
         Record a pre-drive milestone in ``timeline`` (``ready_entered``,
-        ``ready_lost``, ``confirmed``, ``ended``) and refresh the JSON
-        summary if it has been written.
+        ``ready_lost``, ``confirmed``, ``ended``) at ``now``
+        (``time.monotonic()``) and refresh the JSON summary if it has been
+        written. ``t_abs`` is the wall clock, for the record.
         """
-        t = time.time() if now is None else now
-        self.timeline.append({"event": event, "t_abs": t,
+        t = time.monotonic() if now is None else now
+        self.timeline.append({"event": event, "t_mono": t, "t_abs": time.time(),
                               "t_rel": round(t - self.start_time, 3), **detail})
         self._write_summary()
 
@@ -466,8 +507,8 @@ class PredriveAssessment:
         void = self.is_void()
         microsleeps = self._count_microsleeps()
         return {
-            "started_at": self.start_time,
-            "ended_at": self.end_time or self.start_time + self.duration_s,
+            "started_at": self.started_wall,
+            "ended_at": self.ended_wall or self.started_wall + self.duration_s,
             "duration_s": self.duration_s,
             "n_samples": len(self.samples),
             "n_no_face": self.no_face_frames,
@@ -510,21 +551,30 @@ class PredriveAssessment:
         (recognition; else the assessment) to the start confirmation, and is
         ``None`` if the start was never confirmed.
         """
-        def first(event: str) -> Optional[float]:
-            return next((e["t_abs"] for e in self.timeline if e["event"] == event), None)
+        def first(event: str) -> Optional[Dict[str, Any]]:
+            return next((e for e in self.timeline if e["event"] == event), None)
 
-        began = self.predrive_started_at or self.start_time
+        def wall(e: Optional[Dict[str, Any]]) -> Optional[float]:
+            return None if e is None else e["t_abs"]
+
+        # Durations on the monotonic clock; the *_at fields are wall clock.
+        began = (self.start_time if self.predrive_started_mono is None
+                 else self.predrive_started_mono)
         ready, confirmed = first("ready_entered"), first("confirmed")
         ended = next((e for e in reversed(self.timeline) if e["event"] == "ended"), None)
         return {
             "min_duration_s": self.duration_s,
-            "predrive_started_at": began,
-            "first_ready_at": ready,
-            "confirmed_at": confirmed,
-            "time_to_first_ready_s": None if ready is None else round(ready - began, 3),
+            "predrive_started_at": self.predrive_started_at or self.started_wall,
+            "first_ready_at": wall(ready),
+            "confirmed_at": wall(confirmed),
+            "time_to_first_ready_s": (None if ready is None
+                                      else round(ready["t_mono"] - began, 3)),
             "ready_entries": sum(1 for e in self.timeline if e["event"] == "ready_entered"),
-            "predrive_duration_s": None if confirmed is None else round(confirmed - began, 3),
+            "predrive_duration_s": (None if confirmed is None
+                                    else round(confirmed["t_mono"] - began, 3)),
             "end_reason": ended.get("reason") if ended else None,
+            # Longest wait between two frames of this run (monotonic).
+            "max_frame_gap_s": round(self.max_frame_gap_s, 3),
             "timeline": [dict(e) for e in self.timeline],
         }
 
@@ -545,7 +595,7 @@ class PredriveAssessment:
             Path of the CSV file.
         """
         directory.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.start_time))
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.started_wall))
         stem = f"{device_id}_{driver_id if driver_id is not None else 'unknown'}_{stamp}"
         csv_path = directory / f"{stem}.csv"
         with csv_path.open("w", newline="", encoding="utf-8") as fh:
