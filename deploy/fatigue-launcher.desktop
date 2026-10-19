@@ -1,0 +1,13 @@
+[Desktop Entry]
+# XDG autostart entry for the touchscreen launcher. Not used from here:
+# deploy/install_autostart.sh copies it into ~/.config/autostart/ with
+# @PROJECT_DIR@ replaced by this checkout's absolute path (a .desktop Exec=
+# line cannot find a path relative to itself).
+Type=Application
+Version=1.0
+Name=Fatigue Detection Launcher
+Comment=Touchscreen launcher for the driver fatigue detection unit (deploy/README.md)
+Exec=/bin/bash "@PROJECT_DIR@/deploy/launcher_autostart.sh"
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

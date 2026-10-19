@@ -7,13 +7,20 @@ flags - nothing from ``main`` is imported, so the CLI stays the single
 source of truth for how a session runs::
 
     Enroll driver             -> main.py --enroll --driver-id N
-    Pre-drive -> monitoring   -> main.py --sequence   (pass / approved override
-                                 continues into monitoring, no ignition input)
+    Pre-drive -> monitoring   -> main.py --sequence   (no ignition input: a pass /
+                                 approved override releases the starter, BEGIN
+                                 MONITORING then starts monitoring)
     Monitoring only (test)    -> main.py --force-phase monitoring
 
 While a session runs, a slim always-on-top strip along the bottom of the
 screen carries a STOP button (sends SIGINT, which ``main.py`` already
-handles as Ctrl-C and cleans up after). Above it, ``main.py`` shows its
+handles as Ctrl-C and cleans up after). Pre-drive / monitoring sessions also
+get the session controls (2026-10-19), driven by the state ``main.py``
+publishes to ``logs/session_state.json`` (``--state-file``): BEGIN
+MONITORING only in READY_TO_START, START NEXT DRIVER only in IDLE (both
+SIGUSR1), and END SESSION with a confirmation tap (SIGUSR2) - ``main.py``
+then inhibits the starter, stops the alerts and waits in IDLE for the next
+driver without exiting. Above the strip, ``main.py`` shows its
 fullscreen screen: the data screen - no camera image (group decision,
 2026-10-05) - during pre-drive and monitoring, and during enrollment the
 enrollment screen with a live mirror view so the driver can position
@@ -57,7 +64,7 @@ the API settings are missing, which is what a desktop icon that sources
 ``~/.bashrc`` non-interactively produces (see deploy/start_launcher.sh).
 
 Tkinter only - ships with Python (``python3-tk`` on Raspberry Pi OS).
-See ``deploy/fatigue-launcher.service`` to start it on boot.
+See ``deploy/README.md`` (``deploy/install_autostart.sh``) to start it on boot.
 """
 
 import argparse
@@ -145,6 +152,36 @@ CHILD_POLL_MS = 500          # how often the running screen checks the child
 STOP_GRACE_S = 10.0          # SIGINT -> terminate() escalation
 SESSION_LOG = config.LOGS_DIR / "session.log"   # child stdout/stderr
 ENROLL_RESULT = config.LOGS_DIR / "enroll_result.json"   # main.py --result-file
+SESSION_STATE = config.LOGS_DIR / "session_state.json"   # main.py --state-file
+
+# Strip controls for pre-drive / monitoring sessions (2026-10-19). main.py's
+# window takes no touch input, so these live on the strip and reach the child
+# as signals: BEGIN (SIGUSR1) and END SESSION (SIGUSR2). The primary button
+# is shown only in the state it acts in - BEGIN MONITORING only while the
+# child reports READY_TO_START, START NEXT DRIVER only in IDLE - and main.py
+# ignores a request made in any other state. END SESSION takes a second tap
+# on YES, which sits where STOP was (CANCEL takes END SESSION's place, so a
+# double tap cancels), within END_CONFIRM_S.
+LABEL_BEGIN = "▶  BEGIN MONITORING"
+LABEL_NEXT_DRIVER = "▶  START NEXT DRIVER"
+LABEL_END = "END SESSION"
+LABEL_END_CANCEL = "CANCEL"
+LABEL_END_YES = "YES, END"
+LABEL_STOP = "■  STOP"
+END_PROMPT = "End this session?\nStarter inhibited, alerts off."
+END_CONFIRM_S = 6.0
+# main.py's session states (modules.phase.SessionState values) -> strip text.
+STATE_TEXT: Dict[Optional[str], str] = {
+    None: "starting…",
+    "IDLE": "waiting for the next driver",
+    "IDENTIFYING": "identifying driver…",
+    "SETTLING": "hold still…",
+    "ASSESSING": "assessing…",
+    "READY_TO_START": "READY - start the vehicle",
+    "LOCKED": "starter LOCKED",
+    "MONITORING": "monitoring…",
+}
+REQUEST_SIGNALS: Dict[str, str] = {"begin": "SIGUSR1", "end_session": "SIGUSR2"}
 
 # Colours (plain tk, works without ttk themes on the Pi).
 BG = "#1e1e1e"
@@ -153,6 +190,8 @@ BTN = "#2f3b4a"
 BTN_ACTIVE = "#3f4f63"
 BTN_PRIMARY = "#2b6cb0"
 BTN_STOP = "#b02b2b"
+BTN_GO = "#2e8b3e"           # BEGIN MONITORING / START NEXT DRIVER
+BTN_END = "#9c4a12"          # END SESSION (and its YES)
 BTN_QUIT = "#4a4a4a"
 BTN_ASSIGNED = "#2b7a4b"     # driver assigned to this unit
 ONLINE = "#2e9e5b"
@@ -167,7 +206,9 @@ RESULT_BAD = "#c0392b"
 # a driver id from the picker).
 #
 # "Pre-drive" is the whole session: a pass (or an approved override) releases
-# the starter and continues into monitoring by itself. "Monitoring only" is a
+# the starter (READY_TO_START) and BEGIN MONITORING on the strip continues
+# into monitoring; END SESSION returns it to IDLE for the next driver.
+# "Monitoring only" is a
 # test entry: it skips the 30 s assessment, and it starts with the starter
 # INHIBITED (nothing in monitoring can release it) - use it to exercise
 # monitoring alone, e.g. with --profile-loop, or for a driver who cannot pass.
@@ -404,6 +445,14 @@ class Session:
         self._log_file = None
         self._log_offset = 0
         self._stop_requested_at: Optional[float] = None
+        # Last state read from --state-file, and that file's mtime.
+        self._state: Optional[str] = None
+        self._state_mtime: Optional[float] = None
+
+    @property
+    def controls(self) -> bool:
+        """Pre-drive / monitoring session: state file, BEGIN and END SESSION."""
+        return not self.enroll
 
     def start(self) -> None:
         cmd = [child_python(), str(config.BASE_DIR / "main.py"), *self.flags]
@@ -411,6 +460,12 @@ class Session:
             cmd += ["--result-file", str(ENROLL_RESULT)]
             try:
                 ENROLL_RESULT.unlink()      # never show a previous run's result
+            except FileNotFoundError:
+                pass
+        else:
+            cmd += ["--state-file", str(SESSION_STATE)]
+            try:
+                SESSION_STATE.unlink()      # never act on a previous child's state
             except FileNotFoundError:
                 pass
         # The child gets this process's environment, explicitly: the API
@@ -466,6 +521,47 @@ class Session:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+    def child_state(self) -> Optional[str]:
+        """
+        The session state main.py last published (``SessionState`` value), or
+        ``None`` before it has published one. Ignores a file written by any
+        other process. Re-read only when the file changes.
+        """
+        if not self.controls or self.proc is None:
+            return None
+        try:
+            mtime = SESSION_STATE.stat().st_mtime
+        except OSError:
+            return self._state
+        if mtime != self._state_mtime:
+            self._state_mtime = mtime
+            try:
+                with open(SESSION_STATE, encoding="utf-8") as fh:
+                    body = json.load(fh)
+                if isinstance(body, dict) and body.get("pid") == self.proc.pid:
+                    self._state = str(body.get("state"))
+            except (OSError, ValueError):
+                self._state_mtime = None    # half-replaced: read again next poll
+        return self._state
+
+    def request(self, kind: str) -> bool:
+        """
+        Send main.py an operator request (``"begin"`` / ``"end_session"``) as
+        its signal. Only while it runs; main.py decides whether it applies.
+        """
+        proc = self.proc
+        signum = getattr(signal, REQUEST_SIGNALS[kind], None)
+        if proc is None or proc.poll() is not None:
+            return False
+        if signum is None:
+            logger.warning("Cannot send %s to %s: no %s on this platform", kind, self.label,
+                           REQUEST_SIGNALS[kind])
+            return False
+        logger.info("Operator request %s -> %s (pid %s, %s)", kind, self.label, proc.pid,
+                    REQUEST_SIGNALS[kind])
+        proc.send_signal(signum)
+        return True
 
     def close(self) -> Optional[int]:
         """Reap the process (if exited) and close the log; returns the exit code."""
@@ -562,6 +658,14 @@ class Launcher:
         self._reasserts = MAX_REASSERTS
         self._keep_fullscreen = True                # False after Escape (development)
         self.strip: Optional[tk.Toplevel] = None    # the STOP strip while a session runs
+        # The strip's controls (pre-drive / monitoring sessions): the child
+        # state they were laid out for, and the END SESSION confirmation.
+        self.strip_buttons: Dict[str, tk.Button] = {}
+        self._strip_session: Any = None
+        self._strip_state: Optional[str] = None
+        self._end_confirming = False
+        self._end_confirm_job: Optional[str] = None
+        self._stopping = False
 
         # Sizes are set by _apply_size. The other fonts are re-fitted
         # wherever they are used, so shrinking one never shrinks text
@@ -573,6 +677,7 @@ class Launcher:
         self.font_url = tkfont.Font(family="DejaVu Sans", weight="bold")
         self.font_strip = tkfont.Font(family="DejaVu Sans", weight="bold")
         self.font_stop = tkfont.Font(family="DejaVu Sans", weight="bold")
+        self.font_prompt = tkfont.Font(family="DejaVu Sans", weight="bold")
         self.font_driver = tkfont.Font(family="DejaVu Sans", weight="bold")
 
         root.title("Fatigue Detection Launcher")
@@ -1173,7 +1278,8 @@ class Launcher:
         f.rowconfigure(2, minsize=self.px(STRIP_PX))   # under the STOP strip: kept empty
         self._header(f, "Session running").grid(row=0, column=0, sticky="nsew")
         text = tk.Label(f, text=f"{session.label} is running.\n\nIts screen opens on top of "
-                                "this one. Stop it with STOP at the bottom of the screen.",
+                                "this one. END SESSION at the bottom of the screen ends a "
+                                "driver's session; STOP closes it and returns here.",
                         font=self.font_detail, bg=BG, fg=FG, justify="center",
                         wraplength=self.win_w - self.px(24))
         text.grid(row=1, column=0, sticky="nsew")
@@ -1185,6 +1291,12 @@ class Launcher:
         The STOP strip: a new toplevel per session whose type (dock) and
         stacking (topmost) are set before its first map - when window
         managers read them - so nothing about the full window has to change.
+
+        A pre-drive / monitoring session (``session.controls``) also gets the
+        END SESSION control and, in the one state each acts in, BEGIN
+        MONITORING / START NEXT DRIVER (see ``LABEL_BEGIN``). Only the
+        widgets inside the strip change with the child's state; the window
+        itself is never re-mapped or resized.
         """
         self._close_strip()
         x, y = self._home[:2]
@@ -1198,11 +1310,16 @@ class Launcher:
         strip.attributes("-topmost", True)
         strip.geometry(f"{self.win_w}x{h}+{x}+{y + self.win_h - h}")
         self.strip = strip
+        self._strip_state, self._end_confirming, self._stopping = None, False, False
 
         f = tk.Frame(strip, bg=BG)
         f.pack(fill="both", expand=True)
         pad = self.px(4)
-        stop = self._button(f, "■  STOP", self._stop_session, bg=BTN_STOP, font=self.font_stop)
+        if getattr(session, "controls", False):
+            self._build_strip_controls(f, session, pad)
+            strip.deiconify()
+            return
+        stop = self._button(f, LABEL_STOP, self._stop_session, bg=BTN_STOP, font=self.font_stop)
         self._shrink_to_height([stop], self.font_stop, self.px(STRIP_PX) - 2 * pad,
                                -int(self.font_button.cget("size")))
         stop.grid(row=0, column=1, sticky="nsew", padx=pad, pady=pad)
@@ -1224,7 +1341,160 @@ class Launcher:
         self.running_label.grid(row=0, column=0, sticky="nsew")
         strip.deiconify()
 
+    def _build_strip_controls(self, f: tk.Frame, session: Session, pad: int) -> None:
+        """
+        Three fixed columns: the status text or the primary action | END
+        SESSION (CANCEL while confirming) | STOP (YES while confirming). Every
+        widget is created and gridded once, then shown / hidden by
+        :meth:`_layout_strip`; one button font fits every label in its column.
+        """
+        self._strip_session = session
+        strip_h = self.px(STRIP_PX)
+        w0 = int(self.win_w * 0.46)
+        w1 = int(self.win_w * 0.25)
+        widths = (w0, w1, self.win_w - w0 - w1)
+        f.rowconfigure(0, weight=1)
+        for col, width in enumerate(widths):
+            f.columnconfigure(col, weight=0, minsize=width)
+        b = self.strip_buttons = {
+            "primary": self._button(f, LABEL_BEGIN, self._strip_primary, bg=BTN_GO,
+                                    font=self.font_stop),
+            "end": self._button(f, LABEL_END, self._strip_end, bg=BTN_END, font=self.font_stop),
+            "cancel": self._button(f, LABEL_END_CANCEL, self._strip_cancel_end, bg=BTN_QUIT,
+                                   font=self.font_stop),
+            "stop": self._button(f, LABEL_STOP, self._stop_session, bg=BTN_STOP,
+                                 font=self.font_stop),
+            "yes": self._button(f, LABEL_END_YES, self._strip_confirm_end, bg=BTN_END,
+                                font=self.font_stop),
+        }
+        texts = {"primary": (LABEL_BEGIN, LABEL_NEXT_DRIVER), "end": (LABEL_END,),
+                 "cancel": (LABEL_END_CANCEL,), "stop": (LABEL_STOP,), "yes": (LABEL_END_YES,)}
+        cols = {"primary": 0, "end": 1, "cancel": 1, "stop": 2, "yes": 2}
+        # Start from what the text metrics allow, then shrink until every
+        # button - as Tk sizes it, which adds platform padding of its own -
+        # fits its column with each text it can show. A button wider than its
+        # column would widen it and shift the others (CANCEL must sit exactly
+        # where END SESSION was).
+        inner_h = strip_h - 2 * pad - 2 * self.px(BUTTON_PADY_PX)
+        padx = self.px(BUTTON_PADX_PX)
+        size = min(fit_font(self.font_stop, [t for n in texts if cols[n] == col for t in texts[n]],
+                            widths[col] - 2 * pad - 2 * padx - 2, inner_h,
+                            -int(self.font_button.cget("size")))
+                   for col in range(3))
+
+        def fits() -> bool:
+            ok = True
+            for name, options in texts.items():
+                for text in options:
+                    b[name].configure(text=text)
+                    self.root.update_idletasks()
+                    ok &= (b[name].winfo_reqwidth() <= widths[cols[name]] - 2 * pad
+                           and b[name].winfo_reqheight() <= strip_h - 2 * pad)
+            return ok
+
+        while True:
+            self.font_stop.configure(size=-size)
+            if size <= MIN_FONT_PX or fits():
+                break
+            size -= 1
+        for name, col in cols.items():
+            b[name].grid(row=0, column=col, sticky="nsew", padx=pad, pady=pad)
+
+        label_w = widths[0] - 2 * self.px(10) - 4
+        fit_font(self.font_strip, [self._running_text(session, state)
+                                   for state in STATE_TEXT] + [self._running_text(session, None,
+                                                                                  stopping=True)],
+                 label_w, strip_h - 4, self.px(FONT_TITLE_PX))
+        fit_font(self.font_prompt, [END_PROMPT], label_w, strip_h - 4, self.px(FONT_TITLE_PX))
+        self.running_label = tk.Label(
+            f, text="", font=self.font_strip, bg=BG, fg=FG, anchor="w", justify="left",
+            padx=self.px(10), pady=0, bd=0)
+        self.end_prompt = tk.Label(
+            f, text=END_PROMPT, font=self.font_prompt, bg=BG, fg=FG, anchor="w",
+            justify="left", padx=self.px(10), pady=0, bd=0)
+        for label in (self.running_label, self.end_prompt):
+            label.grid(row=0, column=0, sticky="nsew")
+        self._layout_strip()
+
+    def _running_text(self, session: Any, state: Optional[str], stopping: bool = False) -> str:
+        """The strip's status text for a controls session in ``state``."""
+        if stopping:
+            text = f"Stopping {session.label}…"
+        else:
+            text = f"{session.label}:\n{STATE_TEXT.get(state, str(state))}"
+        if self.stream_on:
+            text = f"{self._stream_url()}\n{text}"
+        return text
+
+    def _layout_strip(self) -> None:
+        """Show the controls for the child's state (or the END SESSION confirmation)."""
+        b = self.strip_buttons
+        if self.strip is None or not b:
+            return
+        for widget in (*b.values(), self.running_label, self.end_prompt):
+            widget.grid_remove()
+        state = self._strip_state
+        if self._end_confirming:
+            shown = [self.end_prompt, b["cancel"], b["yes"]]
+        else:
+            first: tk.Widget = self.running_label
+            if not self._stopping and state in ("READY_TO_START", "IDLE"):
+                b["primary"].configure(
+                    text=LABEL_BEGIN if state == "READY_TO_START" else LABEL_NEXT_DRIVER,
+                    state="normal")
+                first = b["primary"]
+            shown = [first, b["stop"]]
+            if not self._stopping and state != "IDLE":
+                shown.append(b["end"])
+        self.running_label.configure(
+            text=self._running_text(self._strip_session, state, self._stopping))
+        for widget in shown:
+            widget.grid()
+
+    def _strip_primary(self) -> None:
+        """BEGIN MONITORING (READY_TO_START) / START NEXT DRIVER (IDLE)."""
+        state = self._strip_state
+        if self.session is None or state not in ("READY_TO_START", "IDLE"):
+            return
+        logger.info("Strip: %s tapped (child state %s)",
+                    "BEGIN MONITORING" if state == "READY_TO_START" else "START NEXT DRIVER",
+                    state)
+        if self.session.request("begin"):
+            # One request per state: re-enabled when the state changes.
+            self.strip_buttons["primary"].configure(state="disabled")
+
+    def _cancel_end_job(self) -> None:
+        if self._end_confirm_job is not None:
+            self.root.after_cancel(self._end_confirm_job)
+            self._end_confirm_job = None
+
+    def _strip_end(self) -> None:
+        """END SESSION, first tap: ask for confirmation (auto-cancels)."""
+        self._cancel_end_job()
+        self._end_confirming = True
+        self._end_confirm_job = self.root.after(int(END_CONFIRM_S * 1000), self._strip_cancel_end)
+        logger.info("Strip: END SESSION tapped - confirm within %.0fs", END_CONFIRM_S)
+        self._layout_strip()
+
+    def _strip_cancel_end(self) -> None:
+        self._cancel_end_job()
+        if self._end_confirming:
+            logger.info("Strip: END SESSION cancelled")
+        self._end_confirming = False
+        self._layout_strip()
+
+    def _strip_confirm_end(self) -> None:
+        """END SESSION confirmed: main.py inhibits, silences, closes and goes IDLE."""
+        self._cancel_end_job()
+        self._end_confirming = False
+        if self.session is not None:
+            logger.info("Strip: END SESSION confirmed (child state %s)", self._strip_state)
+            self.session.request("end_session")
+        self._layout_strip()
+
     def _close_strip(self) -> None:
+        self._cancel_end_job()
+        self.strip_buttons = {}
         if self.strip is not None:
             self.strip.destroy()
             self.strip = None
@@ -1232,7 +1502,13 @@ class Launcher:
     def _stop_session(self) -> None:
         if self.session:
             self.session.stop()
-            self.running_label.configure(text=f"Stopping {self.session.label}…")
+            if self.strip_buttons:
+                self._stopping = True
+                self._cancel_end_job()
+                self._end_confirming = False
+                self._layout_strip()
+            else:
+                self.running_label.configure(text=f"Stopping {self.session.label}…")
 
     def _poll_session(self) -> None:
         if self.session is None:
@@ -1240,11 +1516,18 @@ class Launcher:
         if self.session.running:
             if self.strip is not None:
                 self.strip.lift()       # stay above main.py's fullscreen window
+                if getattr(self.session, "controls", False):
+                    state = self.session.child_state()
+                    if state != self._strip_state:
+                        logger.info("Child state: %s -> %s", self._strip_state, state)
+                        self._strip_state = state
+                        self._layout_strip()
             self.root.after(CHILD_POLL_MS, self._poll_session)
             return
         session, self.session = self.session, None
         # Session over: inhibit the starter before anything else. main.py's
-        # cleanup() already did unless it was killed; this covers that.
+        # cleanup() already did unless it was killed; this covers that, and
+        # any other unexpected exit of the child.
         force_relay_inhibit()
         code = session.proc.poll() if session.proc is not None else None
         self._log_geometry(f"child exited: {session.label}, exit code {code}")
@@ -1366,6 +1649,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     force_relay_inhibit()
     root = tk.Tk()
     app = Launcher(root, windowed=args.windowed, screen_size=args.screen_size)
+    install_exit_signals(root, app)
     try:
         root.mainloop()
     except KeyboardInterrupt:
@@ -1374,6 +1658,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not (app.session and app.session.running):
             force_relay_inhibit()
     return 0
+
+
+def install_exit_signals(root: tk.Tk, app: "Launcher") -> None:
+    """
+    SIGTERM / SIGHUP (desktop logout, ``kill``, an autostart wrapper being
+    stopped) take the same path as Quit: the child is stopped (its cleanup
+    inhibits the starter) and the relay is re-driven to INHIBIT. Without this
+    Python dies on the default action and neither ``finally`` nor
+    :meth:`Launcher.quit` runs. The handler only schedules the quit: Tk's
+    callbacks swallow exceptions, so raising from it would be lost.
+    """
+    def on_signal(signum: int, _frame: Any) -> None:
+        logger.warning("Signal %d received - quitting (child stopped, starter inhibited)", signum)
+        try:
+            root.after(0, app.quit)
+        except tk.TclError:         # already quitting: the window is gone
+            pass
+
+    for name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            try:
+                signal.signal(signum, on_signal)
+            except ValueError:      # not the main thread
+                pass
 
 
 if __name__ == "__main__":

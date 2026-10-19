@@ -4,41 +4,30 @@ import logging
 
 import pytest
 
-from fakes import CAL, FakeAPI, FakeCam, FakeExtractor, FakeRecognizer, keys_after
-from modules.alert import AlertManager
-from modules.ignition import IgnitionSensor
+from fakes import Operator, keys_after
+from modules.phase import SessionState
 
 pytestmark = pytest.mark.slow
 
-
-@pytest.fixture
-def patched_main(m, monkeypatch):
-    """main() with fakes for every device; GPIO forced to mock even on a Pi."""
-    monkeypatch.setattr(m, "setup_logging", lambda: None)
-    monkeypatch.setattr(m, "APIClient", lambda: FakeAPI())
-    monkeypatch.setattr(m, "LandmarkExtractor", lambda *a, **k: FakeExtractor())
-    monkeypatch.setattr(m, "DriverRecognizer", lambda api: FakeRecognizer(0.0))
-    monkeypatch.setattr(m, "Camera", FakeCam)
-    monkeypatch.setattr(m, "AlertManager",
-                        lambda mock=False, phase=None: AlertManager(mock=True, phase=phase))
-    monkeypatch.setattr(m, "IgnitionSensor", lambda mock=False: IgnitionSensor(mock=True))
-    monkeypatch.setattr(m, "identify_driver_bounded",
-                        lambda *a, **k: {"driver_id": 6, "name": "Test Driver", "confidence": 0.6})
-    monkeypatch.setattr(m, "load_calibration", lambda *a, **k: (CAL, CAL.provenance()))
-    monkeypatch.setattr(m.config, "LANDMARK_MODEL", m.config.BASE_DIR / "main.py")  # exists()
-    return m
+READY, IDLE, MONITORING = (SessionState.READY_TO_START, SessionState.IDLE,
+                           SessionState.MONITORING)
 
 
-@pytest.mark.parametrize("argv, frames", [
-    (["--sequence"], 300),
-    (["--force-phase", "predrive"], 300),
-    (["--force-phase", "monitoring"], 60),
-    (["--mock-gpio"], 300),
+@pytest.mark.parametrize("argv, steps", [
+    (["--sequence"], [(READY, 0.3, "b"), (MONITORING, 1.0, "q")]),
+    (["--force-phase", "predrive"], [(READY, 0.3, "b"), (IDLE, 0.5, "q")]),
+    (["--force-phase", "monitoring"], None),
+    # No flags = no ignition input: the same session as --sequence.
+    (["--mock-gpio"], [(READY, 0.3, "b"), (MONITORING, 1.0, "q")]),
 ])
-def test_supervisor_modes(patched_main, monkeypatch, caplog, argv, frames):
+def test_supervisor_modes(patched_main, monkeypatch, caplog, argv, steps):
     m = patched_main
     caplog.set_level(logging.INFO)
-    monkeypatch.setattr(m, "show_frame", keys_after(frames, m.KEY_QUIT))
+    if steps is None:
+        monkeypatch.setattr(m, "show_frame", keys_after(60, m.KEY_QUIT))
+    else:
+        op = Operator(m, *[(state, delay, ord(key)) for state, delay, key in steps])
+        monkeypatch.setattr(m, "show_frame", op)
     m.main(argv)
     lines = [r.getMessage() for r in caplog.records]
     mon = [line for line in lines if "=== MONITORING" in line]
@@ -46,9 +35,24 @@ def test_supervisor_modes(patched_main, monkeypatch, caplog, argv, frames):
     assert any("Relay starts INHIBITED" in line for line in lines)
     assert not any("Relay lock REFUSED" in line for line in lines), \
         "no relay actuation attempted from monitoring"
+    if steps is not None:
+        assert op.steps == [], f"stopped early: {op.states()}"
     if argv[0] in ("--sequence", "--mock-gpio"):
         assert len(mon) == 1 and "entered from pre-drive release) - starter UNLOCKED" in mon[0]
+        assert any("START CONFIRMED by key 'b'" in line for line in lines)
     elif argv[-1] == "predrive":
         assert not mon, "isolated pre-drive never enters monitoring"
+        assert op.states()[-1] is IDLE
     else:
         assert len(mon) == 1 and "starter LOCKED" in mon[0] and not pre
+
+
+def test_gpio_start_confirmation_is_not_implemented(patched_main, monkeypatch):
+    """START_CONFIRM_MODE = 'gpio' stops main() at startup, before any hardware."""
+    m = patched_main
+    monkeypatch.setattr(m.config, "START_CONFIRM_MODE", "gpio")
+    created = []
+    monkeypatch.setattr(m, "AlertManager", lambda *a, **k: created.append(1))
+    with pytest.raises(NotImplementedError, match="ignition-position sense"):
+        m.main(["--sequence"])
+    assert created == [], "raised before the GPIO was touched"

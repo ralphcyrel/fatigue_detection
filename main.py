@@ -1,31 +1,41 @@
 """
 Driver Fatigue Detection System - entry point.
 
-Three phases, selected by the vehicle's ignition state (Module 11)::
+Two phases and enrollment. There is no ignition input (2026-10-19): the Pi's
+only connection to the starter circuit is the relay on GPIO 17, and the motor
+runs only while the key is held at START *and* the relay is energised::
 
     --enroll        Enrollment (operator-supervised, at hiring): face encoding +
                     60 s alert-state calibration -> Laravel backend.
                     ``--driver-id N`` skips the terminal prompt (used by
                     ``launcher.py``, which has no keyboard).
 
-    ignition OFF    Pre-drive assessment: recognise the driver, fetch their
-                    thresholds, run a 30 s assessment. PASS -> starter relay
-                    released and monitoring begins straight away (no key
-                    press). FAIL / not recognised / no baseline -> starter
-                    stays inhibited and an operator override request is raised;
-                    an approval releases it and likewise continues into
-                    monitoring. This is the ONLY phase in which the relay engages.
+    pre-drive       Recognise the driver, fetch their thresholds, settle 3 s,
+                    then a ROLLING assessment with a 30 s minimum. At 30 s
+                    the first 30 s are judged as before; a fail (or not
+                    recognised / no baseline) keeps the starter inhibited and
+                    raises an operator override request (LOCKED). On a pass
+                    the most recent 30 s are re-judged every frame:
+                    READY_TO_START (starter released, green LED) while they
+                    pass, back to assessing (starter inhibited) when they
+                    stop passing, the face is lost > NO_FACE_FAULT_S or the
+                    driver changes. Monitoring begins only on the start
+                    confirmation (``config.START_CONFIRM_MODE``: the BEGIN
+                    MONITORING button), never on a timeout. This is the ONLY
+                    phase in which the relay engages.
 
-    ignition ON     Continuous monitoring: same metrics, LEDs / buzzer /
+    monitoring      Continuous monitoring: same metrics, LEDs / buzzer /
                     backend notification only. The relay is never touched -
                     AlertManager refuses to lock in this phase (Module 8).
-                    Entered on key-ON, or directly from a pre-drive release
-                    (then it ends at the next ignition ON -> OFF, not while
-                    the key has yet to be turned).
 
-    --force-phase P tests one phase alone (a pre-drive release does not
-                    continue); --sequence runs pre-drive -> monitoring with no
-                    ignition input (the touchscreen launcher's default).
+    END SESSION     (launcher strip, SIGUSR2, key 'e') from any state: starter
+                    inhibited, alerts off, session closed, IDLE until START
+                    NEXT DRIVER - the process keeps running. Key-OFF cannot be
+                    sensed, so this is how a session ends.
+
+    The default and --sequence run pre-drive -> monitoring (the touchscreen
+    launcher's default); --force-phase P tests one phase alone (a confirmed
+    start then returns to IDLE instead of entering monitoring).
 
 Per-frame metrics are computed by one shared pipeline (Module 12) in both
 phases::
@@ -41,8 +51,12 @@ a command. With ``--debug-stream`` the same tick also re-sends where the video
 stream can be opened (``PUT /devices/{id}/stream``) for the portal's live view;
 ``cleanup()`` withdraws it.
 
+With ``--state-file PATH`` (the launcher passes it) the current session state
+(``modules.phase.SessionState``) is written to PATH as JSON on every change,
+so the launcher can show BEGIN MONITORING only in READY_TO_START.
+
 Runs on the Raspberry Pi (Picamera2 + GPIO) and, with automatic fallbacks,
-on a development machine (cv2.VideoCapture + mocked GPIO / ignition).
+on a development machine (cv2.VideoCapture + mocked GPIO).
 """
 
 import argparse
@@ -77,17 +91,19 @@ from modules.ear import EARCalculator
 from modules.face_recognition_module import DriverRecognizer
 from modules.frs_debug_log import FrsDebugLog
 from modules.head_pose import HeadPoseEstimator
-from modules.ignition import ForcedIgnition, IgnitionSensor
+from modules.ignition import ForcedIgnition
 from modules.landmark import LandmarkExtractor
 from modules.mar import MARCalculator
 from modules.perclos import PERCLOSCalculator
-from modules.phase import LockReason, Phase
+from modules.phase import LockReason, Phase, SessionState
 from modules.pipeline import (HEAD_POSE_RELEASE_HOLD_S, FrameMetrics, HeadPoseDebounce,
                               MetricsPipeline, SettlingWatch, landmark_problem)
 from modules.pose_neutral import load_neutral, median_pose, save_neutral
 from modules.session_display import (FACE_NONE, FACE_OK, FACE_SEARCHING,
                                      FACE_UNRECOGNISED, GREEN, RED, EnrollState, ScreenState,
                                      render as render_data_screen, render_enroll)
+from modules.start_confirm import (BEGIN, END_SESSION, OperatorRequests, TouchStartConfirm,
+                                   make_start_confirm)
 
 logger = logging.getLogger("fatigue")
 
@@ -155,9 +171,9 @@ class OpenFault:
         if now_mono - self.last_push_mono >= MONITORING_FAULT_REFRESH_S:
             self.push(api_client, "open", now_mono)
 
-# Pre-drive -> monitoring hand-off: after a pass or an approved override the
-# relay is released and a green confirmation is shown on live frames for this
-# long, so the driver sees the verdict, before monitoring starts. Kept under 2 s.
+# Pre-drive -> monitoring hand-off: after the start confirmation a green
+# message is shown on live frames for this long, before monitoring starts.
+# Kept under 2 s.
 RELEASE_INDICATOR_S: float = 1.5
 
 # Frames of face captured for the enrollment encoding.
@@ -245,10 +261,12 @@ GREY = (160, 160, 160)
 
 WINDOW_NAME = "Driver Fatigue Detection"
 
-# Preview-window keys.
+# Preview-window keys. ('i', the mock-ignition toggle, went with the ignition
+# input on 2026-10-19.)
 KEY_QUIT = ord("q")
-KEY_IGNITION = ord("i")   # mock mode only: toggle ignition
 KEY_RETRY = ord("r")      # pre-drive: re-run the assessment
+KEY_BEGIN = ord("b")      # = the launcher's BEGIN MONITORING / START NEXT DRIVER
+KEY_END_SESSION = ord("e")  # = the launcher's END SESSION (no confirmation step)
 
 # Human-readable lock reasons for the overlay.
 LOCK_REASON_TEXT: Dict[LockReason, str] = {
@@ -299,6 +317,16 @@ _profiler: Any = None
 _frs_debug = FrsDebugLog()
 # Outcome of run_enrollment for --result-file (the launcher's result screen).
 _enroll_report: Dict[str, Any] = {}
+# Operator requests (BEGIN / END_SESSION) from the launcher's signals and the
+# window's keys, and the start confirmation built on them. main() replaces
+# _start_confirm per config.START_CONFIRM_MODE.
+_requests = OperatorRequests()
+_start_confirm: Any = TouchStartConfirm(_requests)
+# Where the session is (None = not a pre-drive / monitoring session, e.g.
+# enrollment), and the --state-file it is published to.
+_session_state: Optional[SessionState] = None
+_state_note: str = ""
+_state_file: Optional[str] = None
 
 
 class QuitRequested(Exception):
@@ -307,6 +335,71 @@ class QuitRequested(Exception):
 
 class PhaseChanged(Exception):
     """Raised inside a phase loop when the ignition state no longer matches it."""
+
+
+class SessionEnded(Exception):
+    """Raised by :func:`present` on END SESSION; the supervisor returns to IDLE."""
+
+
+# ---------------------------------------------------------------------------
+# Session state and operator requests (2026-10-19)
+# ---------------------------------------------------------------------------
+
+def _stamp(t: float) -> str:
+    """``time.time()`` as local ``YYYY-mm-dd HH:MM:SS.mmm`` for the log."""
+    return datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def set_session_state(state: SessionState, note: str = "") -> None:
+    """Enter ``state`` (logged once per change) and publish it to ``--state-file``."""
+    global _session_state, _state_note
+    if state is _session_state and note == _state_note:
+        return
+    previous = _session_state
+    _session_state, _state_note = state, note
+    if state is not previous:
+        logger.info("Session state %s -> %s%s", previous.value if previous else "-",
+                    state.value, f" ({note})" if note else "")
+    _write_state_file()
+
+
+def _write_state_file() -> None:
+    """Atomically replace ``--state-file`` with the current state (best effort)."""
+    if not _state_file or _session_state is None:
+        return
+    body = {"state": _session_state.value, "note": _state_note, "driver": _screen.driver_name,
+            "pid": os.getpid(), "since": time.time()}
+    tmp = f"{_state_file}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(body, fh)
+        os.replace(tmp, _state_file)
+    except OSError as exc:
+        logger.warning("Could not write the state file %s: %s", _state_file, exc)
+
+
+def request_operator(kind: str, source: str) -> None:
+    """Record an operator request (signal-handler safe: it only stores)."""
+    _requests.request(kind, _session_state.value if _session_state else "-", source)
+
+
+def _install_request_signals() -> List[Tuple[int, Any]]:
+    """
+    SIGUSR1 -> BEGIN, SIGUSR2 -> END SESSION (the launcher's strip buttons).
+    POSIX only; returns ``[(signum, previous handler)]`` for restoring.
+    """
+    installed = []
+    for name, kind in (("SIGUSR1", BEGIN), ("SIGUSR2", END_SESSION)):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue                     # Windows (development): keys b / e only
+        try:
+            previous = signal.signal(signum, lambda _s, _f, _k=kind, _n=name:
+                                     request_operator(_k, _n))
+        except ValueError:               # not the main thread (tests)
+            continue
+        installed.append((signum, previous))
+    return installed
 
 
 # ---------------------------------------------------------------------------
@@ -748,10 +841,14 @@ def show_frame(frame: np.ndarray) -> int:
 
 def present(frame: np.ndarray) -> int:
     """
-    Show ``frame`` and act on the global keys.
+    Show ``frame`` and act on the global keys and operator requests.
 
-    ``q`` raises :class:`QuitRequested`; ``i`` toggles the mock ignition.
-    Other keys are returned to the caller (e.g. ``r`` to retry).
+    ``q`` raises :class:`QuitRequested`. ``b`` / ``e`` make the same BEGIN /
+    END SESSION requests as the launcher's buttons (SIGUSR1 / SIGUSR2). A
+    pending END SESSION raises :class:`SessionEnded` here - every loop passes
+    through, so a session can be ended from any state; in IDLE (or outside
+    a session) it is dropped. Other keys are returned to the caller (e.g.
+    ``r`` to retry).
 
     Every loop in both phases passes through here once per frame, so this
     is also where the :class:`Heartbeat` is ticked (a no-op until
@@ -765,13 +862,15 @@ def present(frame: np.ndarray) -> int:
         key = _display(frame)
     if key == KEY_QUIT:
         raise QuitRequested()
-    if key == KEY_IGNITION and _ignition is not None:
-        if getattr(_ignition, "mock", False):
-            new_state = not _ignition.read()
-            logger.info("Preview key 'i': mock ignition -> %s", "ON" if new_state else "OFF")
-            _ignition.set_mock_state(new_state)
+    if key == KEY_BEGIN:
+        request_operator(BEGIN, "key 'b'")
+    elif key == KEY_END_SESSION:
+        request_operator(END_SESSION, "key 'e'")
+    if _requests.pending(END_SESSION):
+        if _session_state is None or _session_state is SessionState.IDLE:
+            _requests.discard(END_SESSION, "no session to end")
         else:
-            logger.info("Preview key 'i' ignored: ignition is read from hardware")
+            raise SessionEnded()
     return key
 
 
@@ -2078,30 +2177,11 @@ def run_settling(
     return None
 
 
-def wait_for_ignition(ignition: Any, rate: LoopRate, message: str, color: tuple) -> bool:
-    """
-    Show ``message`` until the ignition turns ON (return ``True``) or the
-    user presses ``r`` to re-run the assessment (return ``False``).
-    """
-    while True:
-        if ignition.phase() is Phase.MONITORING:
-            return True
-        frame = next_frame()
-        rate.tick()
-        display_text(frame, message, color)
-        display_text(frame, "waiting for ignition ON  (r = re-assess)", GREY, dy=40)
-        relay = _alert_manager.get_relay_state() if _alert_manager else "n/a"
-        draw_banner(frame, f"PRE-DRIVE  |  starter {relay}", color)
-        if present(frame) == KEY_RETRY:
-            logger.info("Pre-drive: re-assessment requested from the preview window")
-            return False
-
-
 def show_release(rate: LoopRate, message: str) -> None:
     """
     Pre-drive -> monitoring hand-off: show ``message`` in green on live
-    frames for :data:`RELEASE_INDICATOR_S`. Called after the relay has been
-    released; does not read the ignition (monitoring follows either way).
+    frames for :data:`RELEASE_INDICATOR_S`. Called after the start was
+    confirmed; the starter stays released and monitoring follows.
     """
     logger.info("Pre-drive: %s - starter released, monitoring starts in %.1fs",
                 message, RELEASE_INDICATOR_S)
@@ -2116,6 +2196,58 @@ def show_release(rate: LoopRate, message: str) -> None:
         present(frame)
 
 
+def log_start_confirmed(source: str, cycle_started: float, now: float,
+                        assessment: Optional[PredriveAssessment] = None) -> None:
+    """The start confirmation, logged apart from READY_TO_START entry (Chapter 4 timing)."""
+    duration = now - cycle_started
+    logger.info("START CONFIRMED by %s at %s - pre-drive duration %.1fs (from recognition "
+                "to confirmation)", source, _stamp(now), duration)
+    _frs_debug.log_event(now, "predrive_confirmed", "ALERT",
+                         "START_CONFIRMED by %s predrive_duration=%.1fs" % (source, duration))
+    if assessment is not None:
+        assessment.mark("confirmed", now, source=source)
+
+
+def wait_for_start(
+    rate: LoopRate,
+    message: str,
+    cycle_started: float,
+    assessment: Optional[PredriveAssessment] = None,
+) -> bool:
+    """
+    READY_TO_START without a rolling assessment behind it - an operator
+    override was approved and the starter released. Waits indefinitely for
+    the start confirmation (``config.START_CONFIRM_MODE``); there is no
+    timeout into monitoring.
+
+    Returns:
+        ``True`` once the start is confirmed, ``False`` if the user pressed
+        ``r`` (re-run the assessment; the next cycle re-inhibits).
+    """
+    _start_confirm.reset("new READY_TO_START")
+    set_session_state(SessionState.READY_TO_START, message)
+    now = time.time()
+    logger.info("READY_TO_START at %s (%s) - %.1fs after the pre-drive began; waiting for the "
+                "start confirmation (%s), no timeout", _stamp(now), message, now - cycle_started,
+                config.START_CONFIRM_MODE)
+    _frs_debug.log_event(now, "predrive_ready", "ALERT", f"READY_TO_START {message}")
+    if assessment is not None:
+        assessment.mark("ready_entered", now, source="override")
+    while True:
+        frame = next_frame()
+        rate.tick()
+        display_text(frame, f"{message} - you may start the vehicle", (0, 200, 0))
+        display_text(frame, f"Start the vehicle, {_start_confirm.prompt}", GREY, dy=40)
+        draw_banner(frame, "PRE-DRIVE  |  READY TO START  |  starter UNLOCKED", (0, 200, 0))
+        if present(frame) == KEY_RETRY:
+            logger.info("Pre-drive: re-assessment requested from the preview window")
+            return False
+        source = _start_confirm.confirmed(SessionState.READY_TO_START)
+        if source is not None:
+            log_start_confirmed(source, cycle_started, time.time(), assessment)
+            return True
+
+
 def await_override(
     api_client: APIClient,
     alert_manager: AlertManager,
@@ -2127,11 +2259,12 @@ def await_override(
     provenance: Optional[Dict[str, Any]] = None,
     continue_to_monitoring: bool = True,
     display_reason: Optional[str] = None,
+    cycle_started: Optional[float] = None,
 ) -> bool:
     """
-    Starter stays inhibited: raise one override request and poll the
-    operator's decision until approved (-> release starter), the user
-    presses ``r`` (-> re-assess) or the phase changes.
+    Starter stays inhibited (LOCKED): raise one override request and poll
+    the operator's decision until approved (-> release starter), the user
+    presses ``r`` (-> re-assess) or the session is ended (END SESSION).
 
     ``display_reason`` replaces the lock reason's text on the unit's own
     screen only (an invalid assessment is raised to the backend as
@@ -2143,16 +2276,17 @@ def await_override(
     which unit it was captured on.
 
     Returns:
-        ``True`` if the override was approved and ``continue_to_monitoring``
-        is set: the starter is released and the caller goes straight into
-        monitoring. ``False`` otherwise (``r``, or - with
-        ``continue_to_monitoring`` off, i.e. ``--force-phase predrive`` - an
-        approval followed by ``r`` on the "start vehicle" screen). A phase
-        change raises :class:`PhaseChanged` as before.
+        ``True`` if the override was approved and the start then confirmed
+        (READY_TO_START via :func:`wait_for_start` - an approval releases
+        the starter but, as for a pass, does not enter monitoring by
+        itself). ``False`` on ``r``, here or on the READY screen.
+        ``continue_to_monitoring`` is kept for the caller's sake: the
+        supervisor decides what a confirmation leads to.
     """
     reason_text = display_reason or LOCK_REASON_TEXT[reason]
     logger.warning("Pre-drive: starter stays LOCKED - %s (driver=%s)", reason.value, driver_id)
     alert_manager.lock_relay()  # already locked; explicit for clarity + log
+    set_session_state(SessionState.LOCKED, reason_text)
 
     request_id = api_client.request_override(config.DEVICE_ID, driver_id, reason, assessment_id,
                                              provenance)
@@ -2180,11 +2314,9 @@ def await_override(
         if status == "approved":
             logger.warning("Operator override APPROVED (request %s) - releasing starter", request_id)
             alert_manager.unlock_relay()
-            if continue_to_monitoring:
-                show_release(rate, "OVERRIDE APPROVED")
-                return True
-            wait_for_ignition(ignition, rate, "OVERRIDE APPROVED - start vehicle", (0, 200, 0))
-            return False
+            alert_manager.set_alert_level("ALERT")
+            return wait_for_start(rate, "OVERRIDE APPROVED",
+                                  time.time() if cycle_started is None else cycle_started)
 
         frame = next_frame()
         rate.tick()
@@ -2202,8 +2334,119 @@ def await_override(
             return False
 
 
+class DriverCheck:
+    """
+    Is the driver who was recognised still the one in the seat? (2026-10-19)
+
+    Pre-drive recognises the driver once (:func:`identify_driver_bounded`).
+    While the rolling assessment can grant READY_TO_START, this re-checks:
+
+    * a face lost for longer than ``config.NO_FACE_FAULT_S`` makes the
+      identity *unconfirmed* until the face is matched to the same driver
+      again - attempted on every face frame meanwhile (the starter is
+      inhibited anyway, so the ~1 s stalls cost nothing that matters);
+    * once eligible (the first 30 s are over) a confirmed identity is
+      re-checked every ``config.PREDRIVE_REIDENTIFY_S``;
+    * a match to a *different* enrolled driver makes it unconfirmed at once
+      (READY_TO_START is lost), and once that driver has matched
+      ``config.PREDRIVE_RECOGNITION_MATCHES`` times it is a change of driver
+      (:meth:`observe` returns their id). A same-driver match confirms
+      again.
+
+    "No match" never changes a confirmed identity: one blurred frame must not
+    toggle the starter under a driver holding the key. After a face loss it
+    keeps the identity unconfirmed, so a stranger who sits down cannot inherit
+    the previous driver's READY_TO_START.
+    """
+
+    def __init__(self, driver_id: int, interval_s: Optional[float] = None,
+                 matches_required: Optional[int] = None) -> None:
+        self.driver_id = int(driver_id)
+        self.interval_s = float(config.PREDRIVE_REIDENTIFY_S if interval_s is None
+                                else interval_s)
+        self.matches_required = int(config.PREDRIVE_RECOGNITION_MATCHES
+                                    if matches_required is None else matches_required)
+        self.confirmed = True
+        self.why = ""
+        self.others: Dict[int, int] = {}
+        self.attempts = 0
+        # No periodic checks until start_periodic() (the eligibility point).
+        self.next_due = float("inf")
+
+    def start_periodic(self, now_mono: float) -> None:
+        self.next_due = now_mono + self.interval_s
+
+    def face_lost(self, gap_s: float) -> None:
+        if self.confirmed:
+            self.confirmed, self.why = False, f"face lost {gap_s:.1f}s"
+            logger.info("Pre-drive: face lost for %.1fs - driver %s must be re-identified "
+                        "before READY_TO_START", gap_s, self.driver_id)
+
+    def due(self, now_mono: float) -> bool:
+        return not self.confirmed or now_mono >= self.next_due
+
+    def observe(self, match: Optional[Dict[str, Any]], now_mono: float) -> Optional[int]:
+        """
+        One recognition result. Returns the new driver's id on a change of
+        driver, else ``None``.
+        """
+        self.attempts += 1
+        self.next_due = now_mono + self.interval_s
+        if match is None:
+            if not self.confirmed:
+                logger.info("Pre-drive: re-identification attempt %d - no match; driver %s "
+                            "still unconfirmed (%s)", self.attempts, self.driver_id, self.why)
+            return None
+        did = int(match["driver_id"])
+        if did == self.driver_id:
+            if not self.confirmed:
+                logger.info("Pre-drive: driver %s re-identified (%s) - identity confirmed",
+                            did, self.why)
+            self.confirmed, self.why = True, ""
+            self.others.clear()
+            return None
+        self.others[did] = self.others.get(did, 0) + 1
+        self.confirmed, self.why = False, f"matched driver {did}"
+        logger.warning("Pre-drive: face matched driver %s (%s), not %s - %d/%d matches for a "
+                       "change of driver", did, match.get("name"), self.driver_id,
+                       self.others[did], self.matches_required)
+        return did if self.others[did] >= self.matches_required else None
+
+
+def _not_ready_text(w: Dict[str, Any], assessment: PredriveAssessment) -> str:
+    """Why the rolling window does not pass, for the log and the screen."""
+    if w["reason"] == "microsleep":
+        return "microsleep in the last %.0fs" % assessment.duration_s
+    if w["reason"] == "invalid":
+        return "valid frames %.0f%% < %.0f%% in the last %.0fs" % (
+            w["valid_fraction"] * 100, assessment.min_valid_fraction * 100,
+            assessment.duration_s)
+    return "worst %.0fs FRS %.3f >= %.2f in the last %.0fs" % (
+        assessment.worst_window_s, w["worst_window_mean"], assessment.pass_threshold,
+        assessment.duration_s)
+
+
+def close_assessment(assessment: PredriveAssessment, driver_id: Optional[int], reason: str,
+                     **detail: Any) -> None:
+    """End the rolling run: timeline ``ended``, CSV stream closed, files written / updated."""
+    assessment.finish(reason, time.time(), **detail)
+    if not assessment.files_written:
+        try:
+            assessment.write_files(config.DEVICE_ID, driver_id)
+        except OSError as exc:
+            logger.error("Could not write assessment files: %s", exc)
+    s = assessment.timeline_summary()
+    logger.info("Pre-drive run ended (%s): %.1fs assessed, READY_TO_START entered %d time(s), "
+                "first at %s, start confirmed at %s, pre-drive duration %s", reason,
+                assessment.elapsed(), s["ready_entries"],
+                _stamp(s["first_ready_at"]) if s["first_ready_at"] else "never",
+                _stamp(s["confirmed_at"]) if s["confirmed_at"] else "never",
+                "%.1fs" % s["predrive_duration_s"] if s["predrive_duration_s"] is not None
+                else "n/a (not confirmed)")
+
+
 # ---------------------------------------------------------------------------
-# Phase 1: pre-drive assessment (ignition OFF)
+# Phase 1: pre-drive assessment
 # ---------------------------------------------------------------------------
 
 def run_predrive_assessment(
@@ -2220,39 +2463,64 @@ def run_predrive_assessment(
     continue_to_monitoring: bool = True,
 ) -> bool:
     """
-    One pre-drive cycle.
+    One pre-drive cycle (2026-10-19: start-gated, rolling).
 
     1. Relay inhibited (``set_phase(PREDRIVE)``).
-    2. Recognise the driver (bounded)          -> else DRIVER_NOT_RECOGNIZED.
+    2. IDENTIFYING: recognise the driver (bounded) -> else DRIVER_NOT_RECOGNIZED.
     3. This driver's calibration from this unit  -> none at all: NO_BASELINE;
        only from another unit: FOREIGN_DEVICE_BASELINE (never assessed on it).
-    4. Settle (:func:`run_settling`): face + landmarks valid for
-       ``config.PREDRIVE_SETTLE_SECONDS`` continuously; nothing scored, but
-       a microsleep confirmed here fails at once as MICROSLEEP_DETECTED.
-    5. Fresh pipeline (every rolling buffer empty), neutral head pose
-       (stored, else the settling median), then the 30 s assessment; every
-       frame recorded, invalid frames counted and never scored.
-    6. Persist CSV/JSON + POST /assessments.
-    7. PASS -> release starter, then hand off to monitoring.
-       Lock-reason priority: MICROSLEEP_DETECTED (settling or assessment)
+    4. SETTLING (:func:`run_settling`): face + landmarks valid for
+       ``config.PREDRIVE_SETTLE_SECONDS`` continuously (20 s timeout);
+       nothing scored, but a microsleep confirmed here fails at once as
+       MICROSLEEP_DETECTED.
+    5. ASSESSING: fresh pipeline (every rolling buffer empty), neutral head
+       pose (stored, else the settling median), then the assessment - which
+       no longer ends at ``config.PREDRIVE_ASSESSMENT_SECONDS``. Every frame
+       recorded, invalid frames counted and never scored.
+    6. Eligibility, at 30 s: the first 30 s are judged exactly as the fixed
+       run was, persisted (CSV/JSON) and POSTed to /assessments. A fail is a
+       HARD failure. Priority: MICROSLEEP_DETECTED (settling or assessment)
        > invalid assessment (fewer than ``config.PREDRIVE_MIN_VALID_FRACTION``
        valid frames, or no settling: FAULT, raised as DRIVER_NOT_RECOGNIZED)
        > FATIGUE_DETECTED.
-    8. Any lock reason -> :func:`await_override`; the starter stays
-       inhibited until an operator approves (then as for a pass).
+    7. From then on the pass rule is re-applied every frame to the most
+       recent 30 s (:meth:`PredriveAssessment.window_verdict`). READY_TO_START
+       - starter released, green LED, "Assessment passed - you may start the
+       vehicle" - while it passes, a face has been seen within
+       ``config.NO_FACE_FAULT_S`` and the driver is confirmed
+       (:class:`DriverCheck`). READY is not a latch: when any of these stops
+       holding the starter is re-inhibited and the run goes on ASSESSING,
+       and it is regained when they hold again. A confirmed microsleep after
+       eligibility is still a hard failure (a microsleep fails outright, as
+       in settling). A change of driver ends the cycle (``False``): the
+       caller restarts pre-drive for the new driver.
+    8. MONITORING only on the start confirmation (``config.START_CONFIRM_MODE``,
+       the BEGIN MONITORING button), polled only in READY_TO_START. There is
+       no timeout: without it the unit stays where it is indefinitely.
+       READY_TO_START entry, loss and the confirmation are logged and
+       recorded in the assessment's timeline separately.
+    9. Any hard failure -> :func:`await_override` (LOCKED); the starter stays
+       inhibited until an operator approves (then READY_TO_START, still
+       waiting for the confirmation) or the session is reset (``r`` re-runs,
+       END SESSION returns to IDLE).
+
+    END SESSION (:class:`SessionEnded`, raised by :func:`present`) can come
+    at any point; an assessment in progress is closed and its files written
+    before it propagates.
 
     The display shows "Recognizing...", "Hold still..." and "Assessing..."
     for the three stages (Hershey fonts have no ellipsis character).
 
-    With ``continue_to_monitoring`` off (``--force-phase predrive``, the
-    phase tested alone) a release instead waits on the "start vehicle"
-    screen, where ``r`` re-runs the assessment - the pre-2026-09-29 flow.
+    ``continue_to_monitoring`` off (``--force-phase predrive``, the phase
+    tested alone) changes nothing here; the supervisor does not enter
+    monitoring after the confirmation.
 
     Returns:
-        ``True`` if the starter was released (pass, or approved override)
-        and the caller should go straight into monitoring. ``False`` if the
-        user asked to re-run (``r``), or the ignition turned ON before a
-        release (the caller re-reads the phase; the starter stays inhibited).
+        ``True`` once the start is confirmed (pass, or approved override):
+        the starter is released and the caller goes into monitoring.
+        ``False`` if the user asked to re-run (``r``), the driver changed,
+        or the ignition turned ON before a release (the caller re-reads the
+        phase; the starter stays inhibited).
     """
     alert_manager.set_phase(Phase.PREDRIVE)
     # Every pre-drive cycle starts inhibited, including a re-run requested
@@ -2260,7 +2528,8 @@ def run_predrive_assessment(
     alert_manager.lock_relay()
     alert_manager.set_alert_level("ALERT")
     _screen.reset_session()
-    logger.info("=== PRE-DRIVE phase (ignition OFF) - starter %s ===",
+    cycle_started = time.time()
+    logger.info("=== PRE-DRIVE phase (no ignition input) - starter %s ===",
                 alert_manager.get_relay_state())
 
     driver: Optional[Dict[str, Any]] = None
@@ -2274,9 +2543,11 @@ def run_predrive_assessment(
     # the local log, the debug CSV and the unit's screen.
     invalid_cause: Optional[str] = None
     settle: Optional[Dict[str, Any]] = None
+    assessment: Optional[PredriveAssessment] = None
 
     try:
         # 2. Recognise
+        set_session_state(SessionState.IDENTIFYING)
         driver = identify_driver_bounded(recognizer, ignition, rate)
         if driver is None:
             lock_reason = LockReason.DRIVER_NOT_RECOGNIZED
@@ -2311,6 +2582,7 @@ def run_predrive_assessment(
         if lock_reason is None:
             # 4. Settle: the face and landmarks must be valid for
             # PREDRIVE_SETTLE_SECONDS continuously; nothing is scored.
+            set_session_state(SessionState.SETTLING)
             settle = run_settling(extractor, head_pose, ignition, rate,
                                   thresholds.get("ear_threshold"))
             if settle is not None and settle["microsleep"] is not None:
@@ -2348,145 +2620,228 @@ def run_predrive_assessment(
                 pipeline.set_pose_neutral(settle["neutral"], "settling")
             assessment = PredriveAssessment()
             assessment.calibration = calibration.provenance()
+            assessment.predrive_started_at = cycle_started
             assessment.start(time.time())
-            logger.info("Pre-drive: %d s assessment started for driver %s (%s), "
-                        "calibration %s (%s); scoring baselines %s",
-                        config.PREDRIVE_ASSESSMENT_SECONDS, driver_id, driver["name"],
+            set_session_state(SessionState.ASSESSING)
+            logger.info("Pre-drive: assessment started for driver %s (%s) - rolling, %d s "
+                        "minimum, start-gated (%s confirmation), calibration %s (%s); scoring "
+                        "baselines %s",
+                        driver_id, driver["name"], config.PREDRIVE_ASSESSMENT_SECONDS,
+                        config.START_CONFIRM_MODE,
                         calibration.calibration_id, calibration.source,
                         {k: round(float(v), 4) for k, v in
                          pipeline.scoring_thresholds(thresholds).items()
                          if k in ("perclos_baseline", "blink_duration_baseline",
                                   "blink_frequency_baseline")})
 
-            while not assessment.is_complete(time.time()):
+            check = DriverCheck(driver_id)
+            last_valid_mono = time.monotonic()
+            # The first-30 s verdict, once eligible; None before.
+            result: Optional[Dict[str, Any]] = None
+            ready = False
+            not_ready = ""
+
+            def enter_ready(now: float, w: Dict[str, Any]) -> None:
+                alert_manager.unlock_relay()
+                alert_manager.set_alert_level("ALERT")
+                _start_confirm.reset("new READY_TO_START")
+                set_session_state(SessionState.READY_TO_START, "assessment passed")
+                assessment.mark("ready_entered", now, worst_window_mean=w["worst_window_mean"],
+                                valid_fraction=w["valid_fraction"])
+                logger.info("READY_TO_START at %s - %.1fs after the pre-drive began, %.1fs into "
+                            "the assessment (last %.0fs: worst %.0fs mean %.3f, valid %.1f%%) - "
+                            "starter released; monitoring waits for the start confirmation "
+                            "(%s), no timeout", _stamp(now), now - cycle_started,
+                            assessment.elapsed(now), config.PREDRIVE_ASSESSMENT_SECONDS,
+                            config.PREDRIVE_WORST_WINDOW_SECONDS, w["worst_window_mean"],
+                            w["valid_fraction"] * 100, config.START_CONFIRM_MODE)
+                _frs_debug.log_event(now, "predrive_ready", "ALERT",
+                                     "READY_TO_START worst_%.0fs_mean=%.3f valid=%.1f%%"
+                                     % (config.PREDRIVE_WORST_WINDOW_SECONDS,
+                                        w["worst_window_mean"], w["valid_fraction"] * 100))
+
+            def lose_ready(now: float, why: str) -> None:
+                alert_manager.lock_relay()
+                set_session_state(SessionState.ASSESSING, why)
+                assessment.mark("ready_lost", now, reason=why)
+                logger.warning("READY_TO_START LOST at %s (%s) - starter inhibited, assessing "
+                               "(%.1fs into the assessment)", _stamp(now), why,
+                               assessment.elapsed(now))
+                _frs_debug.log_event(now, "predrive_ready_lost", "ALERT",
+                                     f"READY_TO_START lost: {why}")
+
+            while True:
                 check_phase(ignition, Phase.PREDRIVE)
+                if result is None and assessment.is_complete(time.time()):
+                    # 6. Eligibility: the first 30 s, judged as the fixed run was.
+                    result = assessment.result()
+                    assessment.freeze()
+                    lock_reason, invalid_cause = _first_window_verdict(result)
+                    try:
+                        assessment.write_files(config.DEVICE_ID, driver_id)
+                        assessment.stream_to_csv()
+                    except OSError as exc:
+                        logger.error("Could not write assessment files: %s", exc)
+                    assessment_id = api_client.post_assessment(
+                        config.DEVICE_ID, driver_id, result, lock_reason)
+                    if lock_reason is not None:
+                        if invalid_cause is None:
+                            _frs_debug.log_event(time.time(), "predrive_verdict", "DANGER",
+                                                 "%s worst_%.0fs_mean=%.3f microsleeps=%d"
+                                                 % (lock_reason.value.upper(),
+                                                    result["worst_window_s"],
+                                                    result["worst_window_mean"],
+                                                    result["microsleeps"]))
+                        close_assessment(assessment, driver_id, "hard_failure",
+                                         lock_reason=lock_reason.value)
+                        break
+                    logger.info("Pre-drive PASSED the first %.0fs (worst %.0fs mean %.3f < %.2f) - "
+                                "eligible; READY_TO_START while the last %.0fs keep passing",
+                                result["duration_s"], result["worst_window_s"],
+                                result["worst_window_mean"], result["pass_threshold"],
+                                config.PREDRIVE_ASSESSMENT_SECONDS)
+                    _frs_debug.log_event(time.time(), "predrive_verdict", "ALERT",
+                                         "PASS worst_%.0fs_mean=%.3f valid=%.1f%%"
+                                         % (result["worst_window_s"], result["worst_window_mean"],
+                                            result["valid_fraction"] * 100))
+                    check.start_periodic(time.monotonic())
+
                 frame = next_frame()
                 fps = rate.tick()
                 now, now_mono = time.time(), time.monotonic()
+                eligible = result is not None
                 remaining = assessment.seconds_remaining(now)
-                banner = (f"PRE-DRIVE  |  assessing {remaining:4.1f}s left  |  "
-                          f"starter {alert_manager.get_relay_state()}")
 
                 landmarks, _rect = extractor.extract(frame)
                 problem = landmark_problem(landmarks, frame.shape)
+                m: Optional[FrameMetrics] = None
                 if problem is not None:
                     # No face, or landmarks that cannot be measured: counted,
                     # never scored. Policy disabled here: verdict.level is
-                    # ALERT. Too many of these void the assessment instead.
+                    # ALERT. Too many of these void the window instead.
                     verdict = pipeline.note_no_face(now, now_mono)
                     assessment.add_invalid(problem, now)
                     _frs_debug.log_unscored(now, "predrive_assessing", False, verdict.level,
                                             unscored_reason(problem))
-                    alert_manager.set_alert_level(verdict.level)
-                    _screen.face, _screen.level, _screen.countdown = (FACE_NONE, verdict.level,
-                                                                      remaining)
-                    display_text(frame, "Assessing...", (0, 220, 255))
-                    display_text(frame, "NO FACE" if problem == "no_face"
-                                 else "FACE NOT FULLY VISIBLE", dy=40)
-                    draw_banner(frame, banner, (0, 220, 255))
-                    if debug_pose:
-                        draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
-                    present(frame)
-                    continue
+                    level = verdict.level
+                    gap = now_mono - last_valid_mono
+                    if gap > config.NO_FACE_FAULT_S:
+                        check.face_lost(gap)
+                else:
+                    if check.due(now_mono):
+                        match = recognizer.identify(frame)
+                        # Re-stamp after the ~1 s call, as monitoring does:
+                        # the pipeline sees the gap and abandons closures.
+                        now, now_mono = time.time(), time.monotonic()
+                        new_driver = check.observe(match, now_mono)
+                        if new_driver is not None:
+                            if ready:
+                                lose_ready(now, f"driver changed to {new_driver}")
+                            alert_manager.lock_relay()
+                            logger.warning("Pre-drive: DRIVER CHANGED from %s to %s - starter "
+                                           "inhibited; restarting pre-drive for the new driver",
+                                           driver_id, new_driver)
+                            close_assessment(assessment, driver_id, "driver_changed",
+                                             new_driver_id=new_driver)
+                            return False
+                    last_valid_mono = now_mono
+                    m = pipeline.process(landmarks, thresholds, now, now_mono)
+                    assessment.add(m, now)
+                    _frs_debug.log_frame(m, "predrive_assessing", pipeline.pose_neutral_source)
+                    level = m.level
+                    if eligible and m.microsleep_event is not None:
+                        # A microsleep fails outright, also after eligibility.
+                        lock_reason = LockReason.MICROSLEEP_DETECTED
+                        if ready:
+                            lose_ready(now, "microsleep")
+                        logger.warning(
+                            "Pre-drive: MICROSLEEP %.1fs into the assessment (eyes closed "
+                            "%.2fs) after the first %.0fs had passed - hard failure, starter "
+                            "inhibited", assessment.elapsed(now),
+                            m.microsleep_event["duration_ms"] / 1000.0,
+                            config.PREDRIVE_ASSESSMENT_SECONDS)
+                        _frs_debug.log_event(now, "predrive_verdict", "DANGER",
+                                             "MICROSLEEP_DETECTED after eligibility "
+                                             "(%.2fs closure)"
+                                             % (m.microsleep_event["duration_ms"] / 1000.0))
+                        close_assessment(assessment, driver_id, "hard_failure",
+                                         lock_reason=lock_reason.value)
+                        break
 
-                m = pipeline.process(landmarks, thresholds, now, now_mono)
-                assessment.add(m, now)
-                _frs_debug.log_frame(m, "predrive_assessing", pipeline.pose_neutral_source)
-                # LEDs / buzzer give the driver feedback; the relay is decided
-                # once, below, on the aggregate - never per frame.
-                alert_manager.set_alert_level(m.level)
-                _screen.countdown = remaining
-                display_text(frame, "Assessing...", (0, 220, 255))
-                draw_overlay(frame, driver, m, fps, pipeline, thresholds, landmarks)
-                draw_banner(frame, banner, (0, 220, 255))
+                # 7. Rolling verdict -> READY_TO_START (not a latch).
+                if eligible:
+                    w = assessment.window_verdict(now)
+                    face_gap = now_mono - last_valid_mono
+                    if face_gap > config.NO_FACE_FAULT_S:
+                        not_ready = f"no face for {face_gap:.1f}s"
+                    elif not check.confirmed:
+                        not_ready = f"confirming the driver ({check.why})"
+                    elif not w["passed"]:
+                        not_ready = _not_ready_text(w, assessment)
+                    else:
+                        not_ready = ""
+                    if not not_ready and not ready:
+                        enter_ready(now, w)
+                        ready = True
+                    elif not_ready and ready:
+                        lose_ready(now, not_ready)
+                        ready = False
+
+                # LEDs / buzzer: green while READY_TO_START (the verdict),
+                # else the frame's level as driver feedback. The relay is
+                # driven only by enter_ready / lose_ready.
+                alert_manager.set_alert_level("ALERT" if ready else level)
+
+                if ready:
+                    banner, color = ("PRE-DRIVE  |  READY TO START  |  starter "
+                                     f"{alert_manager.get_relay_state()}"), (0, 200, 0)
+                elif eligible:
+                    banner, color = (f"PRE-DRIVE  |  assessing  |  starter "
+                                     f"{alert_manager.get_relay_state()}"), (0, 220, 255)
+                else:
+                    banner, color = (f"PRE-DRIVE  |  assessing {remaining:4.1f}s left  |  "
+                                     f"starter {alert_manager.get_relay_state()}"), (0, 220, 255)
+                if ready:
+                    display_text(frame, "Assessment passed - you may start the vehicle",
+                                 (0, 200, 0))
+                    display_text(frame, f"Start the vehicle, {_start_confirm.prompt}", GREY,
+                                 dy=40)
+                else:
+                    display_text(frame, "Assessing...", (0, 220, 255))
+                    if problem is not None:
+                        display_text(frame, "NO FACE" if problem == "no_face"
+                                     else "FACE NOT FULLY VISIBLE", dy=40)
+                    elif not_ready:
+                        display_text(frame, f"Not ready: {not_ready}", GREY, dy=40)
+                if problem is not None:
+                    _screen.face, _screen.level = FACE_NONE, level
+                else:
+                    draw_overlay(frame, driver, m, fps, pipeline, thresholds, landmarks)
+                    if not check.confirmed:
+                        _screen.face, _screen.face_detail = FACE_SEARCHING, "- confirming driver"
+                _screen.countdown = None if eligible else remaining
+                draw_banner(frame, banner, color)
                 if debug_pose:
                     draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
-                present(frame)
+                key = present(frame)
+                if ready and key == KEY_RETRY:
+                    # As on the old "start vehicle" screen: re-run from the top.
+                    logger.info("Pre-drive: re-assessment requested from the preview window")
+                    lose_ready(time.time(), "re-assessment requested")
+                    close_assessment(assessment, driver_id, "rerun")
+                    return False
 
-            # 6. Persist
-            result = assessment.result()
-            logger.info("Pre-drive result: passed=%s void=%s valid=%.1f%% worst_%.0fs_mean=%.3f "
-                        "mean=%.3f median=%.3f max=%.3f n=%d invalid=%d %s "
-                        "pose_override_frames=%d yawns=%d microsleeps=%d",
-                        result["passed"], result["void"], result["valid_fraction"] * 100,
-                        result["worst_window_s"], result["worst_window_mean"],
-                        result["mean_frs"], result["median_frs"], result["max_frs"],
-                        result["n_samples"], result["n_no_face"], result["invalid_reasons"],
-                        result["pose_override_frames"], result["yawns"],
-                        result["microsleeps"])
-            try:
-                assessment.write_files(config.DEVICE_ID, driver_id)
-            except OSError as exc:
-                logger.error("Could not write assessment files: %s", exc)
+                # 8. Start confirmation - only ever taken in READY_TO_START.
+                if ready:
+                    source = _start_confirm.confirmed(SessionState.READY_TO_START)
+                    if source is not None:
+                        log_start_confirmed(source, cycle_started, time.time(), assessment)
+                        close_assessment(assessment, driver_id, "confirmed", source=source)
+                        if continue_to_monitoring:
+                            show_release(rate, "START CONFIRMED")
+                        return True
 
-            # Priority (2026-10-15): microsleep_detected > invalid assessment
-            # > FRS fail. A confirmed microsleep was measured on valid frames
-            # throughout, so it stands even if the run as a whole was invalid.
-            if result["failed_on_microsleep"]:
-                # Checked before the aggregate so the lock reason names the
-                # real finding: a microsleep fails outright, and the worst
-                # window can easily still be under the threshold when it does.
-                if result["void"]:
-                    logger.warning("Pre-drive: assessment also INVALID (valid frames %.1f%%) - "
-                                   "the microsleep takes priority",
-                                   result["valid_fraction"] * 100)
-                logger.warning(
-                    "Pre-drive: FAILED ON MICROSLEEP - %d confirmed during the %.0fs "
-                    "assessment (worst %.0fs mean %.3f vs threshold %.2f; the aggregate "
-                    "alone would have %s). Sleep intrusion in a stationary vehicle is "
-                    "disqualifying on its own.",
-                    result["microsleeps"], result["duration_s"], result["worst_window_s"],
-                    result["worst_window_mean"], result["pass_threshold"],
-                    "FAILED" if result["worst_window_mean"] >= result["pass_threshold"]
-                    else "PASSED",
-                )
-                lock_reason = LockReason.MICROSLEEP_DETECTED
-            elif result["void"]:
-                # Not enough valid frames to judge: an invalid assessment
-                # (FAULT), not fatigue. Raised as driver_not_recognized - the
-                # backend has no separate reason - with the real cause here.
-                invalid_cause = ("INVALID_ASSESSMENT: valid frames %.1f%% < %.0f%% (%s)"
-                                 % (result["valid_fraction"] * 100,
-                                    result["min_valid_fraction"] * 100,
-                                    ", ".join(f"{k} {v}" for k, v in
-                                              result["invalid_reasons"].items()) or "no frames"))
-                logger.warning("Pre-drive: %s - FAULT, starter stays inhibited (raised as "
-                               "driver_not_recognized)", invalid_cause)
-                lock_reason = LockReason.DRIVER_NOT_RECOGNIZED
-            elif not result["passed"]:
-                logger.warning(
-                    "Pre-drive: FAILED on aggregate - worst %.0fs mean %.3f >= %.2f",
-                    result["worst_window_s"], result["worst_window_mean"],
-                    result["pass_threshold"],
-                )
-                lock_reason = LockReason.FATIGUE_DETECTED
-
-            assessment_id = api_client.post_assessment(
-                config.DEVICE_ID, driver_id, result, lock_reason)
-
-            # 7. Verdict
-            if lock_reason is None:
-                logger.info("Pre-drive PASSED (worst %.0fs mean %.3f < %.2f) - releasing starter",
-                            result["worst_window_s"], result["worst_window_mean"],
-                            result["pass_threshold"])
-                _frs_debug.log_event(time.time(), "predrive_verdict", "ALERT",
-                                     "PASS worst_%.0fs_mean=%.3f valid=%.1f%%"
-                                     % (result["worst_window_s"], result["worst_window_mean"],
-                                        result["valid_fraction"] * 100))
-                alert_manager.unlock_relay()
-                alert_manager.set_alert_level("ALERT")
-                if continue_to_monitoring:
-                    show_release(rate, "ASSESSMENT PASSED")
-                    return True
-                wait_for_ignition(ignition, rate, "ASSESSMENT PASSED - start vehicle", (0, 200, 0))
-                return False
-            if invalid_cause is None:
-                _frs_debug.log_event(time.time(), "predrive_verdict", "DANGER",
-                                     "%s worst_%.0fs_mean=%.3f microsleeps=%d"
-                                     % (lock_reason.value.upper(), result["worst_window_s"],
-                                        result["worst_window_mean"], result["microsleeps"]))
-
-        # 8. Lock path (every lock reason). An invalid assessment shows FAULT
+        # 9. Lock path (every hard failure). An invalid assessment shows FAULT
         # and its real cause on the unit; the backend gets the lock reason.
         if invalid_cause is not None:
             _frs_debug.log_event(time.time(), "predrive_verdict", "FAULT", invalid_cause)
@@ -2495,12 +2850,127 @@ def run_predrive_assessment(
                               lock_reason, assessment_id, calibration_record,
                               continue_to_monitoring=continue_to_monitoring,
                               display_reason=("INVALID ASSESSMENT" if invalid_cause is not None
-                                              else None))
+                                              else None),
+                              cycle_started=cycle_started)
 
+    except (SessionEnded, QuitRequested, KeyboardInterrupt) as exc:
+        # The trial's record says how it ended (END SESSION, or STOP / quit).
+        if assessment is not None and assessment.timeline_summary()["end_reason"] is None:
+            close_assessment(assessment, driver_id, "session_ended"
+                             if isinstance(exc, SessionEnded) else "stopped")
+        raise
     except PhaseChanged:
         logger.info("Pre-drive: ignition turned ON - leaving pre-drive (starter %s)",
                     alert_manager.get_relay_state())
         return False
+
+
+def _first_window_verdict(result: Dict[str, Any]) -> Tuple[Optional[LockReason], Optional[str]]:
+    """
+    The eligibility verdict on the first ``config.PREDRIVE_ASSESSMENT_SECONDS``
+    - the fixed assessment's verdict, unchanged. Logs it.
+
+    Returns:
+        ``(lock_reason, invalid_cause)``: ``(None, None)`` on a pass.
+    """
+    logger.info("Pre-drive result: passed=%s void=%s valid=%.1f%% worst_%.0fs_mean=%.3f "
+                "mean=%.3f median=%.3f max=%.3f n=%d invalid=%d %s "
+                "pose_override_frames=%d yawns=%d microsleeps=%d",
+                result["passed"], result["void"], result["valid_fraction"] * 100,
+                result["worst_window_s"], result["worst_window_mean"],
+                result["mean_frs"], result["median_frs"], result["max_frs"],
+                result["n_samples"], result["n_no_face"], result["invalid_reasons"],
+                result["pose_override_frames"], result["yawns"],
+                result["microsleeps"])
+    # Priority (2026-10-15): microsleep_detected > invalid assessment
+    # > FRS fail. A confirmed microsleep was measured on valid frames
+    # throughout, so it stands even if the run as a whole was invalid.
+    if result["failed_on_microsleep"]:
+        # Checked before the aggregate so the lock reason names the
+        # real finding: a microsleep fails outright, and the worst
+        # window can easily still be under the threshold when it does.
+        if result["void"]:
+            logger.warning("Pre-drive: assessment also INVALID (valid frames %.1f%%) - "
+                           "the microsleep takes priority",
+                           result["valid_fraction"] * 100)
+        logger.warning(
+            "Pre-drive: FAILED ON MICROSLEEP - %d confirmed during the %.0fs "
+            "assessment (worst %.0fs mean %.3f vs threshold %.2f; the aggregate "
+            "alone would have %s). Sleep intrusion in a stationary vehicle is "
+            "disqualifying on its own.",
+            result["microsleeps"], result["duration_s"], result["worst_window_s"],
+            result["worst_window_mean"], result["pass_threshold"],
+            "FAILED" if result["worst_window_mean"] >= result["pass_threshold"]
+            else "PASSED",
+        )
+        return LockReason.MICROSLEEP_DETECTED, None
+    if result["void"]:
+        # Not enough valid frames to judge: an invalid assessment
+        # (FAULT), not fatigue. Raised as driver_not_recognized - the
+        # backend has no separate reason - with the real cause here.
+        invalid_cause = ("INVALID_ASSESSMENT: valid frames %.1f%% < %.0f%% (%s)"
+                         % (result["valid_fraction"] * 100,
+                            result["min_valid_fraction"] * 100,
+                            ", ".join(f"{k} {v}" for k, v in
+                                      result["invalid_reasons"].items()) or "no frames"))
+        logger.warning("Pre-drive: %s - FAULT, starter stays inhibited (raised as "
+                       "driver_not_recognized)", invalid_cause)
+        return LockReason.DRIVER_NOT_RECOGNIZED, invalid_cause
+    if not result["passed"]:
+        logger.warning(
+            "Pre-drive: FAILED on aggregate - worst %.0fs mean %.3f >= %.2f",
+            result["worst_window_s"], result["worst_window_mean"],
+            result["pass_threshold"],
+        )
+        return LockReason.FATIGUE_DETECTED, None
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# IDLE and END SESSION (2026-10-19)
+# ---------------------------------------------------------------------------
+
+def run_idle(rate: LoopRate) -> None:
+    """
+    IDLE, after END SESSION: starter inhibited, LEDs and buzzer off, the
+    camera still read (so the heartbeat keeps ticking) but nothing processed.
+    Returns when START NEXT DRIVER (BEGIN, made in IDLE) is tapped.
+    """
+    set_session_state(SessionState.IDLE, "waiting for the next driver")
+    logger.info("IDLE - starter %s; waiting for the next driver (START NEXT DRIVER on the "
+                "launcher, or key 'b')",
+                _alert_manager.get_relay_state() if _alert_manager else "n/a")
+    while True:
+        frame = next_frame()
+        rate.tick()
+        display_text(frame, "Session ended", WHITE)
+        display_text(frame, "Waiting for the next driver - tap START NEXT DRIVER", GREY, dy=40)
+        draw_banner(frame, "IDLE  |  starter LOCKED  |  waiting for the next driver", GREY)
+        present(frame)
+        if _requests.take(BEGIN, SessionState.IDLE) is not None:
+            logger.info("IDLE -> next driver: starting pre-drive")
+            return
+
+
+def end_session(alert_manager: AlertManager) -> None:
+    """
+    END SESSION (2026-10-19): the stand-in for key-OFF, which cannot be
+    sensed. Inhibits the starter (leaving monitoring first, so the lock is
+    allowed), stops any active alert and forgets the driver and any pending
+    request. The loop that was running has already closed its own state
+    (assessment files, monitoring faults) on the way out. The caller then
+    runs :func:`run_idle`; the process keeps running.
+    """
+    was = _session_state.value if _session_state is not None else "-"
+    _requests.discard(END_SESSION)
+    _requests.discard(BEGIN, "session ended")
+    alert_manager.set_phase(Phase.PREDRIVE)
+    alert_manager.lock_relay()
+    alert_manager.idle()
+    _screen.reset_session()
+    logger.warning("SESSION ENDED by the operator at %s (was %s) - starter %s, alerts off, "
+                   "pre-drive / READY_TO_START state cleared", _stamp(time.time()), was,
+                   alert_manager.get_relay_state())
 
 
 # ---------------------------------------------------------------------------
@@ -2574,6 +3044,7 @@ def run_monitoring(
     alert_manager.set_phase(Phase.MONITORING)
     alert_manager.set_alert_level("ALERT")
     _screen.reset_session()
+    set_session_state(SessionState.MONITORING)
     logger.info("=== MONITORING phase (%s) - starter %s, lock refused ===",
                 "entered from pre-drive release" if from_release else "ignition ON",
                 alert_manager.get_relay_state())
@@ -2613,243 +3084,259 @@ def run_monitoring(
     # See from_release: whether this session has seen the ignition ON yet.
     ignition_seen_on = False
 
-    while True:
-        prof.frame()
-        with prof.section("gpio"):
-            ignition_on = ignition.phase() is Phase.MONITORING
-        if ignition_on:
-            ignition_seen_on = True
-        elif ignition_seen_on or not from_release:
-            break
-        with prof.section("capture"):
-            frame = next_frame()
-        fps = rate.tick()
-        now, now_mono = time.time(), time.monotonic()
-        if alert_manager.relay_locked:
-            # Key turned ON before an assessment passed: the fuse tap is live
-            # but the starter is still inhibited. Nothing here can release it.
-            banner, banner_color = ("MONITORING  |  starter LOCKED - turn ignition OFF "
-                                    "for pre-drive assessment"), (0, 0, 255)
-        else:
-            banner, banner_color = "MONITORING  |  relay never engages", (0, 200, 0)
+    def close(resolution: str) -> None:
+        """Stop profiling and resolve any fault still open on the backend."""
+        global _profiler
+        prof.stop()
+        _profiler = None
+        if open_fault is not None:
+            # The driver still unseen at the end: close the record so the
+            # portal does not show a fault open forever.
+            open_fault.push(api_client, "resolved", time.monotonic(),
+                            datetime.now(timezone.utc), resolution)
+        if seed_fault is not None:
+            seed_fault.push(api_client, "resolved", time.monotonic(),
+                            datetime.now(timezone.utc), resolution)
 
-        # Landmarks. No face never lowers the level and never raises it to
-        # DANGER: the pipeline's NoFacePolicy holds, latches or faults.
-        with prof.section("landmarks"):
-            landmarks, _rect = extractor.extract(frame)
-            # Invalid landmarks are handled exactly like no face (2026-10-15).
-            problem = landmark_problem(landmarks, frame.shape)
-        if problem is not None:
-            with prof.section("pipeline"):
-                verdict = pipeline.note_no_face(now, now_mono)
-            _frs_debug.log_unscored(now, "monitoring", False, verdict.level,
-                                    f"{unscored_reason(problem)}:{verdict.band}")
-            if verdict.level != last_level:
-                logger.info("Level %s -> %s (no face %.1fs, %s)", last_level or "(none)",
-                            verdict.level, verdict.gap_s, verdict.band)
-            last_level = verdict.level
+    try:
+        while True:
+            prof.frame()
+            # The phase is pinned for the run (modules.ignition.ForcedIgnition;
+            # TODO: ignition sense, deferred hardware), so in practice this
+            # loop ends only by END SESSION or quit.
             with prof.section("gpio"):
-                alert_manager.set_alert_level(verdict.level)
-            if verdict.event in FAULT_TYPE_FOR_EVENT:
-                open_fault = OpenFault(
+                ignition_on = ignition.phase() is Phase.MONITORING
+            if ignition_on:
+                ignition_seen_on = True
+            elif ignition_seen_on or not from_release:
+                break
+            with prof.section("capture"):
+                frame = next_frame()
+            fps = rate.tick()
+            now, now_mono = time.time(), time.monotonic()
+            if alert_manager.relay_locked:
+                # Monitoring without a pre-drive release (--force-phase
+                # monitoring): the starter stays inhibited. Nothing here can
+                # release it.
+                banner, banner_color = ("MONITORING  |  starter LOCKED - no pre-drive "
+                                        "assessment passed"), (0, 0, 255)
+            else:
+                banner, banner_color = "MONITORING  |  relay never engages", (0, 200, 0)
+
+            # Landmarks. No face never lowers the level and never raises it to
+            # DANGER: the pipeline's NoFacePolicy holds, latches or faults.
+            with prof.section("landmarks"):
+                landmarks, _rect = extractor.extract(frame)
+                # Invalid landmarks are handled exactly like no face (2026-10-15).
+                problem = landmark_problem(landmarks, frame.shape)
+            if problem is not None:
+                with prof.section("pipeline"):
+                    verdict = pipeline.note_no_face(now, now_mono)
+                _frs_debug.log_unscored(now, "monitoring", False, verdict.level,
+                                        f"{unscored_reason(problem)}:{verdict.band}")
+                if verdict.level != last_level:
+                    logger.info("Level %s -> %s (no face %.1fs, %s)", last_level or "(none)",
+                                verdict.level, verdict.gap_s, verdict.band)
+                last_level = verdict.level
+                with prof.section("gpio"):
+                    alert_manager.set_alert_level(verdict.level)
+                if verdict.event in FAULT_TYPE_FOR_EVENT:
+                    open_fault = OpenFault(
+                        fault_uuid=str(uuid.uuid4()),
+                        fault_type=FAULT_TYPE_FOR_EVENT[verdict.event],
+                        driver_id=current_driver_id,
+                        entry_level=verdict.entry_level,
+                        started_at=datetime.now(timezone.utc) - timedelta(seconds=verdict.gap_s),
+                        last_known=last_m.last_known() if last_m is not None else None,
+                        gap_s=verdict.gap_s,
+                        last_push_mono=now_mono,
+                    )
+                    with prof.section("api"):
+                        open_fault.push(api_client, "open", now_mono)
+                elif open_fault is not None:
+                    open_fault.gap_s = verdict.gap_s
+                    if now_mono - open_fault.last_push_mono >= MONITORING_FAULT_REFRESH_S:
+                        with prof.section("api"):
+                            open_fault.push(api_client, "open", now_mono)
+                if seed_fault is not None:
+                    with prof.section("api"):
+                        seed_fault.refresh_elapsed(api_client, now_mono)
+                with prof.section("display"):
+                    _screen.face, _screen.face_detail = FACE_NONE, f"{verdict.gap_s:.1f}s"
+                    _screen.level = verdict.level
+                    if driver:
+                        _screen.driver_name = str(driver["name"])
+                    display_text(frame, f"NO FACE {verdict.gap_s:.1f}s  [{verdict.band}]",
+                                 LEVEL_BGR.get(verdict.level, WHITE))
+                    draw_banner(frame, banner, banner_color)
+                    if debug_pose:
+                        draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
+                present(frame)   # times its own heartbeat (api) and imshow (display)
+                continue
+
+            # First face after a fault resolves it. Done here rather than from
+            # m.gap_ended: a driver change below resets the pipeline first.
+            fault_resolved = open_fault is not None
+            if open_fault is not None:
+                resolved = datetime.now(timezone.utc)
+                logger.info("Face re-acquired after %.1fs - %s fault resolved",
+                            (resolved - open_fault.started_at).total_seconds(),
+                            open_fault.fault_type)
+                with prof.section("api"):
+                    open_fault.push(api_client, "resolved", now_mono, resolved, "face_reacquired")
+                open_fault = None
+
+            # Identify - every face frame until the driver is recognised, then
+            # never again this session (see docstring: ~1 s per call, GIL-bound).
+            if current_driver_id is None and now_mono >= next_identify:
+                identify_attempts += 1
+                with prof.section("recognition"):
+                    match = recognizer.identify(frame)
+                # Spaced from the END of the ~1 s attempt, so the loop always
+                # gets UNRECOGNISED_RETRY_S of real frames between stalls.
+                next_identify = time.monotonic() + UNRECOGNISED_RETRY_S
+                # Re-stamp the frame after the ~1 s call, so recognition time is
+                # never counted as eye-closure time: the pipeline sees the gap and
+                # abandons any closure in progress (config.MAX_FRAME_GAP_S).
+                now, now_mono = time.time(), time.monotonic()
+                if match is None:
+                    if not defaults_logged:
+                        logger.warning("Monitoring: driver not recognised - self-seeding the EAR "
+                                       "baseline from this driver's own EAR (overrides only for "
+                                       "the first %.0fs of face time); retrying recognition "
+                                       "every %.0fs", SELF_SEED_S, UNRECOGNISED_RETRY_S)
+                        defaults_logged = True
+                    else:
+                        logger.info("Monitoring: recognition attempt %d - no match, driver stays "
+                                    "UNRECOGNISED; next attempt in %.0fs",
+                                    identify_attempts, UNRECOGNISED_RETRY_S)
+                else:
+                    driver = match
+                    current_driver_id = int(match["driver_id"])
+                    logger.info("Driver identified: %s (id=%s, confidence %.2f, attempt %d) - "
+                                "recognition stops for this session", match["name"],
+                                current_driver_id, match["confidence"], identify_attempts)
+                    # A foreign-device calibration IS used here (flagged on every
+                    # event), unlike pre-drive where it locks. Decided 2026-09-28:
+                    # a real alert-state baseline measured at the wrong camera
+                    # angle beats one self-seeded from a driver who may already
+                    # be drowsy - that failure is silent and defeats detection
+                    # for exactly the drivers who need it. The angle error is
+                    # unquantified (a stated limitation). Self-seed only when
+                    # there is no calibration, or (a flagged repair) when the
+                    # record has no EAR baseline.
+                    with prof.section("api"):   # synchronous GET, once, on recognition
+                        calibration, _ = load_calibration(api_client, current_driver_id,
+                                                          Phase.MONITORING)
+                    if calibration is None:
+                        logger.warning("Monitoring: no usable calibration for driver %s - "
+                                       "self-seeding the EAR baseline; re-enrol with "
+                                       "`main.py --enroll`", current_driver_id)
+                    thresholds = (calibration.thresholds if calibration is not None
+                                  else dict(DEFAULT_THRESHOLDS))
+                    # Fresh history so metrics accumulated before recognition
+                    # (on a self-seeded baseline) don't leak into this driver's.
+                    # That includes a self-seed that gave up: it starts over.
+                    pipeline.reset()
+                    # This driver's neutral head pose from enrollment on this
+                    # unit; without one it is seeded from the next few seconds.
+                    stored_neutral = load_neutral(current_driver_id)
+                    if stored_neutral is not None:
+                        pipeline.set_pose_neutral(stored_neutral, "stored")
+                    if seed_fault is not None:
+                        logger.info("Driver identified - no_ear_baseline fault resolved (%s)",
+                                    "calibration loaded" if calibration is not None
+                                    else "self-seed restarts")
+                        with prof.section("api"):
+                            seed_fault.push(api_client, "resolved", now_mono,
+                                            datetime.now(timezone.utc), "driver_identified")
+                        seed_fault = None
+                    last_danger_push = 0.0
+
+            with prof.section("pipeline"):
+                m = pipeline.process(landmarks, thresholds, now, now_mono,
+                                     self_seed=calibration is None or calibration.self_seed_ear)
+            _frs_debug.log_frame(m, "monitoring", pipeline.pose_neutral_source)
+            last_m = m
+            if m.seed_failed and seed_fault is None:
+                seed_fault = OpenFault(
                     fault_uuid=str(uuid.uuid4()),
-                    fault_type=FAULT_TYPE_FOR_EVENT[verdict.event],
+                    fault_type=FAULT_TYPE_NO_EAR_BASELINE,
                     driver_id=current_driver_id,
-                    entry_level=verdict.entry_level,
-                    started_at=datetime.now(timezone.utc) - timedelta(seconds=verdict.gap_s),
-                    last_known=last_m.last_known() if last_m is not None else None,
-                    gap_s=verdict.gap_s,
+                    entry_level=last_level or "ALERT",
+                    started_at=datetime.now(timezone.utc),
+                    last_known=None,     # nothing was ever scored
+                    gap_s=0.0,
                     last_push_mono=now_mono,
                 )
                 with prof.section("api"):
-                    open_fault.push(api_client, "open", now_mono)
-            elif open_fault is not None:
-                open_fault.gap_s = verdict.gap_s
-                if now_mono - open_fault.last_push_mono >= MONITORING_FAULT_REFRESH_S:
-                    with prof.section("api"):
-                        open_fault.push(api_client, "open", now_mono)
-            if seed_fault is not None:
+                    seed_fault.push(api_client, "open", now_mono)
+            elif seed_fault is not None:
                 with prof.section("api"):
                     seed_fault.refresh_elapsed(api_client, now_mono)
+            # (A gap that opened a fault was already logged above when it was resolved.)
+            if m.gap_ended is not None and m.gap_ended.face_lost and not fault_resolved:
+                logger.info("Face re-acquired after %.1fs (%s from %s)%s",
+                            m.gap_ended.gap_s, m.gap_ended.band, m.gap_ended.entry_level,
+                            " - DANGER latched until %.0fs below DANGER"
+                            % pipeline.no_face.latch.release_hold if m.no_face_latch else "")
+
+            # Log the full FRS breakdown whenever the effective level changes, so
+            # the session log shows which term carried the score into the new
+            # band rather than just the total.
+            if m.level != last_level:
+                logger.info(
+                    "Level %s -> %s: %s%s%s",
+                    last_level or "(none)", m.level,
+                    pipeline.frs_calc.format_breakdown(m.frs_result) if m.scored
+                    else "not scored (EAR self-seed gave up - no baseline)" if m.seed_failed
+                    else "not scored (self-seeding EAR baseline)",
+                    f"  [{m.override_reason} override forcing DANGER]" if m.overridden else
+                    f"  [{m.level_reason}]",
+                    f"  [escalation {m.band}; raw band {m.frs_result['level']}]"
+                    if m.scored and not m.overridden and m.band != m.frs_result["level"] else "",
+                )
+                logger.debug(
+                    "Level %s inputs: ear=%.3f (norm %.3f) perclos=%.1f%% (norm %.3f) "
+                    "blink_dur=%.0fms (norm %.3f) blink_freq=%.1f (norm %.3f) "
+                    "mar=%.3f (norm %.3f) yawn_norm=%.3f",
+                    m.level, m.ear, m.ear_norm, m.perclos, m.perclos_norm,
+                    m.blink_duration_ms, m.bd_norm, m.blink_freq, m.bf_norm,
+                    m.mar, m.mar_norm, m.yawn_norm,
+                )
+                last_level = m.level
+
+            # Physical alerts - LEDs and buzzer only. m.level is DANGER while the
+            # head-pose override is active regardless of the (lower) FRS level.
+            with prof.section("gpio"):
+                alert_manager.set_alert_level(m.level)
+
+            # Operator notification: DANGER to the backend, rate-limited.
+            if m.level == "DANGER" and now - last_danger_push >= DANGER_EVENT_INTERVAL:
+                with prof.section("api"):
+                    api_client.push_fatigue_event(
+                        current_driver_id, m.effective_result(), m.ear, m.perclos,
+                        relay_triggered=False, phase=Phase.MONITORING,
+                        provenance=(calibration.provenance() if calibration is not None
+                                    else SELF_SEEDED_PROVENANCE),
+                    )
+                last_danger_push = now
+
             with prof.section("display"):
-                _screen.face, _screen.face_detail = FACE_NONE, f"{verdict.gap_s:.1f}s"
-                _screen.level = verdict.level
-                if driver:
-                    _screen.driver_name = str(driver["name"])
-                display_text(frame, f"NO FACE {verdict.gap_s:.1f}s  [{verdict.band}]",
-                             LEVEL_BGR.get(verdict.level, WHITE))
+                draw_overlay(frame, driver, m, fps, pipeline, thresholds, landmarks,
+                             calibrated=calibration is not None)
                 draw_banner(frame, banner, banner_color)
                 if debug_pose:
                     draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
             present(frame)   # times its own heartbeat (api) and imshow (display)
-            continue
 
-        # First face after a fault resolves it. Done here rather than from
-        # m.gap_ended: a driver change below resets the pipeline first.
-        fault_resolved = open_fault is not None
-        if open_fault is not None:
-            resolved = datetime.now(timezone.utc)
-            logger.info("Face re-acquired after %.1fs - %s fault resolved",
-                        (resolved - open_fault.started_at).total_seconds(),
-                        open_fault.fault_type)
-            with prof.section("api"):
-                open_fault.push(api_client, "resolved", now_mono, resolved, "face_reacquired")
-            open_fault = None
-
-        # Identify - every face frame until the driver is recognised, then
-        # never again this session (see docstring: ~1 s per call, GIL-bound).
-        if current_driver_id is None and now_mono >= next_identify:
-            identify_attempts += 1
-            with prof.section("recognition"):
-                match = recognizer.identify(frame)
-            # Spaced from the END of the ~1 s attempt, so the loop always
-            # gets UNRECOGNISED_RETRY_S of real frames between stalls.
-            next_identify = time.monotonic() + UNRECOGNISED_RETRY_S
-            # Re-stamp the frame after the ~1 s call, so recognition time is
-            # never counted as eye-closure time: the pipeline sees the gap and
-            # abandons any closure in progress (config.MAX_FRAME_GAP_S).
-            now, now_mono = time.time(), time.monotonic()
-            if match is None:
-                if not defaults_logged:
-                    logger.warning("Monitoring: driver not recognised - self-seeding the EAR "
-                                   "baseline from this driver's own EAR (overrides only for "
-                                   "the first %.0fs of face time); retrying recognition "
-                                   "every %.0fs", SELF_SEED_S, UNRECOGNISED_RETRY_S)
-                    defaults_logged = True
-                else:
-                    logger.info("Monitoring: recognition attempt %d - no match, driver stays "
-                                "UNRECOGNISED; next attempt in %.0fs",
-                                identify_attempts, UNRECOGNISED_RETRY_S)
-            else:
-                driver = match
-                current_driver_id = int(match["driver_id"])
-                logger.info("Driver identified: %s (id=%s, confidence %.2f, attempt %d) - "
-                            "recognition stops for this session", match["name"],
-                            current_driver_id, match["confidence"], identify_attempts)
-                # A foreign-device calibration IS used here (flagged on every
-                # event), unlike pre-drive where it locks. Decided 2026-09-28:
-                # a real alert-state baseline measured at the wrong camera
-                # angle beats one self-seeded from a driver who may already
-                # be drowsy - that failure is silent and defeats detection
-                # for exactly the drivers who need it. The angle error is
-                # unquantified (a stated limitation). Self-seed only when
-                # there is no calibration, or (a flagged repair) when the
-                # record has no EAR baseline.
-                with prof.section("api"):   # synchronous GET, once, on recognition
-                    calibration, _ = load_calibration(api_client, current_driver_id,
-                                                      Phase.MONITORING)
-                if calibration is None:
-                    logger.warning("Monitoring: no usable calibration for driver %s - "
-                                   "self-seeding the EAR baseline; re-enrol with "
-                                   "`main.py --enroll`", current_driver_id)
-                thresholds = (calibration.thresholds if calibration is not None
-                              else dict(DEFAULT_THRESHOLDS))
-                # Fresh history so metrics accumulated before recognition
-                # (on a self-seeded baseline) don't leak into this driver's.
-                # That includes a self-seed that gave up: it starts over.
-                pipeline.reset()
-                # This driver's neutral head pose from enrollment on this
-                # unit; without one it is seeded from the next few seconds.
-                stored_neutral = load_neutral(current_driver_id)
-                if stored_neutral is not None:
-                    pipeline.set_pose_neutral(stored_neutral, "stored")
-                if seed_fault is not None:
-                    logger.info("Driver identified - no_ear_baseline fault resolved (%s)",
-                                "calibration loaded" if calibration is not None
-                                else "self-seed restarts")
-                    with prof.section("api"):
-                        seed_fault.push(api_client, "resolved", now_mono,
-                                        datetime.now(timezone.utc), "driver_identified")
-                    seed_fault = None
-                last_danger_push = 0.0
-
-        with prof.section("pipeline"):
-            m = pipeline.process(landmarks, thresholds, now, now_mono,
-                                 self_seed=calibration is None or calibration.self_seed_ear)
-        _frs_debug.log_frame(m, "monitoring", pipeline.pose_neutral_source)
-        last_m = m
-        if m.seed_failed and seed_fault is None:
-            seed_fault = OpenFault(
-                fault_uuid=str(uuid.uuid4()),
-                fault_type=FAULT_TYPE_NO_EAR_BASELINE,
-                driver_id=current_driver_id,
-                entry_level=last_level or "ALERT",
-                started_at=datetime.now(timezone.utc),
-                last_known=None,     # nothing was ever scored
-                gap_s=0.0,
-                last_push_mono=now_mono,
-            )
-            with prof.section("api"):
-                seed_fault.push(api_client, "open", now_mono)
-        elif seed_fault is not None:
-            with prof.section("api"):
-                seed_fault.refresh_elapsed(api_client, now_mono)
-        # (A gap that opened a fault was already logged above when it was resolved.)
-        if m.gap_ended is not None and m.gap_ended.face_lost and not fault_resolved:
-            logger.info("Face re-acquired after %.1fs (%s from %s)%s",
-                        m.gap_ended.gap_s, m.gap_ended.band, m.gap_ended.entry_level,
-                        " - DANGER latched until %.0fs below DANGER"
-                        % pipeline.no_face.latch.release_hold if m.no_face_latch else "")
-
-        # Log the full FRS breakdown whenever the effective level changes, so
-        # the session log shows which term carried the score into the new
-        # band rather than just the total.
-        if m.level != last_level:
-            logger.info(
-                "Level %s -> %s: %s%s%s",
-                last_level or "(none)", m.level,
-                pipeline.frs_calc.format_breakdown(m.frs_result) if m.scored
-                else "not scored (EAR self-seed gave up - no baseline)" if m.seed_failed
-                else "not scored (self-seeding EAR baseline)",
-                f"  [{m.override_reason} override forcing DANGER]" if m.overridden else
-                f"  [{m.level_reason}]",
-                f"  [escalation {m.band}; raw band {m.frs_result['level']}]"
-                if m.scored and not m.overridden and m.band != m.frs_result["level"] else "",
-            )
-            logger.debug(
-                "Level %s inputs: ear=%.3f (norm %.3f) perclos=%.1f%% (norm %.3f) "
-                "blink_dur=%.0fms (norm %.3f) blink_freq=%.1f (norm %.3f) "
-                "mar=%.3f (norm %.3f) yawn_norm=%.3f",
-                m.level, m.ear, m.ear_norm, m.perclos, m.perclos_norm,
-                m.blink_duration_ms, m.bd_norm, m.blink_freq, m.bf_norm,
-                m.mar, m.mar_norm, m.yawn_norm,
-            )
-            last_level = m.level
-
-        # Physical alerts - LEDs and buzzer only. m.level is DANGER while the
-        # head-pose override is active regardless of the (lower) FRS level.
-        with prof.section("gpio"):
-            alert_manager.set_alert_level(m.level)
-
-        # Operator notification: DANGER to the backend, rate-limited.
-        if m.level == "DANGER" and now - last_danger_push >= DANGER_EVENT_INTERVAL:
-            with prof.section("api"):
-                api_client.push_fatigue_event(
-                    current_driver_id, m.effective_result(), m.ear, m.perclos,
-                    relay_triggered=False, phase=Phase.MONITORING,
-                    provenance=(calibration.provenance() if calibration is not None
-                                else SELF_SEEDED_PROVENANCE),
-                )
-            last_danger_push = now
-
-        with prof.section("display"):
-            draw_overlay(frame, driver, m, fps, pipeline, thresholds, landmarks,
-                         calibrated=calibration is not None)
-            draw_banner(frame, banner, banner_color)
-            if debug_pose:
-                draw_pose_debug(frame, pipeline.pose_debounce, now_mono, fps)
-        present(frame)   # times its own heartbeat (api) and imshow (display)
-
-    prof.stop()
-    _profiler = None
-    if open_fault is not None:
-        # Ignition OFF with the driver still unseen: close the record so the
-        # portal does not show a fault open forever.
-        open_fault.push(api_client, "resolved", time.monotonic(),
-                        datetime.now(timezone.utc), "ignition_off")
-    if seed_fault is not None:
-        seed_fault.push(api_client, "resolved", time.monotonic(),
-                        datetime.now(timezone.utc), "ignition_off")
+    except SessionEnded:
+        # END SESSION stands in for key-OFF (it cannot be sensed), so open
+        # faults resolve as "ignition_off" - the backend's existing value.
+        close("ignition_off")
+        logger.info("Monitoring: session ended by the operator")
+        raise
+    close("ignition_off")
     logger.info("Monitoring: ignition turned OFF - returning to pre-drive")
 
 
@@ -2870,20 +3357,18 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mock-gpio", action="store_true",
-        help="force AlertManager and IgnitionSensor into mock mode even on a Pi "
-             "(press 'i' in the preview window to toggle the mock ignition)",
+        help="force AlertManager into mock mode even on a Pi (no GPIO is driven)",
     )
     parser.add_argument(
         "--force-phase", choices=[p.value for p in Phase], default=None,
-        help="ignore the ignition input and stay in this phase (testing one phase in "
-             "isolation); in predrive a release does NOT continue into monitoring - "
-             "'r' re-runs the assessment",
+        help="stay in this phase (testing one phase in isolation); in predrive a confirmed "
+             "start does NOT continue into monitoring - it returns to IDLE",
     )
     parser.add_argument(
         "--sequence", action="store_true",
-        help="full session with no ignition input (bench / touchscreen): pre-drive, then - "
-             "once a pass or an approved override releases the starter - monitoring "
-             "until stopped",
+        help="full session (the default - there is no ignition input): pre-drive, then - "
+             "once the starter is released (pass or approved override) AND the start is "
+             "confirmed (BEGIN MONITORING) - monitoring until END SESSION or stop",
     )
     parser.add_argument(
         "--profile-loop", type=float, nargs="?", const=60.0, default=None, metavar="SECONDS",
@@ -2894,8 +3379,8 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-preview", action="store_true",
         help="no window at all - neither the data screen nor video (unattended data "
-             "collection). Keys q / i / r are then unavailable - stop with Ctrl-C or the "
-             "launcher's STOP",
+             "collection). Keys q / r / b / e are then unavailable - use the launcher's "
+             "buttons, `kill -USR1` (begin) / `kill -USR2` (end session), or Ctrl-C",
     )
     parser.add_argument(
         "--show-video", action="store_true",
@@ -2917,6 +3402,11 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument(
         "--reserve-bottom", type=int, default=0, metavar="PX",
         help="leave PX at the bottom of the data screen empty (the launcher's STOP strip)",
+    )
+    parser.add_argument(
+        "--state-file", default=None, metavar="PATH",
+        help="write the session state (IDLE / ... / READY_TO_START / MONITORING) to PATH as "
+             "JSON on every change (used by launcher.py for its strip buttons)",
     )
     parser.add_argument(
         "--result-file", default=None, metavar="PATH",
@@ -2948,6 +3438,8 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         parser.error("--sequence cannot be combined with --force-phase or --enroll")
     if args.profile_loop is not None and args.profile_loop <= 0:
         parser.error("--profile-loop SECONDS must be positive")
+    if args.state_file is not None and args.enroll:
+        parser.error("--state-file does not apply to --enroll")
     return args
 
 
@@ -2964,9 +3456,15 @@ def main(argv: Optional[list] = None) -> int:
     """
     global _camera, _alert_manager, _head_pose, _ignition, _heartbeat, _display_available
     global _display_mode, _fullscreen, _reserve_bottom, _stream, _rate
+    global _start_confirm, _state_file
 
     args = parse_args(argv)
     setup_logging()
+    if not args.enroll:
+        # Before any hardware: an unimplemented confirmation mode must stop
+        # the run here, not after the starter could be released.
+        _start_confirm = make_start_confirm(config.START_CONFIRM_MODE, _requests)
+        _state_file = args.state_file
     _fullscreen, _reserve_bottom = args.fullscreen, max(0, args.reserve_bottom)
     if args.no_preview:
         _display_available = False
@@ -3008,6 +3506,10 @@ def main(argv: Optional[list] = None) -> int:
         previous_sigterm = signal.signal(signal.SIGTERM, _raise_on_sigterm)
     except ValueError:  # not the main thread (tests)
         previous_sigterm = None
+    # The launcher's BEGIN MONITORING / START NEXT DRIVER (SIGUSR1) and END
+    # SESSION (SIGUSR2). Installed before the first state is published, so
+    # the launcher never signals a child that would die of SIGUSR1.
+    request_signals = [] if args.enroll else _install_request_signals()
 
     try:
         # 0. Alerts first (auto-detects GPIO): the relay is driven to INHIBIT
@@ -3017,10 +3519,12 @@ def main(argv: Optional[list] = None) -> int:
 
         # 1. Config is imported at module load; log the key values.
         logger.info("Config: device %s, camera %dx%d@%dfps, API %s, calibration %ds, "
-                    "pre-drive %ds (worst %.0fs window)",
+                    "pre-drive rolling %ds minimum (worst %.0fs window), start confirmation "
+                    "%s, no ignition input",
                     config.DEVICE_ID, config.CAMERA_WIDTH, config.CAMERA_HEIGHT,
                     config.CAMERA_FPS, config.API_BASE_URL, config.CALIBRATION_DURATION,
-                    config.PREDRIVE_ASSESSMENT_SECONDS, config.PREDRIVE_WORST_WINDOW_SECONDS)
+                    config.PREDRIVE_ASSESSMENT_SECONDS, config.PREDRIVE_WORST_WINDOW_SECONDS,
+                    config.START_CONFIRM_MODE)
 
         # 2. Backend
         api_client = APIClient()
@@ -3043,16 +3547,17 @@ def main(argv: Optional[list] = None) -> int:
             logger.warning("No driver encodings loaded - every driver will be UNKNOWN. "
                            "Run `python main.py --enroll` first.")
 
-        # 5. Ignition (selects the phase) - forced, mocked, or real GPIO
+        # 5. Phase. There is no ignition input (TODO: ignition sense, deferred
+        #    hardware), so the phase is pinned: --force-phase, else pre-drive
+        #    for good - monitoring (entered from a confirmed start) never sees
+        #    an ON -> OFF edge and runs until END SESSION or stop. Without
+        #    flags this is the same as --sequence.
         if args.force_phase:
             _ignition = ForcedIgnition(Phase(args.force_phase))
-        elif args.sequence:
-            # Reads as ignition OFF for good: pre-drive first, and monitoring
-            # (entered from a release) never sees an ON -> OFF edge, so it
-            # runs until stopped.
-            _ignition = ForcedIgnition(Phase.PREDRIVE, source="--sequence")
         else:
-            _ignition = IgnitionSensor(mock=args.mock_gpio)
+            _ignition = ForcedIgnition(Phase.PREDRIVE,
+                                       source="--sequence" if args.sequence
+                                       else "default (no ignition input)")
         initial_phase = _ignition.phase()
 
         # 6. Alerts were created in step 0 (relay inhibited); set the phase.
@@ -3081,37 +3586,55 @@ def main(argv: Optional[list] = None) -> int:
                         "press 'q' in the window or Ctrl-C" if _display_available else "Ctrl-C",
                         config.HEARTBEAT_INTERVAL_SECONDS,
                         config.FIRMWARE_VERSION)
-            # 8. Phase supervisor. A pre-drive that releases the starter (pass
-            #    or approved override) goes straight into monitoring - no key
-            #    press - except under --force-phase predrive, which tests that
-            #    phase alone. Monitoring returns when the ignition turns OFF,
-            #    and every pre-drive starts by re-inhibiting the starter.
+            # 8. Session supervisor. A pre-drive that releases the starter
+            #    (pass or approved override) waits in READY_TO_START for the
+            #    start confirmation and only then goes into monitoring -
+            #    except under --force-phase predrive, which tests that phase
+            #    alone (back to IDLE). Every pre-drive starts by re-inhibiting
+            #    the starter. END SESSION, from any state, ends up here: the
+            #    starter is inhibited, alerts stop and the unit waits in IDLE
+            #    for the next driver - the process keeps running.
             continue_to_monitoring = args.force_phase is None
+            idle_first = False
             while True:
-                if _ignition.phase() is Phase.PREDRIVE:
-                    released = run_predrive_assessment(
-                        api_client, extractor, recognizer, _alert_manager, _head_pose,
-                        _ignition, rate, debug_pose=args.debug_pose, diag_ear=args.diag_ear,
-                        pose_release_hold=args.pose_release_hold,
-                        continue_to_monitoring=continue_to_monitoring,
-                    )
-                    if not released:
-                        # 'r' (re-run), or ignition ON before a release:
-                        # re-read the phase, starter still inhibited.
-                        continue
-                    run_monitoring(
-                        api_client, extractor, recognizer, _alert_manager, _head_pose,
-                        _ignition, rate, debug_pose=args.debug_pose, diag_ear=args.diag_ear,
-                        pose_release_hold=args.pose_release_hold, from_release=True,
-                        profile_s=args.profile_loop,
-                    )
-                else:
-                    run_monitoring(
-                        api_client, extractor, recognizer, _alert_manager, _head_pose,
-                        _ignition, rate, debug_pose=args.debug_pose, diag_ear=args.diag_ear,
-                        pose_release_hold=args.pose_release_hold,
-                        profile_s=args.profile_loop,
-                    )
+                try:
+                    if idle_first:
+                        idle_first = False
+                        run_idle(rate)
+                    if _ignition.phase() is Phase.PREDRIVE:
+                        released = run_predrive_assessment(
+                            api_client, extractor, recognizer, _alert_manager, _head_pose,
+                            _ignition, rate, debug_pose=args.debug_pose,
+                            diag_ear=args.diag_ear, pose_release_hold=args.pose_release_hold,
+                            continue_to_monitoring=continue_to_monitoring,
+                        )
+                        if not released:
+                            # 'r' (re-run) or a change of driver: a fresh
+                            # pre-drive, starter still inhibited.
+                            continue
+                        if not continue_to_monitoring:
+                            logger.info("--force-phase predrive: start confirmed - monitoring "
+                                        "is not entered (phase tested alone); back to IDLE")
+                            _alert_manager.lock_relay()
+                            _alert_manager.idle()
+                            idle_first = True
+                            continue
+                        run_monitoring(
+                            api_client, extractor, recognizer, _alert_manager, _head_pose,
+                            _ignition, rate, debug_pose=args.debug_pose,
+                            diag_ear=args.diag_ear, pose_release_hold=args.pose_release_hold,
+                            from_release=True, profile_s=args.profile_loop,
+                        )
+                    else:
+                        run_monitoring(
+                            api_client, extractor, recognizer, _alert_manager, _head_pose,
+                            _ignition, rate, debug_pose=args.debug_pose,
+                            diag_ear=args.diag_ear, pose_release_hold=args.pose_release_hold,
+                            profile_s=args.profile_loop,
+                        )
+                except SessionEnded:
+                    end_session(_alert_manager)
+                    idle_first = True
 
     except QuitRequested:
         logger.info("Quit requested from the preview window")
@@ -3126,6 +3649,8 @@ def main(argv: Optional[list] = None) -> int:
         cleanup()
         if previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)
+        for signum, previous in request_signals:
+            signal.signal(signum, previous)
         if args.enroll and args.result_file:
             write_enroll_result(args.result_file, args.driver_id, exit_code, interrupted)
 

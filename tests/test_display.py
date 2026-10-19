@@ -70,9 +70,10 @@ def test_data_screen_cannot_take_a_camera_image():
 def test_session_window_never_gets_a_camera_frame(m, rig, hp, monkeypatch):
     """Pre-drive pass -> monitoring with a no-face gap, data screen on: only canvases are shown."""
     shown, camera_on_panel = [], []
-    monkeypatch.setattr(m, "show_frame", lambda img: (shown.append(img.shape),
-                                                      camera_on_panel.append(shows_camera(img)),
-                                                      -1)[2])
+    # BEGIN MONITORING as soon as READY_TO_START is on screen.
+    monkeypatch.setattr(m, "show_frame", lambda img: (
+        shown.append(img.shape), camera_on_panel.append(shows_camera(img)),
+        m.KEY_BEGIN if m._session_state is m.SessionState.READY_TO_START else -1)[2])
     m._camera = MarkedCam()
     m._display_mode, m._display_available, m._reserve_bottom = "data", True, 66
     monkeypatch.setattr(m, "identify_driver_bounded",

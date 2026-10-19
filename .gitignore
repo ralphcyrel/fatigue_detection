@@ -8,3 +8,5 @@ models/*.dat
 frames/
 snap_*.jpg
 .pytest_cache/
+logs/session_state.json*
+logs/.launcher_autostart.lock

@@ -24,19 +24,47 @@ drowsiness indicators:
 
 ## Operating phases
 
-The ignition state (a fuse tap on an ignition-switched circuit, read on GPIO 25)
-selects the phase:
+There is **no ignition input** (2026-10-19). The Pi's only connection to the
+starter circuit is the relay control on GPIO 17: SMPS +5 V feeds the key
+switch's BAT terminal, START feeds relay COM and relay NO feeds the motor, so
+the motor runs only while the key is held at START *and* the relay is
+energised. The ignition-position sense (GPIO 25) and a relay-feedback divider
+(GPIO 5) are deferred hardware work; no code reads either pin.
 
-| Phase | Ignition | What happens | Starter relay |
-|---|---|---|---|
-| **Enrollment** (`--enroll`) | — | Operator-supervised, at hiring: face encoding + a 4 s closed-eye capture (the landmarks must show the eyelid closing: closed/open EAR ≤ 0.60) + 60 s alert-state calibration → backend. | untouched |
-| **Pre-drive assessment** | OFF | Recognise the driver (≤ 10 s, 3 consistent matches) → fetch *their* calibration captured on this unit (none → lock `no_baseline`; only another unit's → lock `foreign_device_baseline`; never another driver's, never defaults) → 30 s assessment through the shared pipeline. Verdict = worst 5 s rolling mean of FRS `< 0.40`. | **Only phase that drives it.** Starts inhibited; released on PASS or an approved operator override. |
-| **Continuous monitoring** | ON | Same pipeline; LEDs, buzzer and `POST /fatigue-events` only. Unrecognised driver / no usable calibration → EAR baseline self-seeded from the driver's own EAR over the first 5 s (head-pose and microsleep overrides only until then); other baselines generic. After 6 discarded seeds the level is FAULT and a `no_ear_baseline` monitoring fault is raised. | **Never engaged.** `AlertManager.lock_relay()` refuses with a WARNING in this phase. Entering the phase does not release it either (key-ON precedes cranking). |
+| Phase | What happens | Starter relay |
+|---|---|---|
+| **Enrollment** (`--enroll`) | Operator-supervised, at hiring: face encoding + a 4 s closed-eye capture (the landmarks must show the eyelid closing: closed/open EAR ≤ 0.60) + 60 s alert-state calibration → backend. | untouched |
+| **Pre-drive assessment** | Recognise the driver (≤ 10 s, 3 consistent matches) → fetch *their* calibration captured on this unit (none → lock `no_baseline`; only another unit's → lock `foreign_device_baseline`; never another driver's, never defaults) → settle 3 s → **rolling** assessment through the shared pipeline, **30 s minimum**, no maximum. At 30 s the first 30 s are judged as before (worst 5 s mean FRS `< 0.40`, ≥ 80 % valid frames, no microsleep); a fail is a hard failure. After that the same rule is applied to the most recent 30 s on every frame. | **Only phase that drives it.** Starts inhibited. Released in **READY_TO_START** (rolling window passes, face seen within 2 s, same driver) or on an approved operator override; inhibited again as soon as READY_TO_START is lost. |
+| **Continuous monitoring** | Entered **only** on the start confirmation (`START_CONFIRM_MODE = "touch"`: BEGIN MONITORING on the launcher strip), never on a timeout. Same pipeline; LEDs, buzzer and `POST /fatigue-events` only. Unrecognised driver / no usable calibration → EAR baseline self-seeded from the driver's own EAR over the first 5 s (head-pose and microsleep overrides only until then); other baselines generic. After 6 discarded seeds the level is FAULT and a `no_ear_baseline` monitoring fault is raised. | **Never engaged.** `AlertManager.lock_relay()` refuses with a WARNING in this phase. |
 
-Three lock reasons keep the starter inhibited after pre-drive — `fatigue_detected`,
-`driver_not_recognized`, `no_baseline` — and all three resolve through one operator
-override request (`POST /override-requests`, polled every 5 s). Every ignition-OFF
-returns to pre-drive and re-locks; a pass is not carried across ignition cycles.
+Session states (published to the launcher with `main.py --state-file`):
+
+```
+IDLE ──START NEXT DRIVER──▶ IDENTIFYING ─▶ SETTLING ─▶ ASSESSING ◀──────────────┐
+                                 │             │          │ ≥ 30 s and the last   │ window fails / no face
+                                 ▼             ▼          ▼ 30 s pass             │ > 2 s / driver changes
+                              LOCKED ◀─── hard failure ── READY_TO_START ─────────┘
+                    (override approved ─▶ READY_TO_START)      │ BEGIN MONITORING
+                                                               ▼
+                                                           MONITORING
+END SESSION (any state) ─▶ starter inhibited, alerts off ─▶ IDLE   (the process keeps running)
+```
+
+Hard failures keep the starter inhibited and raise one operator override
+request (`POST /override-requests`, polled every 5 s); they clear only by an
+approval (→ READY_TO_START, still waiting for BEGIN MONITORING), `r`, or END
+SESSION. Priority: `microsleep_detected` > invalid assessment (sent as
+`driver_not_recognized`) > `fatigue_detected`. A confirmed microsleep is a hard
+failure at any point, also after the first 30 s. A change of driver (another
+enrolled driver matched 3 times by the re-identification every
+`PREDRIVE_REIDENTIFY_S`, or after a face loss) restarts pre-drive for the new
+driver.
+
+The READY_TO_START entries / losses and the start confirmation are logged
+separately (`READY_TO_START at …`, `START CONFIRMED by … - pre-drive duration
+…`) and recorded in the assessment JSON (`timeline`, `first_ready_at`,
+`confirmed_at`, `predrive_duration_s`) for reporting each trial's real
+pre-drive duration.
 
 Every assessment writes its full per-frame series to `logs/assessments/<device>_<driver>_<UTC>.csv`
 (+ a `.json` summary) and sends the same series in `POST /assessments`.
@@ -55,9 +83,10 @@ Every assessment writes its full per-frame series to `logs/assessments/<device>_
 | `modules/head_pose.py` | Pitch / yaw / roll from the landmarks via solvePnP. |
 | `modules/frs.py` | Combines EAR, blink duration, blink frequency, PERCLOS (+ additive yawn term) into a single Fatigue Risk Score. |
 | `modules/pipeline.py` | **Shared per-frame pipeline** (`MetricsPipeline`) used by both phases, plus the head-pose debounce. |
-| `modules/assessment.py` | Pre-drive scoring: worst-5 s-window aggregate, per-frame CSV/JSON. |
-| `modules/phase.py` | `Phase` and `LockReason` enums. |
-| `modules/ignition.py` | Debounced ignition sense input (mock / real GPIO, same pattern as `alert.py`). |
+| `modules/assessment.py` | Pre-drive scoring: worst-5 s-window aggregate on the first 30 s and on the rolling last 30 s, per-frame CSV/JSON, READY / confirmation timeline. |
+| `modules/phase.py` | `Phase`, `SessionState` and `LockReason` enums. |
+| `modules/start_confirm.py` | Operator requests (BEGIN / END SESSION) and the start confirmation behind `START_CONFIRM_MODE`. |
+| `modules/ignition.py` | Pinned phase source (`ForcedIgnition`). The GPIO 25 ignition sense was removed (deferred hardware). |
 | `modules/alert.py` | Drives the GPIO LEDs and buzzer from the alert level, and the **starter-inhibit relay** from the pre-drive verdict only. |
 | `modules/api.py` | HTTP client for the Laravel backend (encodings, thresholds, enrollment, fatigue events, assessments, override requests). |
 
@@ -72,7 +101,7 @@ fatigue-detection/
 ├── data/             # landmark model + calibration data (git-ignored contents)
 ├── logs/             # runtime logs
 ├── models/           # additional trained models
-├── deploy/           # systemd unit + install notes for the touchscreen launcher
+├── deploy/           # autostart wrapper + .desktop entry + install notes for the launcher
 ├── main.py           # entry point (CLI)
 ├── launcher.py       # touchscreen menu that shells out to main.py
 ├── requirements.txt
@@ -128,18 +157,21 @@ fatigue-detection/
   session, so an unpowered Pi, a crash or a killed session all leave the starter inhibited.
   Add `"gpio=17=op,dh"` to `/boot/firmware/config.txt` so GPIO 17 is held HIGH (relay
   off) during boot.
-- **Ignition sense (GPIO 25)** — fuse tap on an ignition-switched circuit through an
-  optocoupler (or a divider clamped to 3.3 V — never 12 V straight to the pin). Pulled
-  down, so a disconnected tap reads OFF (pre-drive). Debounced 0.3 s in software.
+- **No ignition sense, no relay feedback** — the relay control is the Pi's only
+  connection to the starter circuit (key BAT ← SMPS +5 V, START → relay COM, relay NO →
+  motor). The ignition-position sense (was GPIO 25) and a relay-contact feedback divider
+  (GPIO 5) are deferred hardware for next semester; nothing reads either pin. When the
+  ignition sense exists it replaces the touch confirmation (`START_CONFIRM_MODE = "gpio"`,
+  which today stops `main.py` at startup with `NotImplementedError`).
 - Set `FATIGUE_DEVICE_ID` per vehicle; it keys assessments, override requests and the
   heartbeat. Bump `FIRMWARE_VERSION` in `config/config.py` on release; the portal shows it.
 
 ## How to run
 
 ```bash
-python main.py                                   # real ignition + GPIO
-python main.py --mock-gpio                       # no hardware: 'i' toggles mock ignition
-python main.py --mock-gpio --force-phase predrive     # stay in pre-drive ('r' re-runs)
+python main.py                                   # pre-drive -> (BEGIN) monitoring; same as --sequence
+python main.py --mock-gpio                       # the same, no GPIO driven
+python main.py --mock-gpio --force-phase predrive     # pre-drive only; a confirmed start -> IDLE
 python main.py --mock-gpio --force-phase monitoring   # stay in monitoring
 python main.py --debug-pose                      # overlay head-pose debounce timers
 python main.py --enroll                          # enrol a driver (prompts for the id)
@@ -147,8 +179,10 @@ python main.py --enroll --driver-id 7            # enrol driver 7, no prompt
 python tools/eye_check.py --label driver7        # where the eye landmarks sit + closed/open EAR ratio
 ```
 
-Preview-window keys: `q` quit · `i` toggle mock ignition · `r` re-run the pre-drive
-assessment (after a pass or a denied override).
+Preview-window keys: `q` quit · `r` re-run the pre-drive assessment (in READY_TO_START
+or after a denied override) · `b` = BEGIN MONITORING / START NEXT DRIVER · `e` = END
+SESSION. Without a window (`--no-preview`): `kill -USR1 <pid>` (begin) and
+`kill -USR2 <pid>` (end session), which is what the launcher's buttons send.
 
 ### Touchscreen launcher (no keyboard)
 
@@ -159,13 +193,19 @@ single source of truth:
 | Button | Runs |
 |---|---|
 | Enroll driver | picks a driver from `GET /drivers` (the one assigned to this `FATIGUE_DEVICE_ID` is listed first), then `main.py --enroll --driver-id N` |
-| Pre-drive assessment | `main.py --force-phase predrive` |
-| Continuous monitoring | `main.py --force-phase monitoring` |
-| Follow ignition | `main.py` (real ignition input selects the phase) |
+| Pre-drive assessment → monitoring | `main.py --sequence --state-file logs/session_state.json` |
+| Monitoring only (test) | `main.py --force-phase monitoring --state-file logs/session_state.json` |
 
 The header shows the device id and whether the backend answers `/ping`. While a
 session runs a separate bottom strip carries a **STOP** button (sends SIGINT =
-Ctrl-C); when `main.py` exits the menu returns with the result, back at the
+Ctrl-C) and, for pre-drive / monitoring sessions, the session controls read from
+the state `main.py` publishes: **BEGIN MONITORING** only in READY_TO_START,
+**START NEXT DRIVER** only in IDLE (SIGUSR1), and **END SESSION** (SIGUSR2) behind
+a confirmation — CANCEL appears where END SESSION was and YES where STOP was, and
+the question cancels itself after 6 s. END SESSION leaves `main.py` running in
+IDLE with the starter inhibited and the LEDs / buzzer off. When `main.py` exits
+(STOP, or a crash) the launcher drives the relay to INHIBIT and the menu returns
+with the result, back at the
 launcher's startup geometry (re-asserted, then checked; see
 [`deploy/README.md`](deploy/README.md) for the log lines). Layout is sized for
 the 800×480 HDMI touchscreen and scales up to a monitor; it fits the monitor the
@@ -178,8 +218,9 @@ python launcher.py --screen-size 800x480  # exactly 800x480, borderless at 0,0:
                                           # check the panel layout on a desktop
 ```
 
-To start it on boot or from a desktop icon see [`deploy/README.md`](deploy/README.md)
-(systemd unit, `deploy/start_launcher.sh`, and how to go back to the CLI).
+To start it automatically when the Pi powers on see [`deploy/README.md`](deploy/README.md)
+(XDG autostart: `bash deploy/install_autostart.sh`; also the desktop icon and how to go
+back to the CLI).
 
 ## Tests
 

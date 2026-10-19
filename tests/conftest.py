@@ -15,10 +15,12 @@ for path in (ROOT, ROOT / "tests"):
         sys.path.insert(0, str(path))
 
 import main  # noqa: E402
-from fakes import FakeCam, ShortAssessment  # noqa: E402
+from fakes import (CAL, FakeAPI, FakeCam, FakeExtractor, FakeRecognizer,  # noqa: E402
+                   ShortAssessment)
 from modules.alert import AlertManager  # noqa: E402
 from modules.head_pose import HeadPoseEstimator  # noqa: E402
 from modules.phase import Phase  # noqa: E402
+from modules.start_confirm import OperatorRequests, TouchStartConfirm  # noqa: E402
 
 
 @pytest.fixture
@@ -35,8 +37,13 @@ def m(monkeypatch, tmp_path):
         "_display_mode": "video", "_display_available": False, "_fullscreen": False,
         "_window_ready": False, "_reserve_bottom": 0, "_enroll_report": {},
         "_last_screen_draw": float("-inf"),
+        "_session_state": None, "_state_note": "", "_state_file": None,
     }.items():
         monkeypatch.setattr(main, name, value)
+    # Fresh operator requests: nothing pending from another test.
+    requests = OperatorRequests()
+    monkeypatch.setattr(main, "_requests", requests)
+    monkeypatch.setattr(main, "_start_confirm", TouchStartConfirm(requests))
     monkeypatch.setattr(main, "show_frame", lambda frame: -1)
     monkeypatch.setattr(main, "PredriveAssessment", ShortAssessment)
     yield main
@@ -58,3 +65,20 @@ def rig(m):
         m._ignition = ignition
         return m._alert_manager
     return setup
+
+
+@pytest.fixture
+def patched_main(m, monkeypatch):
+    """main() with fakes for every device; GPIO forced to mock even on a Pi."""
+    monkeypatch.setattr(m, "setup_logging", lambda: None)
+    monkeypatch.setattr(m, "APIClient", lambda: FakeAPI())
+    monkeypatch.setattr(m, "LandmarkExtractor", lambda *a, **k: FakeExtractor())
+    monkeypatch.setattr(m, "DriverRecognizer", lambda api: FakeRecognizer(0.0))
+    monkeypatch.setattr(m, "Camera", FakeCam)
+    monkeypatch.setattr(m, "AlertManager",
+                        lambda mock=False, phase=None: AlertManager(mock=True, phase=phase))
+    monkeypatch.setattr(m, "identify_driver_bounded",
+                        lambda *a, **k: {"driver_id": 6, "name": "Test Driver", "confidence": 0.6})
+    monkeypatch.setattr(m, "load_calibration", lambda *a, **k: (CAL, CAL.provenance()))
+    monkeypatch.setattr(m.config, "LANDMARK_MODEL", m.config.BASE_DIR / "main.py")  # exists()
+    return m

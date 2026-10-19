@@ -1,3 +1,7 @@
+# SUPERSEDED (2026-10-19) by the XDG autostart entry - deploy/install_autostart.sh,
+# see deploy/README.md. Kept for reference only; never enable it together with
+# the autostart entry (two launchers would fight over the camera).
+#
 # Touchscreen launcher on boot - makes the unit plug-and-go for demos.
 #
 # Not installed automatically. See deploy/README.md for the full steps; the

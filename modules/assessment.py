@@ -56,8 +56,29 @@ it as ``void`` (no API change).
 Every sample is kept and written to ``logs/assessments/<device>_<driver>_
 <timestamp>.csv`` (plus a ``.json`` summary) and returned in
 :meth:`PredriveAssessment.result` so the backend receives the full series.
+
+Rolling assessment (2026-10-19)
+-------------------------------
+``duration_s`` (30 s) is a *minimum*, not the length of the run. The run
+goes on until the driver confirms the start (or the session ends), and:
+
+* once it has lasted ``duration_s`` (:meth:`is_complete`), its first
+  ``duration_s`` are judged by :meth:`result` exactly as the fixed run was,
+  and the caller :meth:`freeze`\\ s that verdict - it is what goes to the
+  backend. Later frames are no longer added to ``samples`` (memory stays
+  bounded however long the driver waits); after :meth:`write_files` and
+  :meth:`stream_to_csv` they go straight to the CSV instead.
+* :meth:`window_verdict` applies the same pass rule - valid fraction,
+  microsleeps, worst ``worst_window_s`` mean of ``frs_scored`` - to the most
+  recent ``duration_s`` only. It is evaluated every frame, so it caches the
+  mean of each window once the window is complete (the identical
+  ``f[i:j].mean()`` the fixed run computes) instead of rescanning.
+* :meth:`mark` records the READY_TO_START entries / losses, the start
+  confirmation and the end of the run in ``timeline``, which the JSON
+  summary carries for reporting the real pre-drive duration of each trial.
 """
 
+import bisect
 import csv
 import json
 import logging
@@ -83,10 +104,17 @@ SAMPLE_FIELDS: List[str] = [
     "microsleep_state", "microsleep_override", "microsleep_confirmed",
 ]
 
+# window_verdict(): once this many samples have fallen out of the rolling
+# window, they are dropped from its arrays (the frozen ``samples`` keep the
+# first window regardless).
+_PRUNE_AT: int = 2000
+
 
 class PredriveAssessment:
     """
-    Accumulate per-frame metrics for a fixed window and decide pass / fail.
+    Accumulate per-frame metrics and decide pass / fail - on the first
+    ``duration_s`` once (:meth:`result`), then on a rolling window
+    (:meth:`window_verdict`).
 
     Typical usage::
 
@@ -96,10 +124,16 @@ class PredriveAssessment:
             ...                                   # pipeline.process(...)
             assessment.add(metrics, now)          # or assessment.add_no_face(now)
         result = assessment.result()
+        assessment.freeze()
         assessment.write_files(device_id, driver_id)
+        assessment.stream_to_csv()
+        while waiting_for_the_start:
+            assessment.add(metrics, now)
+            ready = assessment.window_verdict(now)["passed"]
+        assessment.finish("confirmed", now)
 
     Args:
-        duration_s: Length of the scored window.
+        duration_s: Minimum length of the run, and the rolling window.
         worst_window_s: Length of the rolling window for the verdict.
         pass_threshold: ``worst_window_mean`` must be strictly below this.
         min_valid_fraction: Void the assessment if fewer than this fraction
@@ -129,16 +163,41 @@ class PredriveAssessment:
         # .provenance()); set by the caller, echoed in result() so it lands in
         # the JSON summary and POST /assessments.
         self.calibration: Dict[str, Any] = {}
+        # time.time() the pre-drive cycle began (recognition), set by the
+        # caller: the start of the trial's pre-drive duration.
+        self.predrive_started_at: Optional[float] = None
+        self.timeline: List[Dict[str, Any]] = []
+        self._reset_rolling()
+        self._files: Optional[Dict[str, Any]] = None
+
+    def _reset_rolling(self) -> None:
+        self._frozen = False
+        # Rolling-window arrays (every frame, frozen or not): sample times,
+        # frs_scored, times of confirmed microsleeps, times of invalid frames.
+        self._t: List[float] = []
+        self._f: List[float] = []
+        self._ms_t: List[float] = []
+        self._invalid_t: List[float] = []
+        # Mean frs_scored of the complete worst-window starting at sample i,
+        # for every i < _next_open; _next_open is the first window still open.
+        self._win_means: List[float] = []
+        self._next_open = 0
+        self._csv_fh = None
+        self._csv_writer = None
 
     # ------------------------------------------------------------------
 
     def start(self, now: Optional[float] = None) -> None:
         """Reset and open the window at ``now`` (``time.time()`` style)."""
+        self.close_stream()
         self.start_time = time.time() if now is None else now
         self.end_time = 0.0
         self.samples = []
         self.no_face_frames = 0
         self.invalid_reasons = {}
+        self.timeline = []
+        self._reset_rolling()
+        self._files = None
         self._started = True
 
     def progress(self, now: Optional[float] = None) -> float:
@@ -181,7 +240,7 @@ class PredriveAssessment:
         frs_scored = max(frs_raw, DANGER_THRESHOLD) if forced else frs_raw
         comps = m.frs_result.get("components", {})
         pose = m.pose or {}
-        self.samples.append({
+        sample = {
             "t_rel": round(t - self.start_time, 3),
             "t_abs": t,
             "ear": m.ear, "mar": m.mar, "perclos": m.perclos,
@@ -204,14 +263,23 @@ class PredriveAssessment:
             # True only on the frame a microsleep was confirmed, so counting
             # these needs no edge detection.
             "microsleep_confirmed": m.microsleep_event is not None,
-        })
+        }
+        if not self._frozen:
+            self.samples.append(sample)
+        elif self._csv_writer is not None:
+            self._csv_writer.writerow({k: sample.get(k) for k in SAMPLE_FIELDS})
+        self._push(t, frs_scored, sample["microsleep_confirmed"])
 
     def add_invalid(self, reason: str = "no_face", now: Optional[float] = None) -> None:
         """
         Record a frame that could not be measured - no face, or invalid
         landmarks (``reason`` from ``pipeline.landmark_problem``). Counted,
-        never scored.
+        never scored. Counts in :meth:`result` stop at :meth:`freeze`; the
+        rolling window counts it by ``now`` (the wall clock if omitted).
         """
+        self._invalid_t.append(time.time() if now is None else now)
+        if self._frozen:
+            return
         self.no_face_frames += 1
         self.invalid_reasons[reason] = self.invalid_reasons.get(reason, 0) + 1
 
@@ -247,6 +315,116 @@ class PredriveAssessment:
         # Round away float noise (as frs.py does) so a window sitting exactly
         # on the pass threshold is judged correctly.
         return round(worst, 6)
+
+    # ---- rolling window (2026-10-19) ---------------------------------
+
+    def _push(self, t: float, frs_scored: float, microsleep: bool) -> None:
+        """Add one scored frame to the rolling arrays, closing finished windows."""
+        self._t.append(t)
+        self._f.append(frs_scored)
+        if microsleep:
+            self._ms_t.append(t)
+        # A window starting at sample i is complete at the first sample more
+        # than worst_window_s after it - this one, since earlier frames were
+        # checked as they arrived - and spans [i, newest): the same j and the
+        # same f[i:j].mean() as worst_window_mean()'s scan.
+        newest = len(self._t) - 1
+        while self._next_open < newest and t - self._t[self._next_open] > self.worst_window_s:
+            i = self._next_open
+            self._win_means.append(float(np.asarray(self._f[i:newest], dtype=float).mean()))
+            self._next_open += 1
+
+    def _prune(self, cutoff: float) -> None:
+        """Drop rolling samples older than ``cutoff`` once enough have piled up."""
+        s = bisect.bisect_left(self._t, cutoff)
+        if s >= _PRUNE_AT and s <= self._next_open:
+            del self._t[:s], self._f[:s], self._win_means[:s]
+            self._next_open -= s
+        for times in (self._ms_t, self._invalid_t):
+            k = bisect.bisect_left(times, cutoff)
+            if k >= _PRUNE_AT:
+                del times[:k]
+
+    def elapsed(self, now: Optional[float] = None) -> float:
+        """Seconds since :meth:`start`."""
+        return (time.time() if now is None else now) - self.start_time
+
+    def window_verdict(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """
+        The pass rule on the most recent ``duration_s``: frames with
+        ``t >= now - duration_s``. Same aggregate as :meth:`worst_window_mean`
+        (the worst window is computed exactly as there, over this subset),
+        same valid-fraction and microsleep conditions as :meth:`result`.
+
+        Returns:
+            ``passed``, ``reason`` (``None`` on a pass, else ``"microsleep"``
+            > ``"invalid"`` > ``"frs"`` - the hard-failure priority),
+            ``eligible`` (the run has lasted ``duration_s``),
+            ``worst_window_mean``, ``valid_fraction``, ``microsleeps``,
+            ``n_samples`` and ``n_invalid`` in the window.
+        """
+        now = time.time() if now is None else now
+        cutoff = now - self.duration_s
+        self._prune(cutoff)
+        s = bisect.bisect_left(self._t, cutoff)
+        n = len(self._t)
+        valid = n - s
+        invalid = len(self._invalid_t) - bisect.bisect_left(self._invalid_t, cutoff)
+        total = valid + invalid
+        valid_fraction = valid / total if total else 0.0
+        worst = 0.0
+        if valid:
+            # Every window from s up to the first one still open, which (as
+            # in the scan) is the last one counted: it runs to the newest.
+            first_open = max(self._next_open, s)
+            worst = float(np.asarray(self._f[first_open:n], dtype=float).mean())
+            if s < self._next_open:
+                worst = max(worst, max(self._win_means[s:self._next_open]))
+            worst = round(worst, 6)
+        microsleeps = len(self._ms_t) - bisect.bisect_left(self._ms_t, cutoff)
+        void = valid == 0 or valid_fraction < self.min_valid_fraction
+        if microsleeps:
+            reason: Optional[str] = "microsleep"
+        elif void:
+            reason = "invalid"
+        elif worst >= self.pass_threshold:
+            reason = "frs"
+        else:
+            reason = None
+        return {
+            "passed": reason is None,
+            "reason": reason,
+            "eligible": self._started and now - self.start_time >= self.duration_s,
+            "worst_window_mean": worst,
+            "valid_fraction": round(valid_fraction, 4),
+            "microsleeps": microsleeps,
+            "n_samples": valid,
+            "n_invalid": invalid,
+        }
+
+    def freeze(self, now: Optional[float] = None) -> None:
+        """
+        Fix :meth:`result` on the frames so far (the first ``duration_s``).
+        Later frames feed only the rolling window (and the CSV stream).
+        """
+        if not self._frozen:
+            self.is_complete(now)        # stamps end_time
+            self._frozen = True
+
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
+
+    def mark(self, event: str, now: Optional[float] = None, **detail: Any) -> None:
+        """
+        Record a pre-drive milestone in ``timeline`` (``ready_entered``,
+        ``ready_lost``, ``confirmed``, ``ended``) and refresh the JSON
+        summary if it has been written.
+        """
+        t = time.time() if now is None else now
+        self.timeline.append({"event": event, "t_abs": t,
+                              "t_rel": round(t - self.start_time, 3), **detail})
+        self._write_summary()
 
     def _count_yawns(self) -> int:
         """Number of confirmed yawns = transitions into the ``yawning`` state."""
@@ -317,7 +495,37 @@ class PredriveAssessment:
             "invalid_cause": "INVALID_ASSESSMENT" if void else None,
             "passed": (not void) and worst < self.pass_threshold and microsleeps == 0,
             "calibration": dict(self.calibration),
+            # Everything above is the first duration_s (the backend's
+            # record). The rest of the run, local only (2026-10-19):
+            **self.timeline_summary(),
             "samples": list(self.samples),
+        }
+
+    def timeline_summary(self) -> Dict[str, Any]:
+        """
+        When the trial reached READY_TO_START and when the start was
+        confirmed, for reporting the actual pre-drive duration.
+
+        ``predrive_duration_s`` runs from the start of the pre-drive cycle
+        (recognition; else the assessment) to the start confirmation, and is
+        ``None`` if the start was never confirmed.
+        """
+        def first(event: str) -> Optional[float]:
+            return next((e["t_abs"] for e in self.timeline if e["event"] == event), None)
+
+        began = self.predrive_started_at or self.start_time
+        ready, confirmed = first("ready_entered"), first("confirmed")
+        ended = next((e for e in reversed(self.timeline) if e["event"] == "ended"), None)
+        return {
+            "min_duration_s": self.duration_s,
+            "predrive_started_at": began,
+            "first_ready_at": ready,
+            "confirmed_at": confirmed,
+            "time_to_first_ready_s": None if ready is None else round(ready - began, 3),
+            "ready_entries": sum(1 for e in self.timeline if e["event"] == "ready_entered"),
+            "predrive_duration_s": None if confirmed is None else round(confirmed - began, 3),
+            "end_reason": ended.get("reason") if ended else None,
+            "timeline": [dict(e) for e in self.timeline],
         }
 
     # ------------------------------------------------------------------
@@ -331,6 +539,7 @@ class PredriveAssessment:
         """
         Write ``<device>_<driver|unknown>_<UTC stamp>.csv`` (one row per
         frame) and a ``.json`` summary (without the samples) next to it.
+        Later :meth:`mark` / :meth:`finish` calls rewrite the summary.
 
         Returns:
             Path of the CSV file.
@@ -344,10 +553,55 @@ class PredriveAssessment:
             writer.writeheader()
             for s in self.samples:
                 writer.writerow({k: s.get(k) for k in SAMPLE_FIELDS})
-        summary = {k: v for k, v in self.result().items() if k != "samples"}
-        summary["device_id"] = device_id
-        summary["driver_id"] = driver_id
-        summary["csv"] = csv_path.name
-        (directory / f"{stem}.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        self._files = {"csv": csv_path, "json": directory / f"{stem}.json",
+                       "device_id": device_id, "driver_id": driver_id}
+        self._write_summary()
         logger.info("Assessment data written: %s (%d samples)", csv_path, len(self.samples))
         return csv_path
+
+    def _write_summary(self) -> None:
+        """(Re)write the JSON summary, if :meth:`write_files` has run."""
+        if self._files is None:
+            return
+        summary = {k: v for k, v in self.result().items() if k != "samples"}
+        summary["device_id"] = self._files["device_id"]
+        summary["driver_id"] = self._files["driver_id"]
+        summary["csv"] = self._files["csv"].name
+        try:
+            self._files["json"].write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.error("Could not update assessment summary %s: %s", self._files["json"], exc)
+
+    def stream_to_csv(self) -> None:
+        """
+        After :meth:`freeze` and :meth:`write_files`: append every later
+        frame to the CSV as it is added (line-buffered), so a run of any
+        length is recorded without keeping it in memory. No-op if the files
+        were not written.
+        """
+        if self._files is None or self._csv_fh is not None:
+            return
+        try:
+            self._csv_fh = self._files["csv"].open("a", newline="", encoding="utf-8",
+                                                   buffering=1)
+        except OSError as exc:
+            logger.error("Could not reopen %s for the rest of the run: %s",
+                         self._files["csv"], exc)
+            return
+        self._csv_writer = csv.DictWriter(self._csv_fh, fieldnames=SAMPLE_FIELDS)
+
+    def close_stream(self) -> None:
+        """Close the CSV stream (idempotent)."""
+        fh = getattr(self, "_csv_fh", None)
+        if fh is not None:
+            fh.close()
+        self._csv_fh = self._csv_writer = None
+
+    @property
+    def files_written(self) -> bool:
+        return self._files is not None
+
+    def finish(self, reason: str, now: Optional[float] = None, **detail: Any) -> None:
+        """End of the run: mark ``ended`` with ``reason``, close the stream, update the summary."""
+        self.close_stream()
+        self.mark("ended", now, reason=reason, **detail)

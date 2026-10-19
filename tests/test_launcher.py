@@ -24,6 +24,7 @@ LONG_NAME = "Maria Fernanda Delacroix-Villanueva y Santiago"
 def session_files(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "ENROLL_RESULT", tmp_path / "enroll_result.json")
     monkeypatch.setattr(launcher, "SESSION_LOG", tmp_path / "session.log")
+    monkeypatch.setattr(launcher, "SESSION_STATE", tmp_path / "session_state.json")
     return tmp_path
 
 
@@ -481,3 +482,197 @@ def test_kiosk_sizes_to_its_monitor_not_the_x_screen(make_app, monkeypatch):
     monkeypatch.setattr(launcher, "detect_monitors", lambda: [])
     _, _, w, h, _ = app._target_geometry()
     assert (w, h) == (app.root.winfo_screenwidth(), app.root.winfo_screenheight())
+
+
+# ---- session controls on the strip (2026-10-19) -------------------------------
+
+CHILD_STATES = [None, "IDENTIFYING", "SETTLING", "ASSESSING", "READY_TO_START", "LOCKED",
+                "MONITORING", "IDLE"]
+
+
+def controls_session(app, seconds=30):
+    """A running pre-drive session (a sleeper child) with the strip open."""
+    session = launcher.Session("Pre-drive assessment", [])
+    session.proc = sleeper(seconds)
+    app.session = session
+    app._show_running(session)
+    app.root.update()
+    return session
+
+
+def publish(session, state, pid=None):
+    """What main.py --state-file writes."""
+    launcher.SESSION_STATE.write_text(json.dumps(
+        {"state": state, "note": "", "driver": None, "pid": pid or session.proc.pid,
+         "since": time.time()}), encoding="utf-8")
+
+
+def shown(app):
+    """Texts of the strip's mapped buttons, left to right."""
+    app.root.update()
+    buttons = [b for b in app.strip_buttons.values() if b.winfo_ismapped()]
+    return [b.cget("text") for b in sorted(buttons, key=lambda b: b.winfo_x())]
+
+
+@pytest.mark.parametrize("size", SIZES)
+@pytest.mark.parametrize("stream_on", [False, True])
+def test_controls_strip_fits_in_every_state(make_app, size, stream_on):
+    app = make_app(size)
+    app.stream_on = stream_on
+    session = controls_session(app)
+    try:
+        for state in CHILD_STATES:
+            app._strip_state = state
+            app._layout_strip()
+            assert cut_off(app) == [], state
+        app._strip_end()                        # the END SESSION confirmation
+        assert cut_off(app) == []
+        app._strip_cancel_end()
+        app._stop_session()                     # the "Stopping" text
+        assert cut_off(app) == []
+        strip_h = app.px(launcher.STRIP_PX)
+        assert (app.strip.winfo_width(), app.strip.winfo_height()) == (size[0], strip_h)
+        assert -int(app.font_stop.cget("size")) >= 16, "strip buttons stay finger-sized"
+    finally:
+        session.proc.kill()
+        session.proc.wait()
+
+
+def test_begin_monitoring_only_in_ready_to_start(make_app):
+    app = make_app((800, 480))
+    session = controls_session(app)
+    try:
+        expected = {
+            "ASSESSING": [launcher.LABEL_END, launcher.LABEL_STOP],
+            "READY_TO_START": [launcher.LABEL_BEGIN, launcher.LABEL_END, launcher.LABEL_STOP],
+            "LOCKED": [launcher.LABEL_END, launcher.LABEL_STOP],
+            "MONITORING": [launcher.LABEL_END, launcher.LABEL_STOP],
+            "IDLE": [launcher.LABEL_NEXT_DRIVER, launcher.LABEL_STOP],
+        }
+        for state, buttons in expected.items():
+            publish(session, state)
+            app._poll_session()
+            assert app._strip_state == state
+            assert shown(app) == buttons, state
+        # A file written by another process (an earlier child) is ignored.
+        publish(session, "READY_TO_START", pid=session.proc.pid + 1)
+        app._poll_session()
+        assert app._strip_state == "IDLE"
+    finally:
+        session.proc.kill()
+        session.proc.wait()
+
+
+def test_primary_button_sends_begin_once(make_app, monkeypatch):
+    app = make_app((800, 480))
+    session = controls_session(app)
+    sent = []
+    monkeypatch.setattr(session, "request", lambda kind: sent.append(kind) or True)
+    try:
+        publish(session, "READY_TO_START")
+        app._poll_session()
+        begin = app.strip_buttons["primary"]
+        begin.invoke()
+        begin.invoke()                          # disabled after the first tap
+        assert sent == ["begin"]
+        publish(session, "MONITORING")
+        app._poll_session()
+        assert launcher.LABEL_BEGIN not in shown(app)
+    finally:
+        session.proc.kill()
+        session.proc.wait()
+
+
+def test_end_session_needs_a_second_tap(make_app, monkeypatch):
+    """END SESSION alone sends nothing; YES (where STOP was) does; CANCEL is where END was."""
+    monkeypatch.setattr(launcher, "END_CONFIRM_S", 0.3)
+    app = make_app((800, 480))
+    session = controls_session(app)
+    sent = []
+    monkeypatch.setattr(session, "request", lambda kind: sent.append(kind) or True)
+    try:
+        publish(session, "READY_TO_START")
+        app._poll_session()
+        app.root.update()
+        end_x = app.strip_buttons["end"].winfo_x()
+        stop_x = app.strip_buttons["stop"].winfo_x()
+        app.strip_buttons["end"].invoke()
+        assert sent == [] and shown(app) == [launcher.LABEL_END_CANCEL, launcher.LABEL_END_YES]
+        assert app.strip_buttons["cancel"].winfo_x() == end_x, "a double tap lands on CANCEL"
+        assert app.strip_buttons["yes"].winfo_x() == stop_x
+        assert app.end_prompt.winfo_ismapped()
+        # Not confirmed in time: back to the normal controls, nothing sent.
+        assert wait_for(app, lambda: not app._end_confirming)
+        assert sent == [] and launcher.LABEL_END in shown(app)
+        app.strip_buttons["end"].invoke()
+        app.strip_buttons["cancel"].invoke()
+        assert sent == [] and launcher.LABEL_END in shown(app)
+        app.strip_buttons["end"].invoke()
+        app.strip_buttons["yes"].invoke()
+        assert sent == ["end_session"]
+        publish(session, "IDLE")
+        app._poll_session()
+        assert shown(app) == [launcher.LABEL_NEXT_DRIVER, launcher.LABEL_STOP]
+        assert app.session is session and session.running, "the child keeps running"
+    finally:
+        session.proc.kill()
+        session.proc.wait()
+
+
+def test_session_requests_are_signals(session_files, monkeypatch):
+    """BEGIN -> SIGUSR1, END SESSION -> SIGUSR2; nothing once the child has exited."""
+    sent = []
+    s = launcher.Session("Pre-drive assessment", [])
+    s.proc = sleeper(30)
+    try:
+        monkeypatch.setattr(launcher.signal, "SIGUSR1", 101, raising=False)
+        monkeypatch.setattr(launcher.signal, "SIGUSR2", 102, raising=False)
+        monkeypatch.setattr(s.proc, "send_signal", sent.append)
+        assert s.request("begin") and s.request("end_session")
+        assert sent == [101, 102]
+    finally:
+        s.proc.kill()
+        s.proc.wait()
+    assert s.request("begin") is False and sent == [101, 102]
+
+
+def test_state_file_passed_to_pre_drive_sessions_only(session_files, monkeypatch):
+    started = []
+    monkeypatch.setattr(launcher.subprocess, "Popen",
+                        lambda cmd, **k: started.append(cmd) or SimpleNamespace(pid=1, poll=lambda: 0))
+    launcher.SESSION_STATE.write_text("{}", encoding="utf-8")
+    first = launcher.Session("Pre-drive assessment", ["--sequence"])
+    first.start()
+    first.close()
+    assert not launcher.SESSION_STATE.exists(), "an earlier child's state is never read"
+    second = launcher.Session("Enroll X", ["--enroll"], enroll=True)
+    second.start()
+    second.close()
+    assert "--state-file" in started[0] and "--state-file" not in started[1]
+
+
+def test_unexpected_child_exit_inhibits_the_starter(make_app, monkeypatch):
+    """The child dying on its own (crash, kill) still ends with force_relay_inhibit()."""
+    calls = []
+    monkeypatch.setattr(launcher, "force_relay_inhibit", lambda: calls.append(1) or True)
+    app = make_app((800, 480))
+    session = launcher.Session("Pre-drive assessment", [])
+    session.proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(1)"])
+    app.session = session
+    app._show_running(session)
+    assert wait_for(app, lambda: app.session is None, timeout=10)
+    assert calls == [1]
+    assert "crashed" in app.last_result
+
+
+def test_terminate_signal_quits_through_the_failsafe(make_app, monkeypatch):
+    """SIGTERM / SIGHUP schedule Launcher.quit (child stopped, relay re-inhibited)."""
+    handlers = {}
+    monkeypatch.setattr(launcher.signal, "signal", lambda s, h: handlers.setdefault(s, h))
+    app = make_app((800, 480))
+    quits = []
+    monkeypatch.setattr(app, "quit", lambda: quits.append(1))
+    launcher.install_exit_signals(app.root, app)
+    assert launcher.signal.SIGTERM in handlers
+    handlers[launcher.signal.SIGTERM](launcher.signal.SIGTERM, None)
+    assert wait_for(app, lambda: quits == [1])

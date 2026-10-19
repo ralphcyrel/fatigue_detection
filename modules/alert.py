@@ -295,6 +295,20 @@ class AlertManager:
         else:
             logger.info("Alert level %s -> %s", previous, level)
 
+    def idle(self) -> None:
+        """
+        Stop any active alert: buzzer off and every LED off (END SESSION ->
+        IDLE, 2026-10-19). Green stays off so an idle unit is never read as
+        READY_TO_START. The relay is not touched here; the next
+        :meth:`set_alert_level` lights the LEDs again.
+        """
+        self._stop_continuous_buzzer()
+        for pin in _INDICATOR_PINS:
+            self._write(pin, 0)
+        previous, self.current_level = self.current_level, None
+        logger.info("%sAlerts idle (was %s): buzzer and LEDs off | relay=%s",
+                    "[MOCK] " if self.mock else "", previous, self.get_relay_state())
+
     # ------------------------------------------------------------------
     # Buzzer
     # ------------------------------------------------------------------

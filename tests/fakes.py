@@ -193,3 +193,45 @@ def keys_after(n: int, key: int):
         state["n"] += 1
         return key if state["n"] == n else -1
     return show
+
+
+class Operator:
+    """
+    ``show_frame`` replacement acting as the person at the touchscreen.
+
+    ``steps`` are ``(state, seconds_in_state, key)``: once main.py has been in
+    ``state`` (a ``SessionState``) for ``seconds_in_state``, ``key`` is
+    pressed, then the next step waits. ``history`` records every state seen,
+    with the relay and LED pins at the first frame drawn in it. After
+    ``timeout_s`` it presses ``q`` regardless, so a broken flow fails the
+    test instead of hanging it (READY_TO_START waits forever by design).
+    """
+
+    def __init__(self, m: Any, *steps: Tuple[Any, float, int], timeout_s: float = 60.0) -> None:
+        self.m, self.steps = m, list(steps)
+        self.state, self.since = None, time.monotonic()
+        self.history: List[Dict[str, Any]] = []
+        self.deadline = time.monotonic() + timeout_s
+
+    def __call__(self, frame: np.ndarray) -> int:
+        if time.monotonic() > self.deadline:
+            return ord("q")
+        state = self.m._session_state
+        if state is not self.state:
+            self.state, self.since = state, time.monotonic()
+            am = self.m._alert_manager
+            self.history.append({
+                "state": state, "t": self.since,
+                "relay_locked": am.relay_locked if am else None,
+                "pins": dict(am.pin_states) if am else {},
+                "level": am.current_level if am else None,
+            })
+        if self.steps:
+            want, delay, key = self.steps[0]
+            if state is want and time.monotonic() - self.since >= delay:
+                self.steps.pop(0)
+                return key
+        return -1
+
+    def states(self) -> List[Any]:
+        return [h["state"] for h in self.history]

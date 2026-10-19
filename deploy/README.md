@@ -1,20 +1,26 @@
 # Deploying the touchscreen launcher on the Pi
 
-`launcher.py` gives the unit a touch-only menu (Enroll / Pre-drive /
-Monitoring / Follow ignition / Quit) and shells out to `main.py`. This
-folder holds the systemd unit that starts it on boot.
+`launcher.py` gives the unit a touch-only menu (Enroll / Pre-drive →
+monitoring / Monitoring only / Video stream / Quit) and shells out to
+`main.py`. This folder holds what starts it automatically when the Pi powers
+on (an XDG autostart entry), a desktop-icon script, and the older systemd
+unit (superseded - see below).
 
 ## Prerequisites
 
-- Project installed at `/home/pi/fatigue-detection` with the venv at
-  `venv/` (per the main README). Edit the paths in the unit file otherwise.
+- Project checked out at `~/fatigue-detection` (any path works - nothing
+  below hard-codes a user or a directory) with the venv at `venv/` (per the
+  main README).
 - `python3-tk` (present on the Pi OS desktop image; otherwise
   `sudo apt install python3-tk`). The venv was created with
   `--system-site-packages`, so it sees the apt package.
-- **Desktop autologin** enabled: `sudo raspi-config` → *System Options* →
-  *Boot / Auto Login* → *Desktop Autologin*. The launcher needs a display,
-  so the unit waits for X to come up rather than starting a session itself.
-- Backend settings in `/etc/fatigue-detection.env` (readable by `pi`):
+- **Boot to the desktop with autologin**: `sudo raspi-config` → *System
+  Options* → *Boot / Auto Login* → *Desktop Autologin* (the default on the
+  Pi OS desktop image). XDG autostart entries run when the desktop session
+  starts, so without autologin the launcher only appears after someone logs
+  in. The scripts here never change this setting.
+- Backend settings in `/etc/fatigue-detection.env` (readable by the desktop
+  user), or `~/.config/fatigue-detection.env`:
 
   ```
   FATIGUE_API_BASE_URL=http://<server>/api
@@ -24,45 +30,117 @@ folder holds the systemd unit that starts it on boot.
   # FATIGUE_STREAM_TOKEN=pick-8-to-64-chars
   ```
 
-  `sudo chmod 640 /etc/fatigue-detection.env && sudo chown root:pi /etc/fatigue-detection.env`
+  `sudo chmod 640 /etc/fatigue-detection.env && sudo chown root:$USER /etc/fatigue-detection.env`
 
 - **Starter relay held off during boot**: add `"gpio=17=op,dh"` to
   `/boot/firmware/config.txt` so GPIO 17 is held HIGH (relay off) during
   boot. The relay module is low-level trigger, so a LOW pin would allow a
-  start before the launcher runs.
+  start before the launcher runs. (`install_autostart.sh` reminds you if the
+  line is missing; it does not add it.)
 
-## Install / enable
+## Start on power-on (XDG autostart)
+
+Three files:
+
+| File | What it is |
+|---|---|
+| `deploy/launcher_autostart.sh` | Wrapper: derives every path from its own location, logs to `logs/launcher_autostart.log`, refuses a second copy, activates `./venv`, loads the `FATIGUE_*` settings (as `start_launcher.sh` does), **waits for the display** (Tk can open it and `xrandr` lists a monitor; 30 tries, 2 s apart) and for the camera (`rpicam-hello --list-cameras`; 10 tries, only a warning if it never appears), then `exec`s `launcher.py`. |
+| `deploy/fatigue-launcher.desktop` | The XDG autostart entry. A template: its `Exec=` has `@PROJECT_DIR@`, filled in by the installer. |
+| `deploy/install_autostart.sh` | Copies the entry into `~/.config/autostart/` with this checkout's path, makes the wrapper executable, and prints how to verify and undo. Read-only checks: warns if the old systemd unit is enabled too, reminds about `gpio=17=op,dh`. |
+
+Works on Raspberry Pi OS Bookworm with any of its desktops (labwc, Wayfire
+or X11): all of them run `~/.config/autostart/*.desktop` at login. No
+systemd service, no autologin or boot change.
+
+### Install
+
+Run as the desktop user (not with `sudo`):
 
 ```bash
-cd /home/pi/fatigue-detection
-sudo cp deploy/fatigue-launcher.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now fatigue-launcher
+cd ~/fatigue-detection
+bash deploy/install_autostart.sh
+sudo reboot
 ```
 
-Reboot to confirm it comes up on its own. Logs:
+### Verify
 
 ```bash
-journalctl -u fatigue-launcher -f       # launcher stdout + systemd events
+pgrep -af launcher.py                          # it is running
+tail -n 50 ~/fatigue-detection/logs/launcher_autostart.log
+ls -l ~/.config/autostart/fatigue-launcher.desktop
+```
+
+A cold boot logs something like:
+
+```
+launcher_autostart: ===== starting: project /home/<user>/fatigue-detection, ...
+launcher_autostart: display :0 not ready (attempt 1/30) - retrying in 2s
+launcher_autostart: display :0 ready (attempt 2/30)
+launcher_autostart: camera listed by rpicam-hello (attempt 1/10)
+launcher_autostart: exec launcher.py
+... launcher's own log lines (also in logs/launcher.log) ...
+```
+
+To try the wrapper without rebooting: `~/fatigue-detection/deploy/launcher_autostart.sh &`
+(it exits at once, logging why, if a launcher it started is already running).
+
+### Disable / undo
+
+```bash
+rm ~/.config/autostart/fatigue-launcher.desktop   # no longer starts at login
+pkill -f "python launcher.py"                     # stop the running one now
+```
+
+`pkill` sends SIGTERM; the launcher stops its `main.py` session (which
+inhibits the starter on the way out) and drives the relay to INHIBIT before
+it exits. To re-enable, run `bash deploy/install_autostart.sh` again.
+
+### Logs
+
+```bash
+tail -f logs/launcher_autostart.log     # wrapper + launcher stdout/stderr (rotated at 5 MB)
 tail -f logs/launcher.log               # launcher's own log
 tail -f logs/session.log                # stdout/stderr of each main.py session
 tail -f logs/fatigue.log                # main.py's normal log
 ```
 
-## Disable while developing
+Retry counts can be changed with `FATIGUE_AUTOSTART_DISPLAY_TRIES`,
+`FATIGUE_AUTOSTART_CAMERA_TRIES` and `FATIGUE_AUTOSTART_DELAY_S` (e.g. in
+the env file).
+
+## The old systemd unit (superseded)
+
+`deploy/fatigue-launcher.service` is a *system* service that ran the GUI
+before there was a desktop session to run it in, with `/home/pi` paths
+hard-coded. It is kept only for reference; use the autostart entry above.
+**Never enable both** - two launchers fight over the camera. If it was
+installed earlier:
 
 ```bash
-sudo systemctl disable --now fatigue-launcher   # stop now AND don't start on boot
-sudo systemctl stop fatigue-launcher            # stop until next boot only
-sudo systemctl start fatigue-launcher           # start it again by hand
-sudo systemctl enable --now fatigue-launcher    # back to plug-and-go
+sudo systemctl disable --now fatigue-launcher
 ```
 
-With the service stopped, run `python main.py ...` from a terminal as usual.
-Starting the launcher while the service is running would fight over the
-camera - `systemctl status fatigue-launcher` tells you which state it's in.
+## Session controls on the strip
 
-## Try it without installing the service
+While a pre-drive / monitoring session runs, the strip along the bottom of
+the screen shows, besides STOP:
+
+- **BEGIN MONITORING** - only while `main.py` is in READY_TO_START (the
+  assessment passes and the starter is released). It is the start
+  confirmation: there is no ignition sense, so monitoring never starts on
+  its own.
+- **START NEXT DRIVER** - only in IDLE, after END SESSION.
+- **END SESSION** - asks again: CANCEL takes its place, YES takes STOP's
+  place, and the question cancels itself after 6 s. On YES `main.py`
+  inhibits the starter, stops any alert, closes the session and waits in
+  IDLE for the next driver; it keeps running. STOP still ends `main.py`
+  altogether (back to the menu).
+
+The buttons follow `logs/session_state.json`, which `main.py` rewrites on
+every state change; the taps reach it as SIGUSR1 (begin) and SIGUSR2 (end
+session), and `main.py` ignores a tap made in any other state.
+
+## Try it without autostart
 
 ```bash
 source venv/bin/activate
@@ -78,7 +156,8 @@ The launcher logs the size it laid out for and where it came from, e.g.
 ## Starting from a desktop icon
 
 Use `deploy/start_launcher.sh` as the icon's `Exec=` (the script's header
-has a sample `.desktop` file). Do **not** `source ~/.bashrc` in a launcher
+has a sample `.desktop` file). Stop the autostarted launcher first
+(`pkill -f "python launcher.py"`) - only one can hold the camera. Do **not** `source ~/.bashrc` in a launcher
 script: Raspberry Pi OS's `~/.bashrc` returns immediately in a
 non-interactive shell, so the `FATIGUE_*` exports never run and every
 enrollment goes to `http://localhost:8000/api`. The script reads

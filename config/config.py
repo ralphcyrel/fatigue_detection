@@ -140,15 +140,15 @@ HEARTBEAT_INTERVAL_SECONDS: Final[float] = 30.0
 # modules/alert.py (_RELAY_ALLOW / _RELAY_INHIBIT).
 RELAY_PIN: Final[int] = 17
 
-# Ignition sense input (fuse tap on an ignition-switched circuit). The 12 V
-# tap MUST go through an optocoupler or a divider clamped to 3.3 V before it
-# reaches this pin. Reads HIGH when the ignition is ON (IGNITION_ACTIVE_HIGH)
-# and selects the operating phase: OFF -> pre-drive, ON -> monitoring.
-IGNITION_PIN: Final[int] = 25
-IGNITION_ACTIVE_HIGH: Final[bool] = True
-# A raw reading must hold for this long before the reported state flips, so
-# contact bounce / alternator ripple on the tap cannot flap the phase.
-IGNITION_DEBOUNCE_S: Final[float] = 0.3
+# The relay control above is the Pi's ONLY connection to the starter circuit
+# (2026-10-19). SMPS +5 V feeds the key switch's BAT terminal, START feeds
+# relay COM and relay NO feeds the motor, so the motor runs only while the
+# key is held at START *and* the relay is energised. Nothing reads the key.
+# TODO(deferred hardware, next semester): ignition-position sense (was
+# GPIO 25, IGNITION_PIN / IGNITION_ACTIVE_HIGH / IGNITION_DEBOUNCE_S) and a
+# relay-contact feedback divider (GPIO 5). Both inputs are unwired; no code
+# reads either pin. The start confirmation (START_CONFIRM_MODE) is where the
+# ignition sense will plug in.
 
 # Piezo buzzer for audible alerts.
 BUZZER_PIN: Final[int] = 27
@@ -330,11 +330,38 @@ CALIBRATION_DURATION: Final[int] = 60
 # Pre-drive assessment
 # ---------------------------------------------------------------------------
 
-# Length of the scored assessment window at ignition-OFF.
+# MINIMUM length of the pre-drive assessment, and the length of its rolling
+# window (2026-10-19). The assessment is not a fixed 30 s run: it keeps going
+# for as long as the driver sits there before starting. Once it has run this
+# long its first 30 s are judged exactly as the old fixed run was (a fail is
+# a hard failure); from then on the most recent 30 s are re-judged on every
+# frame and decide READY_TO_START. Reaching 30 s only makes the driver
+# eligible to start - it never advances the phase.
 PREDRIVE_ASSESSMENT_SECONDS: Final[int] = 30
 
+# What confirms the start and moves READY_TO_START into continuous
+# monitoring (2026-10-19). There is no timeout: without a confirmation the
+# unit stays in READY_TO_START indefinitely.
+#   "touch" - the BEGIN MONITORING button on the touchscreen launcher's
+#             strip (sent to main.py as SIGUSR1; key 'b' in the window).
+#   "gpio"  - the ignition-position sense (deferred hardware, next
+#             semester). Not implemented: main.py refuses to start with it.
+START_CONFIRM_MODE: Final[str] = "touch"
+
+# While eligible (READY_TO_START, or re-assessing after it), the recognised
+# driver is re-identified this often (seconds, measured from the end of the
+# previous attempt) so a change of driver drops READY. Each attempt stalls
+# the loop for ~1 s on the Pi; closures in progress are abandoned across it
+# as for any stall (MAX_FRAME_GAP_S). Not run during the first 30 s, which
+# stay exactly as the fixed assessment saw them. After a face loss longer
+# than NO_FACE_FAULT_S the driver is re-identified on every face frame until
+# confirmed. A different enrolled driver matched PREDRIVE_RECOGNITION_MATCHES
+# times restarts the pre-drive for them.
+PREDRIVE_REIDENTIFY_S: Final[float] = 10.0
+
 # The verdict is taken on the WORST rolling window of this length (mean FRS
-# over the window, maximised over the assessment), not on the overall mean:
+# over the window, maximised over the first PREDRIVE_ASSESSMENT_SECONDS, and
+# then over the most recent PREDRIVE_ASSESSMENT_SECONDS), not on the overall mean:
 # a 5 s microsleep in 25 s of alertness is exactly what a pre-drive check
 # exists to catch, and a plain mean or median would dilute it. A window
 # rather than a single-frame max keeps one landmark glitch from failing a

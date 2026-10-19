@@ -1,15 +1,16 @@
 """
 Operating phases and starter-lock reasons.
 
-The system runs in one of two phases, selected by the vehicle's ignition
-state (see ``modules.ignition``):
+The system runs in one of two phases. There is no ignition input yet (see
+``modules.ignition``): a session starts in pre-drive and enters monitoring
+on an explicit start confirmation.
 
-* ``Phase.PREDRIVE``   — ignition OFF. The driver is recognised, their
-  personal thresholds fetched, and a 30 s fatigue assessment run. This is
-  the **only** phase in which the starter relay may engage: a pass releases
-  the starter, anything else keeps it inhibited and raises an operator
-  override request.
-* ``Phase.MONITORING`` — ignition ON. The same metrics run continuously,
+* ``Phase.PREDRIVE``   — before the start. The driver is recognised, their
+  personal thresholds fetched, and a rolling fatigue assessment (30 s
+  minimum) run. This is the **only** phase in which the starter relay may
+  engage: a pass releases the starter (READY_TO_START), anything else keeps
+  it inhibited and a hard failure raises an operator override request.
+* ``Phase.MONITORING`` — after the start. The same metrics run continuously,
   but only the LEDs, buzzer and backend notifications react. The relay is
   never touched (``AlertManager.lock_relay`` refuses in this phase).
 
@@ -33,10 +34,33 @@ from enum import Enum
 
 
 class Phase(str, Enum):
-    """Operating phase, derived from the ignition state."""
+    """Operating phase (pinned per run until an ignition sense exists)."""
 
     PREDRIVE = "predrive"
     MONITORING = "monitoring"
+
+
+class SessionState(str, Enum):
+    """
+    Where a ``main.py`` session is (2026-10-19). Published to the launcher
+    (``main.py --state-file``), which shows its strip buttons from it.
+
+    Pre-drive runs IDENTIFYING -> SETTLING -> ASSESSING -> READY_TO_START and
+    enters MONITORING only on a start confirmation. READY_TO_START is the only
+    state in which pre-drive leaves the starter released, and it is not a
+    latch: losing the rolling pass, the face or the driver returns to
+    ASSESSING. LOCKED is a hard failure awaiting an operator override or a
+    reset. IDLE follows END SESSION: starter inhibited, awaiting the next
+    driver.
+    """
+
+    IDLE = "IDLE"
+    IDENTIFYING = "IDENTIFYING"
+    SETTLING = "SETTLING"
+    ASSESSING = "ASSESSING"
+    READY_TO_START = "READY_TO_START"
+    LOCKED = "LOCKED"
+    MONITORING = "MONITORING"
 
 
 class LockReason(str, Enum):
