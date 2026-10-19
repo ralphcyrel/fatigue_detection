@@ -652,16 +652,21 @@ def test_state_file_passed_to_pre_drive_sessions_only(session_files, monkeypatch
 
 
 def test_unexpected_child_exit_inhibits_the_starter(make_app, monkeypatch):
-    """The child dying on its own (crash, kill) still ends with force_relay_inhibit()."""
+    """
+    The child dying on its own (crash, kill) still ends with force_relay_inhibit(),
+    and then anything left in its process group (the recognition worker) is killed.
+    """
     calls = []
     monkeypatch.setattr(launcher, "force_relay_inhibit", lambda: calls.append(1) or True)
+    monkeypatch.setattr(launcher.Session, "kill_leftovers",
+                        lambda self: calls.append("leftovers") or 0)
     app = make_app((800, 480))
     session = launcher.Session("Pre-drive assessment", [])
     session.proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(1)"])
     app.session = session
     app._show_running(session)
     assert wait_for(app, lambda: app.session is None, timeout=10)
-    assert calls == [1]
+    assert calls == [1, "leftovers"], "relay first, then the child's leftovers"
     assert "crashed" in app.last_result
 
 
@@ -676,3 +681,28 @@ def test_terminate_signal_quits_through_the_failsafe(make_app, monkeypatch):
     assert launcher.signal.SIGTERM in handlers
     handlers[launcher.signal.SIGTERM](launcher.signal.SIGTERM, None)
     assert wait_for(app, lambda: quits == [1])
+
+
+def test_child_runs_in_its_own_process_group_and_leftovers_are_killed(session_files,
+                                                                     monkeypatch):
+    """POSIX: main.py leads its own group; after it exits the group is SIGKILLed."""
+    kwargs = {}
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda cmd, **k: kwargs.update(k)
+                        or SimpleNamespace(pid=4321, poll=lambda: 0))
+    s = launcher.Session("Pre-drive assessment", ["--sequence"])
+    s.start()
+    s.close()
+    assert kwargs["start_new_session"] is True
+    killed = []
+    monkeypatch.setattr(launcher.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(launcher.os, "killpg", lambda pid, sig: killed.append((pid, sig)),
+                        raising=False)
+    assert s.kill_leftovers() == 1 and killed == [(4321, 9)]
+
+    def nothing_left(pid, sig):
+        raise ProcessLookupError
+    monkeypatch.setattr(launcher.os, "killpg", nothing_left, raising=False)
+    assert s.kill_leftovers() == 0, "the normal case: main.py stopped its worker itself"
+    s.proc = SimpleNamespace(pid=4321, poll=lambda: None)
+    assert s.kill_leftovers() == 0, "never while main.py still runs"

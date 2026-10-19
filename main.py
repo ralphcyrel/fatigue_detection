@@ -60,6 +60,7 @@ on a development machine (cv2.VideoCapture + mocked GPIO).
 """
 
 import argparse
+import itertools
 import json
 import logging
 import os
@@ -331,9 +332,18 @@ _start_confirm: Any = TouchStartConfirm(_requests)
 _session_state: Optional[SessionState] = None
 _state_note: str = ""
 _state_file: Optional[str] = None
-# Pre-drive re-identification off the frame loop (modules/recognition_worker.py);
-# None -> identify() inline (tests, or the worker could not be started).
+# Face recognition off the frame loop (modules/recognition_worker.py): the
+# one worker process, used by pre-drive re-identification and monitoring.
+# None -> identify() inline (tests, enrollment, or it could not be started).
+# _recognition_factory rebuilds the recogniser in the worker; start / stop
+# only through start_recognition() / stop_recognition().
 _recognition: Optional[RecognitionWorker] = None
+_recognition_factory: Any = None
+# Tags recognition requests with their owner (one pre-drive DriverCheck, one
+# monitoring run), so an answer that arrives after its owner is gone - a
+# re-run, a change of driver, the hand-off to monitoring - is never taken by
+# the next one.
+_recognition_owner = itertools.count(1)
 
 
 class QuitRequested(Exception):
@@ -1148,9 +1158,51 @@ def display_text(frame: np.ndarray, text: str, color: tuple = (0, 0, 255), dy: i
 # ---------------------------------------------------------------------------
 
 def _raise_on_sigterm(signum, frame) -> None:
-    """SIGTERM handler: unwind like Ctrl-C so main()'s finally runs cleanup()."""
-    logger.warning("SIGTERM received - shutting down (starter will be inhibited)")
+    """
+    SIGTERM / SIGHUP handler: unwind like Ctrl-C so main()'s finally runs
+    cleanup() - starter inhibited, recognition worker stopped.
+    """
+    name = {getattr(signal, "SIGTERM", None): "SIGTERM",
+            getattr(signal, "SIGHUP", None): "SIGHUP"}.get(signum, f"signal {signum}")
+    logger.warning("%s received - shutting down (starter will be inhibited)", name)
     raise KeyboardInterrupt
+
+
+def start_recognition() -> None:
+    """
+    Start the recognition worker unless one is running. There is only ever
+    one: a failed or stopped one is closed (and waited for) first. No-op
+    without a factory (enrollment, tests).
+    """
+    global _recognition
+    if _recognition_factory is None:
+        return
+    if _recognition is not None and not _recognition.failed and _recognition.alive:
+        return
+    stop_recognition("restarting")
+    try:
+        worker = RecognitionWorker(_recognition_factory)
+        worker.start()
+        _recognition = worker
+    except Exception:
+        logger.exception("Recognition worker could not be started - recognition runs on the "
+                         "frame loop instead (blocks ~1 s per call on the Pi)")
+
+
+def stop_recognition(why: str) -> None:
+    """Stop the recognition worker and wait for it to exit (idempotent)."""
+    global _recognition
+    worker, _recognition = _recognition, None
+    if worker is not None:
+        logger.info("Stopping the recognition worker (%s)", why)
+        worker.close()
+
+
+def recognition_channel(inline: InlineRecognition) -> Any:
+    """The worker if it can take requests (starting counts), else ``inline``."""
+    if _recognition is not None and not _recognition.failed:
+        return _recognition
+    return inline
 
 
 def cleanup() -> None:
@@ -1165,8 +1217,7 @@ def cleanup() -> None:
         _camera.release()
         _camera = None
     _frs_debug.close()
-    if _recognition is not None:
-        _recognition.close()
+    stop_recognition("exit")
     if _alert_manager is not None:
         _alert_manager.cleanup()
     if _ignition is not None:
@@ -2390,6 +2441,7 @@ class DriverCheck:
         self.others: Dict[int, int] = {}
         self.attempts = 0
         self.generation = 0
+        self.owner = next(_recognition_owner)
         # No periodic checks until start_periodic() (the eligibility point).
         self.next_due = float("inf")
 
@@ -2406,15 +2458,21 @@ class DriverCheck:
     def due(self, now_mono: float) -> bool:
         return not self.confirmed or now_mono >= self.next_due
 
+    def tag(self) -> Tuple[str, int, int]:
+        """Tag for a request submitted now: this check, this generation."""
+        return ("predrive", self.owner, self.generation)
+
     def observe(self, match: Optional[Dict[str, Any]], now_mono: float,
-                generation: Optional[int] = None) -> Optional[int]:
+                tag: Optional[Tuple[str, int, int]] = None) -> Optional[int]:
         """
-        One recognition result, for a frame submitted in ``generation``.
+        One recognition result, for a request tagged ``tag`` (:meth:`tag`).
         Returns the new driver's id on a change of driver, else ``None``.
+        A result for another owner, or from before a face loss, is discarded.
         """
-        if generation is not None and generation != self.generation:
-            logger.info("Pre-drive: re-identification result from before a face loss "
-                        "discarded")
+        if tag is not None and tag != self.tag():
+            logger.info("Pre-drive: re-identification result %s discarded (%s)", tag,
+                        "from before a face loss" if tag[:2] == self.tag()[:2]
+                        else "not this check's")
             return None
         self.attempts += 1
         self.next_due = now_mono + self.interval_s
@@ -2750,8 +2808,7 @@ def run_predrive_assessment(
                 # worker process: submitted on a face frame, answered on a
                 # later one, polled on every frame - the loop never waits
                 # for identify() (~1 s on the Pi). Inline only as a fallback.
-                channel = (_recognition if _recognition is not None and not _recognition.failed
-                           else inline_recognition)
+                channel = recognition_channel(inline_recognition)
                 identified = channel.poll()
 
                 landmarks, _rect = extractor.extract(frame)
@@ -2771,7 +2828,7 @@ def run_predrive_assessment(
                         check.face_lost(gap)
                 else:
                     if check.due(now_mono) and not channel.busy:
-                        if channel.submit(frame, check.generation) and channel.blocking:
+                        if channel.submit(frame, check.tag()) and channel.blocking:
                             # Fallback: identify() just ran here. Re-stamp, as
                             # monitoring does, so the pipeline sees the gap
                             # and abandons any closure across it.
@@ -2802,7 +2859,7 @@ def run_predrive_assessment(
                         break
 
                 if identified is not None:
-                    new_driver = check.observe(identified[1], now_mono, identified[0])
+                    new_driver = check.observe(identified[1], now_mono, tag=identified[0])
                     if new_driver is not None:
                         if ready:
                             lose_ready(now_mono, f"driver changed to {new_driver}")
@@ -3015,6 +3072,9 @@ def end_session(alert_manager: AlertManager) -> None:
     alert_manager.lock_relay()
     alert_manager.idle()
     _screen.reset_session()
+    # No recognition process outlives the session; the next driver's starts
+    # when IDLE is left.
+    stop_recognition("END SESSION")
     logger.warning("SESSION ENDED by the operator at %s (was %s) - starter %s, alerts off, "
                    "pre-drive / READY_TO_START state cleared", _stamp(time.time()), was,
                    alert_manager.get_relay_state())
@@ -3067,9 +3127,18 @@ def run_monitoring(
     re-identify cadence held the loop at ~11 fps; it cannot move to a
     thread because dlib holds the GIL for the whole call. Until a match it
     is retried every :data:`UNRECOGNISED_RETRY_S` (was: every face frame,
-    ~1 fps). What an unrecognised driver gets is unchanged: no driver, no
-    calibration, self-seeded EAR baseline, ``driver_id`` null on events and
-    faults.
+    ~1 fps), spaced from the answer to the previous attempt. What an
+    unrecognised driver gets is unchanged: no driver, no calibration,
+    self-seeded EAR baseline, ``driver_id`` null on events and faults.
+
+    Since 2026-10-19 the call runs in the recognition worker process
+    (modules/recognition_worker.py), like pre-drive's re-identification: a
+    face frame is submitted, the answer is taken on a later face frame and
+    the loop never waits. An answer for a frame from before a face loss
+    longer than ``config.NO_FACE_FAULT_S`` is discarded and the attempt
+    repeated. Only if the worker is unavailable does ``identify()`` run on
+    the loop, as before. The worst gap between two frames is logged at the
+    end and saved with the run's summary in ``logs/monitoring/``.
 
     Frames with no face follow ``modules.pipeline.NoFacePolicy``: the level
     is held (never lowered) and a DANGER is latched for up to
@@ -3117,6 +3186,19 @@ def run_monitoring(
     # Unrecognised-driver retry schedule (UNRECOGNISED_RETRY_S).
     next_identify = float("-inf")
     identify_attempts = 0
+    # Recognition requests: this run's owner token; the generation moves on
+    # at every face loss longer than NO_FACE_FAULT_S (older answers are void).
+    inline_recognition = InlineRecognition(recognizer)
+    identify_owner = next(_recognition_owner)
+    identify_generation = 0
+    # Frame-loop health for the run's summary (monotonic).
+    started_mono, started_wall = time.monotonic(), time.time()
+    frames = 0
+    prev_frame_mono: Optional[float] = None
+    max_frame_gap = 0.0
+    gaps_over = 0
+    identified_after: Optional[float] = None
+    end_reason = "stopped"
     last_danger_push = float("-inf")
     # Effective level (FRS band, or DANGER under the head-pose override) as
     # of the previous scored frame, so transitions can be logged once rather
@@ -3130,6 +3212,35 @@ def run_monitoring(
     seed_fault: Optional[OpenFault] = None
     # See from_release: whether this session has seen the ignition ON yet.
     ignition_seen_on = False
+
+    def summary() -> None:
+        """Log and save how the frame loop did this run (every exit)."""
+        duration = time.monotonic() - started_mono
+        record = {
+            "device_id": config.DEVICE_ID, "driver_id": current_driver_id,
+            "started_at": started_wall, "ended_at": time.time(),
+            "duration_s": round(duration, 3), "end_reason": end_reason,
+            "frames": frames, "mean_fps": round(frames / duration, 2) if duration > 0 else None,
+            "max_frame_gap_s": round(max_frame_gap, 3),
+            "frame_gaps_over_limit": gaps_over, "max_frame_gap_limit_s": config.MAX_FRAME_GAP_S,
+            "identify_attempts": identify_attempts,
+            "identified_after_s": None if identified_after is None else round(identified_after, 3),
+            "recognition": "worker" if _recognition is not None and not _recognition.failed
+                           else "inline",
+        }
+        logger.info("Monitoring ended (%s): %.1fs, %d frames, %.1f fps, worst frame gap %.3fs "
+                    "(%d over %.1fs), recognition %s, %d identify attempt(s)", end_reason,
+                    duration, frames, record["mean_fps"] or 0.0, max_frame_gap, gaps_over,
+                    config.MAX_FRAME_GAP_S, record["recognition"], identify_attempts)
+        directory = config.LOGS_DIR / "monitoring"
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(started_wall))
+        path = directory / (f"{config.DEVICE_ID}_{current_driver_id if current_driver_id is not None else 'unknown'}"
+                            f"_{stamp}.json")
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.error("Could not write the monitoring summary %s: %s", path, exc)
 
     def close(resolution: str) -> None:
         """Stop profiling and resolve any fault still open on the backend."""
@@ -3161,6 +3272,12 @@ def run_monitoring(
                 frame = next_frame()
             fps = rate.tick()
             now, now_mono = time.time(), time.monotonic()
+            frames += 1
+            if prev_frame_mono is not None:
+                gap = now_mono - prev_frame_mono
+                max_frame_gap = max(max_frame_gap, gap)
+                gaps_over += gap > config.MAX_FRAME_GAP_S
+            prev_frame_mono = now_mono
             if alert_manager.relay_locked:
                 # Monitoring without a pre-drive release (--force-phase
                 # monitoring): the starter stays inhibited. Nothing here can
@@ -3179,6 +3296,8 @@ def run_monitoring(
             if problem is not None:
                 with prof.section("pipeline"):
                     verdict = pipeline.note_no_face(now, now_mono)
+                if verdict.gap_s > config.NO_FACE_FAULT_S:
+                    identify_generation += 1      # answers from before this are void
                 _frs_debug.log_unscored(now, "monitoring", False, verdict.level,
                                         f"{unscored_reason(problem)}:{verdict.band}")
                 if verdict.level != last_level:
@@ -3233,19 +3352,39 @@ def run_monitoring(
                     open_fault.push(api_client, "resolved", now_mono, resolved, "face_reacquired")
                 open_fault = None
 
-            # Identify - every face frame until the driver is recognised, then
-            # never again this session (see docstring: ~1 s per call, GIL-bound).
-            if current_driver_id is None and now_mono >= next_identify:
-                identify_attempts += 1
+            # Identify - until the driver is recognised, then never again this
+            # session (see docstring). Submitted to the worker on a face frame,
+            # answered on a later one; inline only if the worker is unavailable.
+            identified = None
+            if current_driver_id is None:
+                channel = recognition_channel(inline_recognition)
                 with prof.section("recognition"):
-                    match = recognizer.identify(frame)
-                # Spaced from the END of the ~1 s attempt, so the loop always
-                # gets UNRECOGNISED_RETRY_S of real frames between stalls.
-                next_identify = time.monotonic() + UNRECOGNISED_RETRY_S
-                # Re-stamp the frame after the ~1 s call, so recognition time is
-                # never counted as eye-closure time: the pipeline sees the gap and
-                # abandons any closure in progress (config.MAX_FRAME_GAP_S).
-                now, now_mono = time.time(), time.monotonic()
+                    identified = channel.poll()
+                    if (identified is None and now_mono >= next_identify
+                            and not channel.busy
+                            and channel.submit(frame, ("monitoring", identify_owner,
+                                                       identify_generation))):
+                        identify_attempts += 1
+                        if channel.blocking:
+                            # Fallback: identify() ran here. Re-stamp the frame so
+                            # recognition time is never counted as eye-closure
+                            # time: the pipeline sees the gap and abandons any
+                            # closure in progress (config.MAX_FRAME_GAP_S).
+                            now, now_mono = time.time(), time.monotonic()
+                            identified = channel.poll()
+                if identified is not None and identified[0] != ("monitoring", identify_owner,
+                                                                identify_generation):
+                    logger.info("Monitoring: recognition answer %s discarded (%s) - asking "
+                                "again", identified[0],
+                                "from before a face loss" if identified[0][:2] ==
+                                ("monitoring", identify_owner) else "not this run's")
+                    identified = None
+                    next_identify = float("-inf")
+            if identified is not None:
+                match = identified[1]
+                # Spaced from the answer to this attempt, so the loop always gets
+                # UNRECOGNISED_RETRY_S between attempts.
+                next_identify = now_mono + UNRECOGNISED_RETRY_S
                 if match is None:
                     if not defaults_logged:
                         logger.warning("Monitoring: driver not recognised - self-seeding the EAR "
@@ -3260,6 +3399,7 @@ def run_monitoring(
                 else:
                     driver = match
                     current_driver_id = int(match["driver_id"])
+                    identified_after = now_mono - started_mono
                     logger.info("Driver identified: %s (id=%s, confidence %.2f, attempt %d) - "
                                 "recognition stops for this session", match["name"],
                                 current_driver_id, match["confidence"], identify_attempts)
@@ -3381,11 +3521,19 @@ def run_monitoring(
     except SessionEnded:
         # END SESSION stands in for key-OFF (it cannot be sensed), so open
         # faults resolve as "ignition_off" - the backend's existing value.
+        end_reason = "session_ended"
         close("ignition_off")
         logger.info("Monitoring: session ended by the operator")
         raise
-    close("ignition_off")
-    logger.info("Monitoring: ignition turned OFF - returning to pre-drive")
+    except BaseException:
+        end_reason = "stopped"         # quit / Ctrl-C / SIGTERM / a crash
+        raise
+    else:
+        end_reason = "ignition_off"
+        close("ignition_off")
+        logger.info("Monitoring: ignition turned OFF - returning to pre-drive")
+    finally:
+        summary()
 
 
 # ---------------------------------------------------------------------------
@@ -3504,7 +3652,7 @@ def main(argv: Optional[list] = None) -> int:
     """
     global _camera, _alert_manager, _head_pose, _ignition, _heartbeat, _display_available
     global _display_mode, _fullscreen, _reserve_bottom, _stream, _rate
-    global _start_confirm, _state_file, _recognition
+    global _start_confirm, _state_file, _recognition_factory
 
     args = parse_args(argv)
     setup_logging()
@@ -3554,6 +3702,13 @@ def main(argv: Optional[list] = None) -> int:
         previous_sigterm = signal.signal(signal.SIGTERM, _raise_on_sigterm)
     except ValueError:  # not the main thread (tests)
         previous_sigterm = None
+    # SIGHUP (the desktop session ending) the same way, where it exists.
+    previous_sighup = None
+    if hasattr(signal, "SIGHUP"):
+        try:
+            previous_sighup = signal.signal(signal.SIGHUP, _raise_on_sigterm)
+        except ValueError:
+            pass
     # The launcher's BEGIN MONITORING / START NEXT DRIVER (SIGUSR1) and END
     # SESSION (SIGUSR2). Installed before the first state is published, so
     # the launcher never signals a child that would die of SIGUSR1.
@@ -3595,15 +3750,12 @@ def main(argv: Optional[list] = None) -> int:
             logger.warning("No driver encodings loaded - every driver will be UNKNOWN. "
                            "Run `python main.py --enroll` first.")
         if not args.enroll:
-            # Pre-drive re-identification in its own process (dlib holds the
-            # GIL, so a thread would still stall the frame loop).
-            try:
-                worker = RecognitionWorker(KnownFaces.of(recognizer))
-                worker.start()
-                _recognition = worker
-            except Exception:
-                logger.exception("Recognition worker could not be started - pre-drive "
-                                 "re-identification runs on the frame loop instead")
+            # Recognition in its own process for pre-drive re-identification
+            # and monitoring (dlib holds the GIL, so a thread would still stall
+            # the frame loop). Stopped on END SESSION, restarted for the next
+            # driver, stopped by cleanup() on every exit.
+            _recognition_factory = KnownFaces.of(recognizer)
+            start_recognition()
 
         # 5. Phase. There is no ignition input (TODO: ignition sense, deferred
         #    hardware), so the phase is pinned: --force-phase, else pre-drive
@@ -3659,6 +3811,7 @@ def main(argv: Optional[list] = None) -> int:
                     if idle_first:
                         idle_first = False
                         run_idle(rate)
+                        start_recognition()
                     if _ignition.phase() is Phase.PREDRIVE:
                         released = run_predrive_assessment(
                             api_client, extractor, recognizer, _alert_manager, _head_pose,
@@ -3698,7 +3851,7 @@ def main(argv: Optional[list] = None) -> int:
         logger.info("Quit requested from the preview window")
         interrupted = True
     except KeyboardInterrupt:
-        logger.info("Interrupted (Ctrl-C / SIGINT / SIGTERM)")
+        logger.info("Interrupted (Ctrl-C / SIGINT / SIGTERM / SIGHUP)")
         interrupted = True
     except Exception:
         logger.exception("Fatal error in main loop")
@@ -3707,6 +3860,8 @@ def main(argv: Optional[list] = None) -> int:
         cleanup()
         if previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)
+        if previous_sighup is not None:
+            signal.signal(signal.SIGHUP, previous_sighup)
         for signum, previous in request_signals:
             signal.signal(signum, previous)
         if args.enroll and args.result_file:

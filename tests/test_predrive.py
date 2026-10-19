@@ -632,28 +632,6 @@ def test_predrive_loop_ignores_a_wall_clock_jump(m, rig, hp, ign, known_driver, 
 
 # ---- re-identification off the frame loop (2026-10-19) ------------------------
 
-@pytest.fixture
-def worker(m):
-    """``worker(factory)``: a real RecognitionWorker process, started and ready."""
-    from modules.recognition_worker import RecognitionWorker
-    made = []
-
-    def make(factory):
-        w = RecognitionWorker(factory)
-        w.start()
-        made.append(w)
-        deadline = time.monotonic() + 60.0
-        while not w.ready and not w.failed and time.monotonic() < deadline:
-            w.poll()
-            time.sleep(0.05)
-        assert w.ready, "worker started"
-        m._recognition = w
-        return w
-    yield make
-    for w in made:
-        w.close()
-
-
 GAPS = {}
 
 
@@ -716,11 +694,13 @@ def test_driver_change_through_the_worker(m, rig, hp, ign, known_driver, transit
 def test_driver_check_discards_results_from_before_a_face_loss(m):
     same = {"driver_id": 6, "name": "Test Driver", "confidence": 0.6}
     c = m.DriverCheck(6, interval_s=10.0, matches_required=3)
-    before = c.generation
+    before = c.tag()
     c.face_lost(2.5)
     assert not c.confirmed
     assert c.observe(same, 0.0, before) is None and not c.confirmed, "stale: ignored"
-    assert c.observe(same, 0.0, c.generation) is None and c.confirmed
+    other = m.DriverCheck(6).tag()                  # another cycle's request
+    assert c.observe(same, 0.0, other) is None and not c.confirmed, "not ours: ignored"
+    assert c.observe(same, 0.0, c.tag()) is None and c.confirmed
 
 
 def test_a_broken_worker_reports_failure(m):
@@ -762,3 +742,36 @@ def test_worker_runs_the_real_recognizer():
         assert tag == "tag" and match is None and faces == 0, "blank frame: no face"
     finally:
         w.close()
+
+
+def test_microsleep_during_reidentification_is_detected(m, rig, hp, ign, known_driver,
+                                                        monkeypatch, worker):
+    """
+    A >= 1.0 s closure (1.1 s) that starts while a 1 s re-identification is in
+    the worker is still confirmed: the frames keep coming, so the closure is
+    observed throughout instead of being abandoned across a stall.
+    """
+    from fakes import SlowRecognizerFactory
+    monkeypatch.setattr(m.config, "PREDRIVE_REIDENTIFY_S", 0.2)   # back to back
+    w = worker(SlowRecognizerFactory(cost=1.0))
+    closure = {"busy": []}
+
+    def state(t, n):
+        if "from" not in closure and m._session_state is READY and w.busy:
+            closure["from"] = t                       # an identify() is in flight
+        start = closure.get("from")
+        if start is not None and start <= t < start + 1.1:
+            closure["busy"].append(w.busy)
+            return "closed"
+        return "open"
+    monkeypatch.setattr(m, "show_frame",
+                        Operator(m, (SessionState.LOCKED, 0.3, m.KEY_QUIT), timeout_s=45.0))
+    seen = _spy_reason(m, monkeypatch)
+    api = FakeAPI("pending")
+    am = rig(api, ign)
+    with pytest.raises(m.QuitRequested):
+        m.run_predrive_assessment(api, ScriptedFace(state), FakeRecognizer(0.0), am, hp, ign,
+                                  m.LoopRate())
+    assert closure["busy"] and closure["busy"][0], "closed while identify() was running"
+    assert sum(closure["busy"]) >= len(closure["busy"]) // 2
+    assert seen["reason"] is m.LockReason.MICROSLEEP_DETECTED and am.relay_locked

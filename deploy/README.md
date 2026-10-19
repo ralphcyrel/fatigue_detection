@@ -140,6 +140,15 @@ The buttons follow `logs/session_state.json`, which `main.py` rewrites on
 every state change; the taps reach it as SIGUSR1 (begin) and SIGUSR2 (end
 session), and `main.py` ignores a tap made in any other state.
 
+Each `main.py` runs in its own process group with one helper process, the
+face-recognition worker (`modules/recognition_worker.py`). `main.py` stops
+it on END SESSION (a new one starts with START NEXT DRIVER) and on every
+exit; if `main.py` is killed it dies with it, and the launcher kills the
+group after `main.py` exits. To check for strays:
+`pgrep -af "multiprocessing.spawn"` should list nothing while no session
+runs. Because of the separate group, Ctrl-C in the terminal that started the
+launcher reaches the launcher only, which stops the session itself.
+
 ## Try it without autostart
 
 ```bash

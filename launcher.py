@@ -445,6 +445,7 @@ class Session:
         self._log_file = None
         self._log_offset = 0
         self._stop_requested_at: Optional[float] = None
+        self._own_group = False
         # Last state read from --state-file, and that file's mtime.
         self._state: Optional[str] = None
         self._state_mtime: Optional[float] = None
@@ -485,9 +486,14 @@ class Session:
         logger.info("Starting %s: %s", self.label, " ".join(cmd))
         # stdin is /dev/null so a stray input() fails fast instead of hanging
         # a keyboard-less unit forever.
+        # Its own process group (POSIX), so that anything main.py started -
+        # its recognition worker process - can be killed with it if main.py
+        # dies without stopping it (kill_leftovers).
+        self._own_group = sys.platform != "win32"
         self.proc = subprocess.Popen(
             cmd, cwd=str(config.BASE_DIR), env=env,
             stdin=subprocess.DEVNULL, stdout=self._log_file, stderr=subprocess.STDOUT,
+            start_new_session=self._own_group,
         )
 
     @property
@@ -521,6 +527,27 @@ class Session:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+    def kill_leftovers(self) -> int:
+        """
+        After main.py has exited: SIGKILL whatever is still in its process
+        group - an orphaned recognition worker, if main.py was killed before
+        it could stop it. Normally there is nothing (main.py stops its worker
+        on every exit path). Returns 1 if something was killed, else 0.
+        """
+        proc = self.proc
+        if proc is None or not getattr(self, "_own_group", False) or proc.poll() is None:
+            return 0
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return 0                     # nothing left: the normal case
+        except OSError as exc:
+            logger.error("Could not clean up %s's process group: %s", self.label, exc)
+            return 0
+        logger.warning("%s left processes behind (recognition worker?) - killed its process "
+                       "group %s", self.label, proc.pid)
+        return 1
 
     def child_state(self) -> Optional[str]:
         """
@@ -1527,8 +1554,10 @@ class Launcher:
         session, self.session = self.session, None
         # Session over: inhibit the starter before anything else. main.py's
         # cleanup() already did unless it was killed; this covers that, and
-        # any other unexpected exit of the child.
+        # any other unexpected exit of the child. Then nothing of the child's
+        # may outlive it (its recognition worker).
         force_relay_inhibit()
+        session.kill_leftovers()
         code = session.proc.poll() if session.proc is not None else None
         self._log_geometry(f"child exited: {session.label}, exit code {code}")
         self._close_strip()
@@ -1623,6 +1652,8 @@ class Launcher:
                 session.proc.wait()
             session.close()
         force_relay_inhibit()   # no child left: a killed one never cleaned up
+        if session is not None:
+            session.kill_leftovers()
         self.root.destroy()
 
 

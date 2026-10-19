@@ -242,10 +242,11 @@ class SlowRecognizerFactory:
     Picklable factory for ``RecognitionWorker`` (runs in the spawned child):
     a recogniser whose ``identify()`` costs ``cost`` s - the Pi's ~1 s - and
     matches driver ``driver_id`` for the first ``same`` calls, then ``then``.
+    ``driver_id=None``: never a match (an unrecognised driver).
     """
 
-    def __init__(self, cost: float = 1.0, driver_id: int = 6, same: Optional[int] = None,
-                 then: int = 7) -> None:
+    def __init__(self, cost: float = 1.0, driver_id: Optional[int] = 6,
+                 same: Optional[int] = None, then: int = 7) -> None:
         self.cost, self.driver_id, self.same, self.then = cost, driver_id, same, then
 
     def __call__(self) -> "FakeRecognizer":
@@ -257,6 +258,8 @@ class SlowRecognizerFactory:
                 time.sleep(factory.cost)
                 did = (factory.driver_id if factory.same is None or self.calls <= factory.same
                        else factory.then)
+                if did is None:
+                    return None
                 return {"driver_id": did, "name": f"Driver {did}", "confidence": 0.6}
         return Slow(cost=0.0)
 

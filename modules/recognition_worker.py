@@ -14,8 +14,16 @@ The child is started with the ``spawn`` method - a fresh interpreter, never
 a ``fork`` of a process holding the camera, GPIO and GUI threads - and is
 given the known encodings (:class:`KnownFaces`), not an API client: it does
 no network I/O and touches no hardware. It ignores SIGINT (the launcher's
-STOP goes to ``main.py``, which closes it) and exits on EOF if ``main.py``
-dies.
+STOP goes to ``main.py``, which closes it).
+
+Never an orphan, never two (2026-10-19): only one worker may be live at a
+time (:meth:`RecognitionWorker.start` refuses a second). ``main.py`` closes
+it on END SESSION and on every exit path (:meth:`RecognitionWorker.close`
+escalates join -> terminate -> kill). If ``main.py`` dies without closing it,
+the child goes too: on Linux the kernel sends it SIGTERM when its parent dies
+(``PR_SET_PDEATHSIG``), and on any platform it exits when its pipe breaks or
+its parent pid changes. The launcher additionally kills ``main.py``'s whole
+process group once ``main.py`` has exited.
 
 :class:`InlineRecognition` has the same interface but calls ``identify()``
 in place, blocking as before. It is the fallback when the worker could not
@@ -24,9 +32,11 @@ start or failed, and what the tests use with fake recognisers.
 
 import logging
 import multiprocessing
+import os
 import signal
+import sys
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -59,30 +69,45 @@ class KnownFaces:
         return recognizer
 
 
-def _serve(conn: Any, factory: Callable[[], Any]) -> None:
+def _die_with_parent(parent_pid: int) -> None:
+    """Linux: have the kernel SIGTERM this process when its parent dies."""
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.prctl(1, signal.SIGTERM)          # PR_SET_PDEATHSIG
+        except (OSError, AttributeError):
+            pass
+    if os.getppid() != parent_pid:                 # parent died before the prctl
+        os._exit(0)
+
+
+def _serve(conn: Any, factory: Callable[[], Any], parent_pid: Optional[int] = None) -> None:
     """Child process: build the recogniser, then answer one frame at a time."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if parent_pid is not None:
+        _die_with_parent(parent_pid)
     try:
-        recognizer = factory()
-    except BaseException as exc:            # report why, then exit
-        conn.send(("error", repr(exc)))
-        return
-    conn.send(("ready", None))
-    while True:
         try:
+            recognizer = factory()
+        except BaseException as exc:        # report why, then exit
+            conn.send(("error", repr(exc)))
+            return
+        conn.send(("ready", None))
+        while True:
             msg = conn.recv()
-        except (EOFError, OSError):         # parent gone
-            return
-        if msg is None:
-            return
-        tag, frame = msg
-        t0 = time.monotonic()
-        try:
-            match, err = recognizer.identify(frame), None
-        except Exception as exc:            # one bad frame must not kill the worker
-            match, err = None, repr(exc)
-        conn.send(("result", (tag, match, getattr(recognizer, "last_face_count", None),
-                              time.monotonic() - t0, err)))
+            if msg is None:
+                return
+            tag, frame = msg
+            t0 = time.monotonic()
+            try:
+                match, err = recognizer.identify(frame), None
+            except Exception as exc:        # one bad frame must not kill the worker
+                match, err = None, repr(exc)
+            conn.send(("result", (tag, match, getattr(recognizer, "last_face_count", None),
+                                  time.monotonic() - t0, err)))
+    except (EOFError, OSError):             # pipe broken: main.py is gone - so are we
+        return
 
 
 class RecognitionWorker:
@@ -98,6 +123,8 @@ class RecognitionWorker:
     """
 
     blocking = False
+    # The one live worker (start() refuses a second while it runs).
+    _live: ClassVar[Optional["RecognitionWorker"]] = None
 
     def __init__(self, factory: Callable[[], Any], start_timeout_s: float = 60.0,
                  result_timeout_s: float = 15.0) -> None:
@@ -115,11 +142,21 @@ class RecognitionWorker:
         self.max_call_s = 0.0
 
     def start(self) -> None:
-        """Spawn the child (returns at once; it reports ready on its own)."""
+        """
+        Spawn the child (returns at once; it reports ready on its own).
+
+        Raises:
+            RuntimeError: if another worker is still live - there is only
+                ever one.
+        """
+        live = RecognitionWorker._live
+        if live is not None and live is not self and live.alive:
+            raise RuntimeError(f"a recognition worker is already running (pid {live.pid})")
         parent, child = self._ctx.Pipe()
-        self._proc = self._ctx.Process(target=_serve, args=(child, self.factory),
+        self._proc = self._ctx.Process(target=_serve, args=(child, self.factory, os.getpid()),
                                        name="recognition", daemon=True)
         self._proc.start()
+        RecognitionWorker._live = self
         child.close()
         self._conn, self._started_mono = parent, time.monotonic()
         logger.info("Recognition worker process started (pid %s) - re-identification runs "
@@ -128,6 +165,15 @@ class RecognitionWorker:
     @property
     def busy(self) -> bool:
         return self._pending is not None
+
+    @property
+    def alive(self) -> bool:
+        """Whether the child process is running."""
+        return self._proc is not None and self._proc.is_alive()
+
+    @property
+    def pid(self) -> Optional[int]:
+        return None if self._proc is None else self._proc.pid
 
     def _fail(self, why: str) -> None:
         if self.failed:
@@ -204,19 +250,33 @@ class RecognitionWorker:
         return tag, match, faces, seconds
 
     def close(self) -> None:
-        """Stop the child (idempotent)."""
+        """
+        Stop the child and wait until it has gone (idempotent): ask it to
+        exit, then terminate, then kill. Never leaves it running.
+        """
         conn, proc, self._conn = self._conn, self._proc, None
+        self._pending = None
         if conn is not None:
             try:
                 conn.send(None)
             except (OSError, EOFError, ValueError):
                 pass
             conn.close()
-        if proc is not None and proc.is_alive():
+        if proc is not None:
             proc.join(timeout=1.0)
             if proc.is_alive():
                 proc.terminate()
-                proc.join(timeout=1.0)
+                proc.join(timeout=2.0)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=2.0)
+            if proc.is_alive():
+                logger.error("Recognition worker pid %s did not exit", proc.pid)
+            else:
+                logger.info("Recognition worker stopped (pid %s, exit code %s)", proc.pid,
+                            proc.exitcode)
+        if RecognitionWorker._live is self:
+            RecognitionWorker._live = None
 
 
 class InlineRecognition:
